@@ -1,0 +1,30 @@
+# General
+.env
+*.tmp
+*.log
+file_list.tmp
+world_snap.json
+project_tree.md
+current_architecture.md
+future_roadmap.md
+
+# Web Client (React/Vite)
+apps/web-client/node_modules/
+apps/web-client/dist/
+apps/web-client/build/
+apps/web-client/test-results/
+
+# Python Director
+apps/python-director/__pycache__/
+apps/python-director/venv/
+apps/python-director/.venv/
+
+# Core State (Rust)
+engines/core-state/target/
+engines/core-state/debug.log
+engines/core-state/errors.txt
+engines/core-state/build_output.txt
+
+# OS File
+.DS_Store
+Thumbs.db
