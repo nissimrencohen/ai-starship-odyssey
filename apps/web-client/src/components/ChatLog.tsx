@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { Terminal, User, Bot } from 'lucide-react';
+import { Terminal, User, Bot, RefreshCw } from 'lucide-react';
 
 export interface ChatMessage {
     sender: 'user' | 'rachel';
@@ -9,9 +9,10 @@ export interface ChatMessage {
 
 interface ChatLogProps {
     messages: ChatMessage[];
+    onRetry?: () => void;
 }
 
-export function ChatLog({ messages }: ChatLogProps) {
+export function ChatLog({ messages, onRetry }: ChatLogProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -70,6 +71,14 @@ export function ChatLog({ messages }: ChatLogProps) {
                 `}
                             >
                                 {msg.text}
+                                {msg.text === "The Architect's connection is unstable." && idx === messages.length - 1 && onRetry && (
+                                    <button
+                                        onClick={onRetry}
+                                        className="mt-3 text-xs bg-red-500/20 hover:bg-red-500/40 text-red-200 px-3 py-1.5 rounded border border-red-500/30 transition-colors flex items-center gap-2"
+                                    >
+                                        <RefreshCw className="w-3 h-3" /> Retry Connection
+                                    </button>
+                                )}
                             </div>
                         </div>
                     ))

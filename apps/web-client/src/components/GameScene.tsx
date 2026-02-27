@@ -86,7 +86,9 @@ export const GameScene: React.FC<GameSceneProps> = ({ ecsEntities, particles, zo
             />
 
             {/* Heliocentric Lighting — Sun sits at world origin (0, 0, 0) */}
-            <ambientLight intensity={0.3} color={realityOverride?.ambient_color || '#ffffff'} />
+            {/* Heliocentric Lighting — Sun sits at world origin (0, 0, 0) */}
+            <ambientLight intensity={0.2} color={realityOverride?.ambient_color || '#ffffff'} />
+            <directionalLight position={[100, 50, 50]} intensity={1.5} />
             <pointLight
                 position={[0, 0, 0]}
                 intensity={80000}

@@ -644,6 +644,18 @@ export default function App() {
           50%       { opacity: 0; }
         }
       `}</style>
+
+      {/* Clears the error state explicitly */}
+      <div style={{ display: 'none' }}>
+        {(() => {
+          (window as any).clearFailedState = () => {
+            setAiState('idle');
+            setDirectorMessage('Awaiting connection to The Void...');
+            setChatHistory(prev => prev.filter(m => m.text !== "The Architect's connection is unstable."));
+          };
+        })()}
+      </div>
+
       <div
         className={`relative min-h-screen bg-transparent text-neutral-100 flex flex-col antialiased selection:bg-purple-500/30 overflow-hidden${isShaking ? ' shake' : ''}`}
       >
@@ -687,7 +699,7 @@ export default function App() {
             <div className="flex-1 flex flex-col bg-white/5 border border-white/10 p-4 rounded-xl shadow-inner group hover:border-purple-500/30 transition-colors min-h-0">
               <h3 className="text-[10px] uppercase tracking-widest text-neutral-500 mb-3 font-bold">Conversational Stream</h3>
               <div className="flex-1 min-h-0">
-                <ChatLog messages={chatHistory} />
+                <ChatLog messages={chatHistory} onRetry={() => (window as any).clearFailedState && (window as any).clearFailedState()} />
               </div>
             </div>
 

@@ -1,5 +1,70 @@
-import React from 'react';
+import React, { Suspense } from 'react';
 import * as THREE from 'three';
+import { useTexture } from '@react-three/drei';
+
+const ASSET_BASE_URL = 'http://127.0.0.1:8000/assets/';
+
+const TEXTURE_MAP: Record<string, string> = {
+    "Earth": "2k_earth_daymap.jpg",
+    "Mars": "2k_mars.jpg",
+    "Jupiter": "2k_jupiter.jpg",
+    "Venus": "2k_venus_surface.jpg",
+    "Mercury": "2k_mercury.jpg",
+    "Saturn": "2k_saturn.jpg",
+    "Uranus": "2k_uranus.jpg",
+    "Neptune": "2k_neptune.jpg",
+    "Sun": "2k_sun.jpg",
+    "Moon": "2k_moon.jpg",
+    "Phobos": "2k_moon.jpg",
+    "Deimos": "2k_moon.jpg",
+};
+
+interface PlanetMeshProps {
+    name: string;
+    radius: number;
+    fallbackColor: string;
+    isSun?: boolean;
+}
+
+const PlanetMesh: React.FC<PlanetMeshProps> = ({ name, radius, fallbackColor, isSun }) => {
+    const textureFile = TEXTURE_MAP[name];
+    const texture = textureFile ? useTexture(`${ASSET_BASE_URL}${textureFile}`) : null;
+
+    if (isSun) {
+        return (
+            <mesh>
+                <sphereGeometry args={[radius, 64, 64]} />
+                {texture ? (
+                    <meshBasicMaterial map={texture} />
+                ) : (
+                    <meshStandardMaterial
+                        emissive="#ff8c00"
+                        emissiveIntensity={4}
+                        color="#ffd700"
+                        roughness={0.0}
+                        metalness={1.0}
+                        toneMapped={false}
+                    />
+                )}
+            </mesh>
+        );
+    }
+
+    return (
+        <mesh>
+            <sphereGeometry args={[radius, 32, 32]} />
+            {texture ? (
+                <meshStandardMaterial map={texture} roughness={0.7} metalness={0.2} />
+            ) : (
+                <meshStandardMaterial
+                    color={fallbackColor}
+                    roughness={0.4}
+                    metalness={0.3}
+                />
+            )}
+        </mesh>
+    );
+};
 
 interface EntityRendererProps {
     entities: Record<string, any>;
@@ -19,8 +84,12 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({ entities, newbor
         return acc;
     }, {} as Record<number, any[]>);
 
+    // 2. Identify Player Target Lock
+    const playerEnt = Object.values(entities).find((e: any) => e.ent_type === 'player');
+    const playerTargetId = playerEnt?.target_lock_id;
+
     return (
-        <>
+        <Suspense fallback={null}>
             {parents.map((ent: any) => {
                 const id = ent.id;
                 const isNew = newbornIds.has(ent.id);
@@ -36,6 +105,8 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({ entities, newbor
                 const isEnemy = ent.ent_type === 'enemy';
                 const isCompanion = ent.ent_type === 'companion';
                 const isExplosion = ent.ent_type === 'explosion';
+
+                const isTargeted = id === playerTargetId;
 
                 // Planet Color Palette
                 const getPlanetColor = (name: string) => {
@@ -72,17 +143,12 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({ entities, newbor
                     <group key={id} position={[ent.x, ent.z || 0, ent.y]} scale={[scale, scale, scale]}>
                         {isSun && (
                             <group>
-                                <mesh>
-                                    <sphereGeometry args={[ent.radius || 300, 64, 64]} />
-                                    <meshStandardMaterial
-                                        emissive="#ff8c00" // Deep Orange-Gold
-                                        emissiveIntensity={4}
-                                        color="#ffd700" // Golden Core
-                                        roughness={0.0}
-                                        metalness={1.0}
-                                        toneMapped={false}
-                                    />
-                                </mesh>
+                                <PlanetMesh
+                                    name="Sun"
+                                    radius={ent.radius || 300}
+                                    fallbackColor="#ffd700"
+                                    isSun
+                                />
                                 {/* Sun self-illuminates everything within range */}
                                 <pointLight color={realityOverride?.sun_color || '#fcd34d'} intensity={1000} distance={300000} decay={0.1} />
                             </group>
@@ -90,14 +156,11 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({ entities, newbor
 
                         {isPlanet && (
                             <group>
-                                <mesh>
-                                    <sphereGeometry args={[getPlanetRadius(ent.name), 32, 32]} />
-                                    <meshStandardMaterial
-                                        color={getPlanetColor(ent.name)}
-                                        roughness={0.4}
-                                        metalness={0.3}
-                                    />
-                                </mesh>
+                                <PlanetMesh
+                                    name={ent.name}
+                                    radius={getPlanetRadius(ent.name)}
+                                    fallbackColor={getPlanetColor(ent.name)}
+                                />
                                 {ent.name === 'Saturn' && (
                                     <mesh rotation={[Math.PI / 2.5, 0, 0]}>
                                         <torusGeometry args={[getPlanetRadius(ent.name) * 1.8, 5, 2, 100]} />
@@ -108,18 +171,11 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({ entities, newbor
                                 {/* RENDER MOONS HIERARCHICALLY (Requirement 1 & 2) */}
                                 {childrenByParent[ent.id]?.map((moon: any) => (
                                     <group key={moon.id} position={[moon.x, moon.z || 0, moon.y]}>
-                                        <mesh>
-                                            {moon.name === 'Phobos' || moon.name === 'Deimos' ? (
-                                                <dodecahedronGeometry args={[moon.radius || 3, 0]} />
-                                            ) : (
-                                                <sphereGeometry args={[moon.radius || 5, 16, 16]} />
-                                            )}
-                                            <meshStandardMaterial
-                                                color={moon.custom_color || '#a8a8a8'}
-                                                roughness={0.8}
-                                                metalness={0.1}
-                                            />
-                                        </mesh>
+                                        <PlanetMesh
+                                            name={moon.name || "Moon"}
+                                            radius={moon.radius || 5}
+                                            fallbackColor={moon.custom_color || '#a8a8a8'}
+                                        />
                                     </group>
                                 ))}
                             </group>
@@ -207,9 +263,24 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({ entities, newbor
                                 />
                             </mesh>
                         )}
+
+                        {/* HUNTER'S EYE BRACKET */}
+                        {isTargeted && (
+                            <group>
+                                <mesh>
+                                    <boxGeometry args={[(ent.radius || 25) * 2.5, (ent.radius || 25) * 2.5, (ent.radius || 25) * 2.5]} />
+                                    <meshBasicMaterial color="#ef4444" wireframe={true} transparent opacity={0.6} depthTest={false} />
+                                </mesh>
+                                {/* Add a simple dot in the center just for flair */}
+                                <mesh>
+                                    <sphereGeometry args={[2, 8, 8]} />
+                                    <meshBasicMaterial color="#ef4444" depthTest={false} />
+                                </mesh>
+                            </group>
+                        )}
                     </group>
                 );
             })}
-        </>
+        </Suspense>
     );
 };

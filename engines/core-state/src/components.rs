@@ -40,9 +40,15 @@ pub struct WorldState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality_override: Option<RealityOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub player_spaceship: Option<String>,
+    pub player_spaceship: Option<String>, // Legacy - we might keep or deprecate
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ship_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ship_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_complete: Option<bool>,
 }
 
 impl Default for WorldState {
@@ -58,6 +64,9 @@ impl Default for WorldState {
             reality_override: None,
             player_spaceship: None,
             behavior_policy: None,
+            ship_model: None,
+            ship_color: None,
+            mission_complete: None,
         }
     }
 }
@@ -91,6 +100,7 @@ pub enum PhysicsType {
     Static,
     Orbital { radius: f32, speed: f32, angle: f32 },
     Sinusoidal { amplitude: f32, frequency: f32, time: f32 },
+    Projectile { speed: f32 },
 }
 
 // Example ECS Component: Type/Name
@@ -159,7 +169,7 @@ pub struct Parent(pub u32);
 /// Player visual customization
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Visuals {
-    pub model_type: String,
+    pub model_type: Option<String>,
     pub color: String,
 }
 
@@ -176,8 +186,21 @@ pub struct WeaponParameters {
     pub spread: f32, // Offset between shots in multi-shot
 }
 
+impl Default for WeaponParameters {
+    fn default() -> Self {
+        Self {
+            projectile_count: 1,
+            projectile_color: "#00ff00".to_string(),
+            spread: 0.1,
+        }
+    }
+}
+
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct PersistentId(pub u64); // Strict unique ID for external AI targeting
+
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
+pub struct TargetLock(pub u32); // Holds the bevy Entity index of the locked target
 
 #[derive(Debug, Deserialize)]
 pub struct CommandRequest {

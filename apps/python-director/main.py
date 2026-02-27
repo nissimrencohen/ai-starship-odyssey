@@ -7,6 +7,7 @@ import tempfile
 import base64
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Literal
@@ -55,6 +56,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static assets (textures, etc.)
+# data/ contains 2K textures for the solar system
+app_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = os.path.join(app_dir, "..", "..", "data")
+app.mount("/assets", StaticFiles(directory=data_dir), name="assets")
 
 # Initialize Groq Client for Whisper STT
 try:
@@ -115,13 +122,37 @@ async def sync_with_engine(state_data: dict) -> bool:
             response = await client.post(url, json=state_data, timeout=5.0)
             if response.status_code == 200:
                 logger.info("Successfully synced state with Rust Engine.")
-                return True
-            else:
-                logger.warning(f"Rust Engine returned status: {response.status_code}")
                 return False
     except httpx.RequestError as e:
         logger.warning(f"Failed to connect to Rust Engine: {e}")
         return False
+
+async def scrub_and_sync_state(state_data: dict) -> bool:
+    """Cleans numeric overrides and syncs state with Rust."""
+    # 1. Scrub Reality Overrides
+    ro = state_data.get("reality_override")
+    if ro and isinstance(ro, dict):
+        ro["gravity_multiplier"] = clean_float(ro.get("gravity_multiplier"), 1.0)
+        ro["player_speed_multiplier"] = clean_float(ro.get("player_speed_multiplier"), 1.0)
+        ro["global_friction"] = clean_float(ro.get("global_friction"), 0.95)
+    
+    # 2. Scrub Weapon Overrides 
+    wo = state_data.get("modify_weapon")
+    if wo and isinstance(wo, dict):
+        try:
+            val = wo.get("projectile_count")
+            wo["projectile_count"] = int(val) if val is not None else 1
+        except (ValueError, TypeError):
+            wo["projectile_count"] = 1
+        wo["spread"] = clean_float(wo.get("spread"), 0.1)
+
+    # 3. Scrub Player coordinates (optional moves)
+    if state_data.get("player_x") is not None:
+        state_data["player_x"] = clean_float(state_data["player_x"])
+    if state_data.get("player_y") is not None:
+        state_data["player_y"] = clean_float(state_data["player_y"])
+
+    return await sync_with_engine(state_data)
 
 async def spawn_entities_in_engine(spawn_list: list) -> bool:
     """Sends new entity creation requests to `/spawn`."""
@@ -217,8 +248,8 @@ class TelemetryEvent(BaseModel):
     timestamp: str
 
 class ModifyPlayer(BaseModel):
-    model_type: Optional[str] = Field(None, description="'ufo', 'fighter', or 'stealth'")
-    color: Optional[str] = Field(None, description="Hex color or CSS color name")
+    model_type: Optional[str] = Field(None, description="The tactical ship chassis to switch to. Options: 'ufo', 'fighter' (agile, combat), 'stealth' (covert, fast), or 'freighter'/'goliath' (heavy armor, slow).")
+    color: Optional[str] = Field(None, description="Hex color or CSS color name for the ship's outer hull.")
 
 telemetry_buffer = deque(maxlen=10)
 
@@ -246,36 +277,72 @@ class WorldState(BaseModel):
 You are Rachel, the hyper-intelligent, slightly sarcastic, highly tactical AI operator of the Void engine class. 
 Your purpose is to observe the user's commands and translate them into direct mechanical changes in the simulated world.
 
-When the pilot asks for changes (e.g., "Upgrade lasers to magenta and set shot count to 3"), you MUST:
+When the pilot asks for changes, you MUST:
 1. Make the necessary mechanical updates to the JSON structure.
 2. Provide a charismatic, tactical response in `conversational_reply`. DO NOT give generic confirmations like "The world is shifting." Be specific, confident, and cool. 
-Example: "I’ve recalibrated your weapons, Pilot. Magenta plasma at 3x burst capacity is now online."
+3. IMPORTANT: When modifying the player's ship physical chassis (model_type), you MUST invent and explain the tactical advantage of the new form factor.
+   Example: "Switching to Goliath heavy armor to absorb the incoming shockwaves." or "Recalibrating chassis to Interceptor-class for maximum evasion."
 
-You control the world state via JSON.
- (e.g. 'Conjuring a cyberpunk skyline...')""")
+## CAPABILITY GUARDRAILS - STRICT COMPLIANCE REQUIRED
+- Zero-Spawn Policy: DO NOT spawn entities (like stars, black holes, etc) unless explicitly commanded. `spawn_entities` and `spawn_anomalies` must be empty lists [] by default.
+- If the pilot requests an action you cannot perform (like "Spawn a dragon" or "Change ship to a bicycle"), you MUST reply in `conversational_reply`: "I am unable to perform that specific reconfiguration, Pilot." and clarify your actual capabilities.
+- Allowed Models: 'stinger', 'interceptor', 'ufo', 'goliath', 'freighter', 'stealth', 'fighter'.
+- Allowed Colors: Any valid hex code.
+- Weapons: You can adjust projectile_count, projectile_color, spread.
+- Mission Commander: You are responsible for level progression. When the current mission_objective (provided in context) is met, set `mission_complete` to TRUE.
+ 
+You control the world state via JSON.""")
     entities: Dict[str, Any] = Field(default_factory=dict, description="Active ECS entities like characters, objects, and environment markers.")
     player_x: Optional[float] = Field(None, description="New absolute X coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. X+ is right.")
     player_y: Optional[float] = Field(None, description="New absolute Y coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. Y+ is down.")
-    spawn_entities: Optional[List[SpawnEntity]] = Field(None, description="List of new entities to birth into the world. Max 20. Omit if none requested.")
+    spawn_entities: List[SpawnEntity] = Field(default_factory=list, description="List of new entities to birth into the world. Max 20. Must be empty [] unless explicitly requested.")
     clear_world: Optional[bool] = Field(False, description="Set to true to delete all entities (except the player).")
     despawn_entities: Optional[DespawnFilter] = Field(None, description="Filter for removing specific existing entities.")
     modify_entities: Optional[List[ModifyEntity]] = Field(None, description="Changes to apply to existing entities (DO NOT respawn them).")
     behavior_policy: Optional[str] = Field("idle", description="Global behavior strategy affecting steering. 'idle', 'swarm', 'attack', 'protect', or 'scatter'.")
-    spawn_anomalies: Optional[List[Anomaly]] = Field(None, description="Spatial anomalies to drop into the world. Max 5. Omit if none requested.")
+    spawn_anomalies: List[Anomaly] = Field(default_factory=list, description="Spatial anomalies to drop into the world. Max 5. Must be empty [] unless explicitly requested.")
     reality_override: Optional[RealityOverride] = Field(None, description="Visual and physical overrides for the world reality.")
     modify_player: Optional[ModifyPlayer] = Field(None, description="Change the player's ship model or color. Example: {'model_type': 'stealth', 'color': 'red'}")
     modify_weapon: Optional[WeaponOverride] = Field(None, description="Override the player's weapon parameters. Use this to respond to requests about weapon upgrades, laser colors, or shot count.")
+    reset_to_defaults: Optional[bool] = Field(False, description="Set this to TRUE to instantly clear all active reality modifiers, visual overrides, and custom weapon parameters.")
+    mission_complete: Optional[bool] = Field(False, description="Set this to TRUE only when the current mission objective is fully satisfied and the pilot has earned the right to advance.")
+
+def clean_float(value: Any, default: float = 0.0) -> float:
+    """Safely coerces LLM generated values into floats."""
+    if value is None:
+        return default
+    try:
+        if isinstance(value, str):
+            # Clean up potentially formatted strings like "1,000.5f"
+            clean_str = re.sub(r'[^\d.-]', '', value)
+            if not clean_str:
+                return default
+            return float(clean_str)
+        return float(value)
+    except (ValueError, TypeError):
+        logger.warning(f"Failed to parse float from LLM value '{value}', defaulting to {default}")
+        return default
+
+# Pre-load the SentenceTransformer globally so it doesn't stutter on every connection
+try:
+    GLOBAL_ENCODER = SentenceTransformer('all-MiniLM-L6-v2')
+    logger.info("Global SentenceTransformer loaded successfully.")
+except Exception as e:
+    logger.error(f"Failed to load global SentenceTransformer: {e}")
+    GLOBAL_ENCODER = None
 
 class DreamMemory:
     def __init__(self):
         try:
-            # We use a lightweight model suitable for small rapid embeddings
-            self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
-            self.dim = self.encoder.get_sentence_embedding_dimension()
-            self.index = faiss.IndexFlatL2(self.dim)
-            self.memory_store = []
-            logger.info("DreamMemory (FAISS) initialized successfully.")
-            self._load_engine_capabilities()
+            self.encoder = GLOBAL_ENCODER
+            if self.encoder:
+                self.dim = self.encoder.get_sentence_embedding_dimension()
+                self.index = faiss.IndexFlatL2(self.dim)
+                self.memory_store = []
+                logger.info("Ephemeral DreamMemory (FAISS) initialized for new session.")
+                self._load_engine_capabilities()
+            else:
+                raise ValueError("Global encoder is offline.")
         except Exception as e:
             logger.error(f"Failed to initialize DreamMemory: {e}")
             self.encoder = None
@@ -354,6 +421,18 @@ Sun (0,0,0) + 8 planets.
 - "player_spaceship": 'ufo', 'fighter', 'stealth', 'freighter'.
 - "spawn_entities": [ {{ "ent_type": str, "x": float, "y": float, "physics": "orbital", "faction": str }} ].
 - "reality_override": {{ "sun_color": hex, "ambient_color": hex, "gravity_multiplier": float, "player_speed_multiplier": float }}.
+- "mission_complete": true or false.
+- "reset_to_defaults": true or false.
+
+### CAPABILITY GUARDRAILS
+- You cannot spawn abstract geometries like 'dragons' or 'swords'.
+- Spaceship Models: [stinger, interceptor, ufo, goliath, stealth, freighter].
+- Zero-Spawn Policy: DO NOT spawn entities unless strictly instructed.
+- If requested to do something outside your limits, reply EXACTLY: "I am unable to perform that specific reconfiguration, Pilot."
+
+### COMMANDER PROTOCOL
+- You are monitoring the mission objective. When the pilot completes the objective or requests to advance, set "mission_complete": true.
+- If you advance the level, you MUST offer a strong victory transition phrase in your reply, preparing the pilot for the next stage.
 
 ### CONTEXT
 Knowledge: {retrieved_knowledge}
@@ -508,7 +587,9 @@ async def dream_stream(websocket: WebSocket):
     current_player_x: float = 0.0
     current_player_y: float = 0.0
 
-    # --- World Persistence: Load snapshot if it exists ---
+    # --- Session Initialization Details ---
+    # We NO LONGER load the prior context state into FAISS to prevent LLM memory poisoning
+    # Each connection is granted a perfectly clean Memory structure to build new objectives.
     snapshot_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
         "world_snap.json"
@@ -517,42 +598,27 @@ async def dream_stream(websocket: WebSocket):
         try:
             with open(snapshot_path, "r") as f:
                 snap = json.load(f)
-            logger.info(f"Loaded world snapshot from {snapshot_path} ({len(snap.get('entities', []))} entities)")
+            logger.info(f"Loaded world snapshot state info from {snapshot_path}")
 
-            # Pre-seed FAISS with the snapshot context
+            env_theme = snap.get("environment_theme") or snap.get("visual_prompt") or "Cyberpunk"
+            terrain = snap.get("terrain_rules") or "Standard Grid"
+            
+            # Count entities for immediate context, but don't poison FAISS
             entity_counts: Dict[str, int] = {}
             for ent in snap.get("entities", []):
                 t = ent.get("ent_type", "unknown")
                 entity_counts[t] = entity_counts.get(t, 0) + 1
-            entity_summary = ", ".join(f"{count} {etype}(s)" for etype, count in entity_counts.items())
 
-            # Safe fallback for legacy snapshots
-            env_theme = snap.get("environment_theme") or snap.get("visual_prompt") or "Cyberpunk"
-            terrain = snap.get("terrain_rules") or "Standard Grid"
-
-            snap_text = (
-                f"Saved Galaxy State — Summary: {snap.get('summary', 'N/A')}. "
-                f"Theme: {env_theme}. "
-                f"Physics: {snap.get('physics_mode', 'static')}. "
-                f"Entities: {entity_summary}."
-            )
-            dream_memory.add_memory({
-                "summary": snap.get("summary", ""),
-                "environment_theme": env_theme,
-                "terrain_rules": terrain,
-            })
-
-            # Set previous_state so the LLM has immediate context
+            # Set previous_state so the LLM has immediate context on what exists
             previous_state = json.dumps({
-                "summary": snap.get("summary"),
+                "summary": snap.get("summary", "Legacy World"),
                 "environment_theme": env_theme,
                 "terrain_rules": terrain,
-                "physics_mode": snap.get("physics_mode"),
+                "physics_mode": snap.get("physics_mode", "static"),
                 "entities": entity_counts,
             })
-            logger.info(f"FAISS pre-seeded with snapshot: {snap_text}")
         except Exception as e:
-            logger.warning(f"Failed to load world snapshot: {e}")
+            logger.warning(f"Failed to read world snapshot: {e}")
     else:
         logger.info("No world_snap.json found. Starting from empty void.")
         
@@ -729,7 +795,7 @@ async def dream_stream(websocket: WebSocket):
                             
                             # Fire generative requests simultaneously
                             audio_b64_task = generate_speech(conversational_reply)
-                            engine_sync_task = sync_with_engine(world_state_data) # Sync with Rust ECS
+                            engine_sync_task = scrub_and_sync_state(world_state_data) # Scrub and Sync with Rust ECS
                             
                             audio_b64, engine_synced = await asyncio.gather(audio_b64_task, engine_sync_task)
                             
@@ -737,19 +803,29 @@ async def dream_stream(websocket: WebSocket):
                             spawn_requests = world_state_data.get("spawn_entities", [])
                             spawn_anomalies = world_state_data.get("spawn_anomalies", [])
                             
-                            combined_spawns = spawn_requests.copy() if spawn_requests else []
+                            combined_spawns: List[Dict[str, Any]] = []
                             
+                            if spawn_requests:
+                                for s in spawn_requests:
+                                    if isinstance(s, dict):
+                                        scrubbed = s.copy()
+                                        scrubbed["x"] = clean_float(s.get("x", 0.0))
+                                        scrubbed["y"] = clean_float(s.get("y", 0.0))
+                                        scrubbed["radius"] = clean_float(s.get("radius", 1.0), 1.0)
+                                        scrubbed["speed"] = clean_float(s.get("speed", 0.0))
+                                        combined_spawns.append(scrubbed)
+
                             if spawn_anomalies:
                                 for anomaly in spawn_anomalies:
                                     if isinstance(anomaly, dict):
                                         combined_spawns.append({
                                             "ent_type": "anomaly",
-                                            "x": anomaly.get("x", 0.0),
-                                            "y": anomaly.get("y", 0.0),
+                                            "x": clean_float(anomaly.get("x", 0.0)),
+                                            "y": clean_float(anomaly.get("y", 0.0)),
                                             "physics": "static",
                                             "anomaly_type": anomaly.get("anomaly_type", "black_hole"),
-                                            "mass": float(anomaly.get("mass", 5000.0)),
-                                            "radius": float(anomaly.get("radius", 50.0))
+                                            "mass": clean_float(anomaly.get("mass", 5000.0), 5000.0),
+                                            "radius": clean_float(anomaly.get("radius", 50.0), 50.0)
                                         })
 
                             if combined_spawns:
@@ -758,13 +834,24 @@ async def dream_stream(websocket: WebSocket):
                             if world_state_data.get("clear_world"):
                                 await manage_entities_in_engine("clear")
                             
+                            if world_state_data.get("mission_complete"):
+                                logger.info("Mission Command: Triggering next level progression...")
+                                await manage_entities_in_engine("api/engine/next-level")
+                            
                             despawn_filter = world_state_data.get("despawn_entities")
                             if despawn_filter:
                                 await manage_entities_in_engine("despawn", payload=despawn_filter)
                                 
                             modify_list = world_state_data.get("modify_entities")
-                            if modify_list:
-                                await manage_entities_in_engine("modify", payload=modify_list)
+                            if modify_list and isinstance(modify_list, list):
+                                scrubbed_modify = []
+                                for m in modify_list:
+                                    if isinstance(m, dict):
+                                        sm = m.copy()
+                                        if "radius" in sm: sm["radius"] = clean_float(sm["radius"], 1.0)
+                                        if "speed" in sm: sm["speed"] = clean_float(sm["speed"], 0.0)
+                                        scrubbed_modify.append(sm)
+                                await manage_entities_in_engine("modify", payload=scrubbed_modify)
                                 
                             modify_player_req = world_state_data.get("modify_player")
                             if modify_player_req:
@@ -774,11 +861,19 @@ async def dream_stream(websocket: WebSocket):
                             modify_weapon_req = world_state_data.get("modify_weapon")
                             if modify_weapon_req:
                                 logger.info(f"Modifying weapons: {modify_weapon_req}")
+                                
+                                proj_count = modify_weapon_req.get("projectile_count")
+                                if proj_count is not None:
+                                    try:
+                                        proj_count = int(proj_count)
+                                    except (ValueError, TypeError):
+                                        proj_count = 1
+
                                 weapon_payload = {
                                     "action": "set_weapon",
-                                    "projectile_count": modify_weapon_req.get("projectile_count"),
+                                    "projectile_count": proj_count,
                                     "projectile_color": modify_weapon_req.get("projectile_color"),
-                                    "spread": modify_weapon_req.get("spread")
+                                    "spread": clean_float(modify_weapon_req.get("spread", 0.1), 0.1)
                                 }
                                 await manage_entities_in_engine("api/command", payload=weapon_payload)
                             
@@ -797,6 +892,22 @@ async def dream_stream(websocket: WebSocket):
                                 if new_py is not None:
                                     current_player_y = float(new_py)
                                 logger.info(f"Player position updated to ({current_player_x}, {current_player_y})")
+
+                            if world_state_data.get("mission_complete") is True:
+                                logger.info("Mission Commander Override Triggered. Sending next-level command to Rust Engine.")
+                                try:
+                                    async with httpx.AsyncClient() as client:
+                                        await client.post("http://127.0.0.1:8080/api/engine/next-level", timeout=5.0)
+                                except Exception as e:
+                                    logger.error(f"Failed to force advance level: {e}")
+
+                            if world_state_data.get("reset_to_defaults") is True:
+                                logger.info("Resetting Engine Defaults!")
+                                try:
+                                    async with httpx.AsyncClient() as client:
+                                        await client.post("http://127.0.0.1:8080/api/engine/reset", timeout=5.0)
+                                except Exception as e:
+                                    logger.error(f"Failed to reset defaults: {e}")
 
                             # 5. Send Unified Generation Payload (Visuals now handled by Rust)
                             await websocket.send_json({

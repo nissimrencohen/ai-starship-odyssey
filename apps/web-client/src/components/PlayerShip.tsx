@@ -5,11 +5,14 @@ import * as THREE from 'three';
 
 // Procedural Fallback Ship Component — scaled to world units (hundreds of units across)
 const ShipFallback = ({ type = 'ufo', color }: { type?: string, color?: string }) => {
+    // Map tactical chassis names to base visual models
+    const mappedType = type === 'goliath' ? 'freighter' : (type === 'stinger' || type === 'interceptor' ? 'fighter' : type);
+
     // Default colors if not supplied
-    const cPrimary = color || (type === 'ufo' ? '#a855f7' : '#22d3ee');
+    const cPrimary = color || (mappedType === 'ufo' ? '#a855f7' : '#22d3ee');
     const cSecondary = color || '#0891b2';
 
-    if (type === 'fighter') {
+    if (mappedType === 'fighter') {
         return (
             <group>
                 <mesh>
@@ -30,9 +33,9 @@ const ShipFallback = ({ type = 'ufo', color }: { type?: string, color?: string }
                 </mesh>
             </group>
         );
-    } else if (type === 'freighter') {
+    } else if (mappedType === 'freighter') {
         return (
-            <group>
+            <group rotation={[Math.PI / 2, 0, 0]}>
                 <mesh position={[0, -10, 0]}>
                     <boxGeometry args={[20, 50, 20]} />
                     <meshStandardMaterial color={color || '#475569'} roughness={0.8} />
@@ -47,9 +50,9 @@ const ShipFallback = ({ type = 'ufo', color }: { type?: string, color?: string }
                 </mesh>
             </group>
         );
-    } else if (type === 'stealth') {
+    } else if (mappedType === 'stealth') {
         return (
-            <group>
+            <group rotation={[Math.PI / 2, 0, 0]}>
                 <mesh position={[0, 0, 0]}>
                     <coneGeometry args={[16, 50, 3]} />
                     <meshStandardMaterial color={color || '#0f172a'} roughness={0.9} emissive={color || '#3b82f6'} emissiveIntensity={0.2} />
@@ -100,6 +103,15 @@ class GLTFErrorBoundary extends React.Component<{ children: React.ReactNode, fal
     }
 }
 
+// Helper function to globally preload models so they are in cache before the Director requests them
+export const preloadShipModel = (url: string) => {
+    try {
+        useGLTF.preload(url);
+    } catch (e) {
+        console.warn("Could not preload ship model:", url);
+    }
+};
+
 const ShipModel = ({ url }: { url: string }) => {
     const { scene } = useGLTF(url);
     return <primitive object={scene} />;
@@ -108,13 +120,18 @@ const ShipModel = ({ url }: { url: string }) => {
 interface PlayerShipProps {
     position: [number, number, number];
     rotation: number;
-    modelUrl?: string;
-    shipType?: string;
+    modelUrl?: string; // Optional URL for explicit glTF injection
+    shipType?: string; // The semantic type from the AI (e.g., 'freighter', 'stealth')
     shipColor?: string;
 }
 
 export const PlayerShip: React.FC<PlayerShipProps> = ({ position, rotation, modelUrl, shipType, shipColor }) => {
     const groupRef = useRef<THREE.Group>(null);
+
+    // Attempt standard preloads if a known modelUrl format is provided
+    React.useEffect(() => {
+        if (modelUrl) preloadShipModel(modelUrl);
+    }, [modelUrl]);
 
     useFrame((state, delta) => {
         if (groupRef.current) {

@@ -191,6 +191,18 @@ export function HUD({ playerHealth, score, currentLevel, entities, showDamageFla
         </div>
       )}
 
+      {/* ── Commander Override Banner ────────────────────────────────────── */}
+      {objective?.includes("COMMANDER OVERRIDE") && (
+        <div className="fixed top-32 left-1/2 -translate-x-1/2 z-[200] pointer-events-none">
+          <div
+            className="px-8 py-3 bg-[#f59e0b]/20 border border-[#f59e0b]/60 rounded text-[#f59e0b] font-mono tracking-[0.4em] font-black text-lg uppercase shadow-[0_0_40px_rgba(245,158,11,0.6)]"
+            style={{ animation: 'attack-pulse 0.8s infinite alternate' }}
+          >
+            COMMANDER OVERRIDE ACTIVE
+          </div>
+        </div>
+      )}
+
       {/* ── Health Bar — top-left (past the Director sidebar) ────────── */}
       <div
         className="fixed top-6 z-[150] pointer-events-none"
@@ -254,10 +266,11 @@ export function HUD({ playerHealth, score, currentLevel, entities, showDamageFla
             </div>
             <div
               className="text-lg font-black font-mono tracking-wider"
-              style={{
-                color: '#fbbf24',
-                textShadow: '0 0 10px rgba(251,191,36,0.3)',
-              }}
+              style={
+                objective?.includes("COMMANDER OVERRIDE")
+                  ? { color: '#f59e0b', textShadow: '0 0 20px rgba(245,158,11,0.8)' }
+                  : { color: '#fbbf24', textShadow: '0 0 10px rgba(251,191,36,0.3)' }
+              }
             >
               {objective || "Infiltrating System..."}
             </div>

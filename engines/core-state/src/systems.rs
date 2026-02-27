@@ -305,8 +305,10 @@ pub fn steering_system(
 /// Generative physics system: Orbital entities orbit around the Player's position.
 /// The Player acts as the gravitational center of the galaxy.
 pub fn generative_physics_system(
-    mut query: Query<(&mut Transform, &mut PhysicsType, Option<&BirthAge>, Option<&DeathAge>, Option<&SteeringAgent>)>,
-    player_query: Query<(&Transform, &EntityType), Without<PhysicsType>>
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Transform, &mut PhysicsType, Option<&BirthAge>, Option<&DeathAge>, Option<&SteeringAgent>, Option<&TargetLock>)>,
+    player_query: Query<(&Transform, &EntityType), Without<PhysicsType>>,
+    all_entities_query: Query<(Entity, &Transform), Without<PhysicsType>>,
 ) {
     // First pass: find the player's position (no longer used for centering, but kept for future proximity logic)
     let mut _px: f32 = 0.0;
@@ -320,7 +322,7 @@ pub fn generative_physics_system(
     }
 
     // Second pass: update all non-static entities relative to the Sun (0,0,0)
-    for (mut transform, mut phys, birth_age, death_age, steering) in query.iter_mut() {
+    for (entity, mut transform, mut phys, birth_age, death_age, steering, target_lock_opt) in query.iter_mut() {
         let birth_factor = birth_age.map_or(1.0, |b| (b.0 / 2.0).min(1.0));
 
         // Death Implosion effect (pull towards center 0,0,0)
@@ -335,10 +337,9 @@ pub fn generative_physics_system(
             PhysicsType::Static => {}
             PhysicsType::Orbital { radius, speed, ref mut angle } => {
                 *angle += speed * birth_factor * 0.016;
-                // Heliocentric Orbit — flat on the XY plane (renderer maps Y→Z)
+                // Heliocentric Orbit
                 let target_x = angle.cos() * radius;
-                let target_y = angle.sin() * radius; // No Y compression — flat circle
-                let target_z = 0.0;                  // Stay in the XY plane
+                let target_y = angle.sin() * radius;
                 
                 if let Some(agent) = steering.as_ref() {
                     if agent.behavior != "idle" {
@@ -351,7 +352,6 @@ pub fn generative_physics_system(
                 // Lerp back to orbit if returning from steering
                 transform.x += (target_x - transform.x) * 0.1;
                 transform.y += (target_y - transform.y) * 0.1;
-                transform.z += (target_z - transform.z) * 0.1;
             }
             PhysicsType::Sinusoidal { amplitude, frequency, ref mut time } => {
                 *time += 0.016;
@@ -366,14 +366,38 @@ pub fn generative_physics_system(
                     }
                 }
                 
-                // Drift rightward while oscillating
                 transform.x += 25.0 * birth_factor * 0.016;
-                if transform.x > 1000.0 {
-                    transform.x = -1000.0;
-                }
+                if transform.x > 1000.0 { transform.x = -1000.0; }
                 transform.z += (target_z - transform.z) * 0.1;
+            }
+            PhysicsType::Projectile { speed } => {
+                if let Some(t_lock) = target_lock_opt {
+                    let mut found_target_pos = None;
+                    for (e2, t2) in all_entities_query.iter() {
+                        if e2.index() == t_lock.0 {
+                            found_target_pos = Some((t2.x, t2.y));
+                            break;
+                        }
+                    }
+
+                    if let Some((tx, ty)) = found_target_pos {
+                        let dx = tx - transform.x;
+                        let dy = ty - transform.y;
+                        let target_angle = dy.atan2(dx);
+                        
+                        let mut angle_diff = target_angle - transform.rotation;
+                        while angle_diff > std::f32::consts::PI { angle_diff -= std::f32::consts::TAU; }
+                        while angle_diff < -std::f32::consts::PI { angle_diff += std::f32::consts::TAU; }
+                        
+                        transform.rotation += angle_diff * 0.05;
+                    } else {
+                        commands.entity(entity).remove::<TargetLock>();
+                    }
+                }
+
+                transform.x += transform.rotation.cos() * speed;
+                transform.y += transform.rotation.sin() * speed;
             }
         }
     }
 }
-
