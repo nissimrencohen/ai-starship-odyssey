@@ -33,6 +33,8 @@ pub struct WorldState {
     pub reality_override: Option<RealityOverride>,
     #[serde(default)]
     pub player_spaceship: Option<String>,
+    #[serde(default)]
+    pub behavior_policy: Option<String>,
 }
 
 // Example ECS Component: Transform
@@ -151,4 +153,12 @@ pub struct WeaponParameters {
 
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct PersistentId(pub u64); // Strict unique ID for external AI targeting
+
+#[derive(Debug, Deserialize)]
+pub struct CommandRequest {
+    pub action: String, // e.g. "set_weapon"
+    pub projectile_count: Option<u32>,
+    pub projectile_color: Option<String>,
+    pub spread: Option<f32>,
+}
 

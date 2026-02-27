@@ -6,7 +6,7 @@ file_list.tmp
 world_snap.json
 project_tree.md
 current_architecture.md
-future_roadmap.md
+legacy_and_unused.md
 
 # Web Client (React/Vite)
 apps/web-client/node_modules/

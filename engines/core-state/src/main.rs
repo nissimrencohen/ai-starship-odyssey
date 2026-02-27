@@ -4,7 +4,7 @@ mod systems;
 use bevy_ecs::prelude::*;
 use warp::Filter;
 use std::sync::{Arc, Mutex};
-use components::{WorldState, Transform, EntityType, Name, PhysicsType, BirthAge, DeathAge, SteeringAgent, SpatialAnomaly, Particle, Projectile, PlayerInputMessage, Health, Faction, Visuals, UpdatePlayerRequest, Parent, SpawnAge, WeaponParameters, PersistentId};
+use components::{WorldState, Transform, EntityType, Name, PhysicsType, BirthAge, DeathAge, SteeringAgent, SpatialAnomaly, Particle, Projectile, PlayerInputMessage, Health, Faction, Visuals, UpdatePlayerRequest, Parent, SpawnAge, WeaponParameters, PersistentId, CommandRequest};
 use systems::{generative_physics_system, environmental_physics_system, particle_physics_system};
 use serde::{Serialize, Deserialize};
 use futures_util::{StreamExt, SinkExt};
@@ -249,12 +249,25 @@ struct SharedState(Arc<Mutex<WorldState>>);
 
 fn sync_state_system(
     shared: Res<SharedState>,
-    mut query: Query<(&EntityType, &mut PhysicsType)>
+    mut query: Query<(&EntityType, &mut PhysicsType, Option<&mut SteeringAgent>)>
 ) {
     let state = shared.0.lock().unwrap();
     let mode = state.physics_mode.as_str();
+    let behavior_policy = state.behavior_policy.as_deref();
 
-    for (ent_type, mut phys) in query.iter_mut() {
+    for (ent_type, mut phys, mut steering_opt) in query.iter_mut() {
+        // 1. Handle Global Behavior Policy (Non-Player)
+        if ent_type.0 != "player" {
+            if let Some(policy) = behavior_policy {
+                if let Some(ref mut steering) = steering_opt {
+                    if steering.behavior != policy {
+                        steering.behavior = policy.to_string();
+                    }
+                }
+            }
+        }
+
+        // 2. Handle Physics Mode (Companion specialized logic)
         if ent_type.0 == "companion" {
             match mode {
                 "orbital" => {
@@ -301,6 +314,7 @@ async fn main() {
         player_y: None,
         reality_override: None,
         player_spaceship: None,
+        behavior_policy: None,
     };
 
     let state = Arc::new(Mutex::new(initial_state));
@@ -757,7 +771,44 @@ async fn main() {
             warp::reply::json(&serde_json::json!({ "status": "updated_player" }))
         });
 
-    let routes = get_state_route.or(update_state).or(save_route).or(spawn_route).or(clear_route).or(despawn_route).or(modify_route).or(update_player_route).with(state_cors);
+    // POST /api/command — Interpret AI-orchestrated commands
+    let world_for_command = world.clone();
+    let command_route = warp::post()
+        .and(warp::path("api"))
+        .and(warp::path("command"))
+        .and(warp::body::json())
+        .map(move |req: CommandRequest| {
+            let mut w = world_for_command.lock().unwrap();
+            
+            if req.action == "set_weapon" {
+                let mut player_query = w.query::<(Entity, &EntityType)>();
+                let mut player_entity = None;
+                for (e, etype) in player_query.iter(&w) {
+                    if etype.0 == "player" {
+                        player_entity = Some(e);
+                        break;
+                    }
+                }
+                
+                if let Some(e) = player_entity {
+                    if let Some(mut weapon) = w.get_mut::<WeaponParameters>(e) {
+                        if let Some(cnt) = req.projectile_count { weapon.projectile_count = cnt; }
+                        if let Some(clr) = req.projectile_color { weapon.projectile_color = clr; }
+                        if let Some(spr) = req.spread { weapon.spread = spr; }
+                    } else {
+                        w.entity_mut(e).insert(WeaponParameters {
+                            projectile_count: req.projectile_count.unwrap_or(1),
+                            projectile_color: req.projectile_color.unwrap_or_else(|| "#00ff00".to_string()),
+                            spread: req.spread.unwrap_or(0.1),
+                        });
+                    }
+                }
+            }
+            
+            warp::reply::json(&serde_json::json!({ "status": "command_received", "action": req.action }))
+        });
+
+    let routes = get_state_route.or(update_state).or(save_route).or(spawn_route).or(clear_route).or(despawn_route).or(modify_route).or(update_player_route).or(command_route).with(state_cors);
     // Serve state updates + save on 8080
     tokio::spawn(async {
         println!("State API listening on http://127.0.0.1:8080 (endpoints: /state, /save)");

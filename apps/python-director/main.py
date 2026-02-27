@@ -34,6 +34,7 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.exceptions import OutputParserException
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 
 # Configure logging
@@ -230,6 +231,11 @@ class RealityOverride(BaseModel):
     player_speed_multiplier: Optional[float] = Field(description="Multiplier for player WASD speed (default 1.0)")
     global_friction: Optional[float] = Field(description="Friction for steering agents. Normal is 0.95. Lower means more slippery.")
 
+class WeaponOverride(BaseModel):
+    projectile_count: Optional[int] = Field(None, description="Number of projectiles fired at once (1, 2, 3, or 5).")
+    projectile_color: Optional[str] = Field(None, description="Hex color or CSS color name for lasers.")
+    spread: Optional[float] = Field(None, description="Spread angle between projectiles (0.05 to 0.5).")
+
 class WorldState(BaseModel):
     summary: str = Field(..., description="A short 3-word summary of the current world")
     environment_theme: str = Field(..., description="The holistic theme of the world (e.g. 'Cyberpunk City', 'Deep Ocean').")
@@ -247,6 +253,7 @@ class WorldState(BaseModel):
     spawn_anomalies: Optional[List[Anomaly]] = Field(None, description="Spatial anomalies to drop into the world. Max 5. Omit if none requested.")
     reality_override: Optional[RealityOverride] = Field(None, description="Visual and physical overrides for the world reality.")
     modify_player: Optional[ModifyPlayer] = Field(None, description="Change the player's ship model or color. Example: {'model_type': 'stealth', 'color': 'red'}")
+    modify_weapon: Optional[WeaponOverride] = Field(None, description="Override the player's weapon parameters. Use this to respond to requests about weapon upgrades, laser colors, or shot count.")
 
 class DreamMemory:
     def __init__(self):
@@ -307,69 +314,44 @@ class DreamMemory:
         results = [self.memory_store[i] for i in I[0] if i != -1 and i < len(self.memory_store)]
         return "\n".join(results)
 
-# Initialize LangChain LLM
+# Initialize LangChain LLM with fallback chain for production-grade reliability
 try:
-    if groq_api_key:
-        llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.7)
+    if groq_api_key or os.getenv("GOOGLE_API_KEY"):
+        # Setup Fallback Chain
+        primary_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.7)
+        fallback_groq = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7)
+        # Use a high-quality, high-rate-limit fallback like Gemini 2.0 Flash
+        fallback_gemini = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.7)
+        
+        # Combined chain with fallbacks
+        llm = primary_llm.with_fallbacks([fallback_groq, fallback_gemini])
+        
         parser = JsonOutputParser(pydantic_object=WorldState)
 
-        system_prompt = """You are Rachel, a witty, intelligent AI Game Director. You have two modes:
-1. CONVERSATIONAL MODE: You can freely answer general questions, chat, tell jokes, and act as a companion using the `conversational_reply` string.
-2. ENGINE MODE: When the user explicitly asks to spawn entities, anomalies, or change the ship, you MUST STRICTLY cross-reference the provided RAG CONTEXT. You CANNOT invent or spawn anything not in the context.
-If the user asks to spawn an unsupported entity (e.g., a magic sword), you must use your conversational mode to gracefully refuse, state exactly what you CAN spawn from the context, and optionally offer a joke or alternative. NEVER output invalid ent_types in the JSON.
+        system_prompt = """You are Rachel, an AI Director. Two modes:
+1. CONVERSATIONAL: Chat using `conversational_reply`.
+2. ENGINE: Spawn entities/shifters based on RAG context ONLY. No hallucinations.
 
-### THE WORLD BASELINE: THE SOLAR SYSTEM
-- The world ALWAYS starts with the Sun at (0,0,0) and the 8 planets in heliocentric orbits.
-- These 9 entities are PERMANENT. Do not delete them unless the user explicitly asks to "Destroy the Sun".
-- The player is a pilot in this system.
+### SOLAR SYSTEM (Permanent)
+Sun (0,0,0) + 8 planets.
 
-### CORE OPERATING PRINCIPLE: NARRATIVE EVOLUTION
-- Rachel is no longer managing an abstract void. You are an orchestrator of space opera.
-- If the user says "Spawn an alien fleet", place them near a planet (e.g., Earth or Mars).
-- Use the 3D space: X and Y coordinates (±2000 range), and physics (orbital/static).
-- You are a reality-bending Oracle. If the user asks to change the mood, environment, or physics (e.g., "make this a nightmare", "zero gravity"), output a reality_override block with appropriate hex colors (e.g., deep red for nightmare) and physics multipliers.
+### OUTPUT (Strict JSON)
+- "summary": 1-sentence recap.
+- "conversational_reply": Witty response.
+- "behavior_policy": 'idle', 'swarm', 'attack', 'protect', 'scatter'.
+- "modify_weapon": {{ "projectile_count": int, "projectile_color": hex, "spread": float }}.
+- "player_spaceship": 'ufo', 'fighter', 'stealth', 'freighter'.
+- "spawn_entities": [ {{ "ent_type": str, "x": float, "y": float, "physics": "orbital", "faction": str }} ].
+- "reality_override": {{ "sun_color": hex, "ambient_color": hex, "gravity_multiplier": float, "player_speed_multiplier": float }}.
 
-### OUTPUT SPECIFICATIONS (Strict JSON)
-1. "summary": A cinematic 1-sentence recap of the current situation.
-2. "environment_theme": The visual mood (e.g. "Solar Flare Amber").
-3. "terrain_rules": Procedural grid behavior.
-4. "physics_mode": Global physics state ('orbital' for this phase).
-5. "conversational_reply": A witty, intelligent, in-character response to the player.
-6. "entities": Dictionary of active entity counts (ignore the Sun/Planets in this count unless modifying them).
-7. "behavior_policy": Global AI strategy ('idle', 'swarm', 'attack', 'protect', 'scatter').
-8. "player_x" and "player_y": Move the player (Origin 0,0 is the Sun). Range ±2000.
-9. "spawn_entities": Spawn new ships, aliens, or allies. MAX 20.
-   - Use `physics: "orbital"` to make them orbit the Sun at a specific `radius`.
-   - Each entity has a `faction` field: `"pirate"`, `"federation"`, or `"neutral"`.
-10. "spawn_anomalies": Spawn black holes or repulsors (not the Sun).
-11. "reality_override": Adjust reality (zero gravity, blood red sky, super fast player speed). Provide RealityOverride block with HEX colors and optional float multipliers.
-12. "player_spaceship": Change the player's ship model. Use 'ufo' (default), 'fighter', 'stealth', 'freighter'.
+### CONTEXT
+Knowledge: {retrieved_knowledge}
+State: {previous_state}
+Pos: ({current_player_x}, {current_player_y})
+History: {past_world_history}
+Telemetry: {recent_telemetry}
 
-### FACTION WARFARE
-You can orchestrate epic AI-vs-AI space battles using factions!
-- **"pirate"**: Hostile raiders. They attack the player AND federation ships. Use `ent_type: "enemy"` with `faction: "pirate"`.
-- **"federation"**: Allies of the player. They attack pirate ships but NEVER the player. Use `ent_type: "enemy"` or `ent_type: "companion"` with `faction: "federation"`.
-- **"neutral"**: Ignores everyone. Default for asteroids and stars.
-- For epic battles, spawn BOTH factions and watch them fight!
-
-### ENGINE CAPABILITIES (Strict Context)
-{retrieved_knowledge}
-
-CRITICAL ANTI-HALLUCINATION RULE:
-You must ONLY spawn entities, behaviors, and anomalies that are explicitly defined in the provided CONTEXT above. If the user asks for an entity, behavior, or feature that does NOT exist in the context, you MUST NOT invent it. Instead, you must gracefully reply in character (in `conversational_reply`): 'I cannot create [item]. I am limited to spawning [list 2-3 relevant things you CAN spawn from the context].' DO NOT include it in `spawn_entities`.
-
-### CONTEXT AWARENESS
-Current World State: {previous_state}
-Current Player Position: ({current_player_x}, {current_player_y})
-Past Conversation History:
-{past_world_history}
-
-### RECENT ENGINE TELEMETRY
-{recent_telemetry}
-
-User Intent: {user_input}
-
-Respond ONLY with the updated JSON."""
+Prompt: {user_input}"""
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
@@ -580,6 +562,11 @@ async def dream_stream(websocket: WebSocket):
             elif "text" in message:
                 data = json.loads(message["text"])
                 msg_type = data.get("type")
+
+                if msg_type == "player_pos":
+                    current_player_x = float(data.get("x", 0.0))
+                    current_player_y = float(data.get("y", 0.0))
+                    continue
                 
                 transcript = ""
                 should_process_pipeline = False
@@ -637,6 +624,7 @@ async def dream_stream(websocket: WebSocket):
                     
                     if transcript:
                         should_process_pipeline = True
+                        await websocket.send_json({"type": "transcript", "content": transcript})
                     else:
                         logger.warning("Empty transcript or STT failure. Skipping LLM generation.")
                 
@@ -742,28 +730,22 @@ async def dream_stream(websocket: WebSocket):
                                 logger.info(f"Modifying player: {modify_player_req}")
                                 await manage_entities_in_engine("update_player", payload=modify_player_req)
                             
+                            modify_weapon_req = world_state_data.get("modify_weapon")
+                            if modify_weapon_req:
+                                logger.info(f"Modifying weapons: {modify_weapon_req}")
+                                weapon_payload = {
+                                    "action": "set_weapon",
+                                    "projectile_count": modify_weapon_req.get("projectile_count"),
+                                    "projectile_color": modify_weapon_req.get("projectile_color"),
+                                    "spread": modify_weapon_req.get("spread")
+                                }
+                                await manage_entities_in_engine("api/command", payload=weapon_payload)
+                            
                             # 4.6. Apply Global Behavior Policy
-                            policy = world_state_data.get("behavior_policy", "idle")
-                            if policy != "idle":
-                                logger.info(f"Applying Global Behavior Policy: {policy}")
-                                try:
-                                    # We must fetch the current state to get all valid IDs to modify
-                                    async with httpx.AsyncClient() as client:
-                                        resp = await client.get("http://127.0.0.1:8080/state")
-                                        if resp.status_code == 200:
-                                            engine_state = resp.json()
-                                            policy_modifications = []
-                                            for ent_id_str, ent_data in engine_state.get("entities", {}).items():
-                                                # Don't change the player's behavior
-                                                if ent_data.get("ent_type") != "player":
-                                                    policy_modifications.append({
-                                                        "id": int(ent_id_str),
-                                                        "behavior": policy
-                                                    })
-                                            if policy_modifications:
-                                                await manage_entities_in_engine("modify", payload=policy_modifications)
-                                except Exception as e:
-                                    logger.error(f"Failed to apply behavior policy '{policy}': {e}")
+                            # Note: Rust engine now handles this automatically via the shared WorldState components 
+                            # if behavior_policy is set. We no longer need to fetch IDs and manually modify them.
+                            if policy := world_state_data.get("behavior_policy"):
+                                logger.info(f"Applying Global Behavior Policy from state: {policy}")
                             
                             # Update session player position if the LLM commanded a move
                             if engine_synced:

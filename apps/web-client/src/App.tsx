@@ -4,6 +4,7 @@ import { Activity, Server, Mic, MicOff, Save, Volume2, VolumeX, Trash2 } from 'l
 import { Canvas } from '@react-three/fiber';
 import { GameScene } from './components/GameScene';
 import { HUD } from './components/HUD';
+import { ChatLog, ChatMessage } from './components/ChatLog';
 
 const WS_URL = 'ws://127.0.0.1:8000/api/v1/dream-stream';
 
@@ -14,6 +15,7 @@ export default function App() {
   const [engineSynced, setEngineSynced] = useState<boolean>(false);
   const [textInput, setTextInput] = useState("");
   const [aiState, setAiState] = useState<"idle" | "synthesizing" | "orchestrating">("idle");
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunks = useRef<Blob[]>([]);
 
@@ -371,9 +373,13 @@ export default function App() {
       try {
         const data = JSON.parse(lastMessage.data);
 
-        if (data.type === 'text') {
+        if (data.type === 'transcript') {
+          // Received back from the Python Director for voice transcriptions
+          setChatHistory(prev => [...prev, { sender: 'user', text: data.content, timestamp: new Date() }]);
+        } else if (data.type === 'text') {
           // LLM responding to the user
           setDirectorMessage(data.content);
+          setChatHistory(prev => [...prev, { sender: 'rachel', text: data.content, timestamp: new Date() }]);
         } else if (data.msg_type === 'status') {
           setAiState(data.state);
         } else if (data.type === 'frame_update') {
@@ -383,7 +389,8 @@ export default function App() {
           setWorldState(data.content);
         } else if (data.type === 'proactive_audio') {
           console.log("Proactive Action Triggered by Engine!");
-          setDirectorMessage("Rachel is speaking: " + data.text);
+          setDirectorMessage("Rachel looks on: " + data.text);
+          setChatHistory(prev => [...prev, { sender: 'rachel', text: data.text, timestamp: new Date() }]);
           setAiState("synthesizing"); // Re-using valid Loader state Enum
 
           if (data.audio_b64 && isRachelEnabled) {
@@ -420,6 +427,22 @@ export default function App() {
     }
   }, [lastMessage]);
 
+  // Periodically sync player position to the Director for spatial awareness
+  useEffect(() => {
+    const syncInterval = setInterval(() => {
+      // Find the player entity in ecsEntities
+      const player = Object.values(ecsEntities).find(ent => ent.ent_type === 'player');
+      if (player && readyState === ReadyState.OPEN) {
+        sendMessage(JSON.stringify({
+          type: 'player_pos',
+          x: player.x,
+          y: player.y
+        }));
+      }
+    }, 2000); // Every 2 seconds is enough for awareness without flooding
+    return () => clearInterval(syncInterval);
+  }, [ecsEntities, readyState, sendMessage]);
+
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -435,6 +458,8 @@ export default function App() {
       mediaRecorderRef.current.onstop = () => {
         const fullBlob = new Blob(audioChunks.current, { type: 'audio/webm' });
         if (readyState === ReadyState.OPEN) {
+          // We don't have the transcript yet, but we've finished recording.
+          // The transcript will come back via the websocket handled above.
           sendMessage(fullBlob);
           sendMessage(JSON.stringify({ type: 'audio_end' }));
         }
@@ -570,19 +595,19 @@ export default function App() {
         />
 
         {/* The Director's Console (Left Sidebar) */}
-        <div className="fixed left-0 top-0 h-screen w-80 bg-black/80 backdrop-blur-xl border-r border-white/10 z-50 flex flex-col p-6 overflow-y-auto overflow-x-hidden custom-scrollbar transition-transform duration-500 ease-in-out">
+        <div className="fixed left-0 top-0 h-screen w-80 bg-black/80 backdrop-blur-xl border-r border-white/10 z-50 flex flex-col p-6 overflow-hidden transition-transform duration-500 ease-in-out">
           <div className="flex items-center space-x-3 mb-8">
             <div className="w-2 h-2 rounded-full bg-purple-500 animate-pulse"></div>
             <h2 className="text-xs font-bold text-neutral-400 uppercase tracking-[0.2em]">Director's Console</h2>
           </div>
 
-          <div className="flex flex-col gap-6">
+          <div className="flex-1 flex flex-col gap-6 min-h-0">
             {/* Conversations / Subtitles */}
-            <div className="bg-white/5 border border-white/10 p-4 rounded-xl shadow-inner group hover:border-purple-500/30 transition-colors">
+            <div className="flex-1 flex flex-col bg-white/5 border border-white/10 p-4 rounded-xl shadow-inner group hover:border-purple-500/30 transition-colors min-h-0">
               <h3 className="text-[10px] uppercase tracking-widest text-neutral-500 mb-3 font-bold">Conversational Stream</h3>
-              <p className="text-sm font-medium text-neutral-200 leading-relaxed italic">
-                "{directorMessage}"
-              </p>
+              <div className="flex-1 min-h-0">
+                <ChatLog messages={chatHistory} />
+              </div>
             </div>
 
             {/* Director's Schema (Visual Prompt) */}
@@ -607,18 +632,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Debug: World State JSON */}
-            <div className="bg-black/90 border border-white/5 rounded-xl p-4 font-mono text-[10px] text-neutral-500">
-              <h3 className="text-purple-400/60 mb-3 uppercase tracking-widest text-[9px] flex items-center justify-between">
-                <span>[Raw Engine State]</span>
-                {engineSynced && (
-                  <span className="text-green-400 animate-pulse">SYNCED</span>
-                )}
-              </h3>
-              <pre className="whitespace-pre-wrap max-h-64 overflow-auto scrollbar-hide">
-                {worldState ? JSON.stringify(worldState, null, 2) : "Awaiting sync..."}
-              </pre>
-            </div>
+            {/* Removed [Raw Engine State] JSON dump for cleaner UI v7.3 */}
           </div>
         </div>
 
@@ -678,6 +692,7 @@ export default function App() {
                   e.preventDefault();
                   if (!textInput.trim() || readyState !== ReadyState.OPEN) return;
                   sendMessage(JSON.stringify({ type: 'text_command', text: textInput }));
+                  setChatHistory(prev => [...prev, { sender: 'user', text: textInput, timestamp: new Date() }]);
                   setTextInput('');
                   setDirectorMessage('Manual override initiated...');
                 }}
