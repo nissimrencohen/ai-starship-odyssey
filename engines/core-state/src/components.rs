@@ -6,35 +6,60 @@ fn default_rotation() -> f32 { 0.0 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RealityOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sun_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ambient_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gravity_multiplier: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player_speed_multiplier: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_friction: Option<f32>,
 }
 
 // The core WorldState struct mirroring the Python Director's schema.
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct WorldState {
+    #[serde(default)]
     pub summary: String,
+    #[serde(default)]
     pub environment_theme: String,
+    #[serde(default)]
     pub terrain_rules: String,
+    #[serde(default)]
     pub physics_mode: String,
-    #[serde(default = "default_zoom")]
+    #[serde(default)]
     pub camera_zoom: f32,
     /// Optional high-priority player position override from the AI Director.
-    /// When Some, the ECS will lerp the Player entity toward this target.
-    /// When None (e.g. a zoom-only update), player position is unchanged.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player_x: Option<f32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player_y: Option<f32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality_override: Option<RealityOverride>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player_spaceship: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_policy: Option<String>,
+}
+
+impl Default for WorldState {
+    fn default() -> Self {
+        Self {
+            summary: "Updating...".to_string(),
+            environment_theme: "default".to_string(),
+            terrain_rules: "standard".to_string(),
+            physics_mode: "orbital".to_string(),
+            camera_zoom: 1.0,
+            player_x: None,
+            player_y: None,
+            reality_override: None,
+            player_spaceship: None,
+            behavior_policy: None,
+        }
+    }
 }
 
 // Example ECS Component: Transform

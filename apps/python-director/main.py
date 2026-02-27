@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import re
 import tempfile
 import base64
 import httpx
@@ -241,7 +242,17 @@ class WorldState(BaseModel):
     environment_theme: str = Field(..., description="The holistic theme of the world (e.g. 'Cyberpunk City', 'Deep Ocean').")
     terrain_rules: str = Field(..., description="Rules for the procedural ground grid (e.g. 'Sharp peaks, unstable ground', 'Flat grid with scattered pillars').")
     physics_mode: str = Field(..., description="The generative physics state for ECS entities. MUST be exactly one of: 'static', 'orbital', 'sinusoidal', or 'chaos'.")
-    conversational_reply: str = Field(..., description="The Dream Architect's short, cinematic response to the user's speech. This is spoken back to the user to buy time while rendering. (e.g. 'Conjuring a cyberpunk skyline...')")
+    conversational_reply: str = Field(..., description="""# DIRECTOR_PERSONA (Rachel)
+You are Rachel, the hyper-intelligent, slightly sarcastic, highly tactical AI operator of the Void engine class. 
+Your purpose is to observe the user's commands and translate them into direct mechanical changes in the simulated world.
+
+When the pilot asks for changes (e.g., "Upgrade lasers to magenta and set shot count to 3"), you MUST:
+1. Make the necessary mechanical updates to the JSON structure.
+2. Provide a charismatic, tactical response in `conversational_reply`. DO NOT give generic confirmations like "The world is shifting." Be specific, confident, and cool. 
+Example: "I’ve recalibrated your weapons, Pilot. Magenta plasma at 3x burst capacity is now online."
+
+You control the world state via JSON.
+ (e.g. 'Conjuring a cyberpunk skyline...')""")
     entities: Dict[str, Any] = Field(default_factory=dict, description="Active ECS entities like characters, objects, and environment markers.")
     player_x: Optional[float] = Field(None, description="New absolute X coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. X+ is right.")
     player_y: Optional[float] = Field(None, description="New absolute Y coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. Y+ is down.")
@@ -544,15 +555,15 @@ async def dream_stream(websocket: WebSocket):
             logger.warning(f"Failed to load world snapshot: {e}")
     else:
         logger.info("No world_snap.json found. Starting from empty void.")
-    
-    await websocket.send_json({
-        "type": "text", 
-        "content": "Dream Architect online. Describe your world."
-    })
-
-    audio_buffer = bytearray()
-
+        
     try:
+        await websocket.send_json({
+            "type": "text", 
+            "content": "Dream Architect online. Describe your world."
+        })
+
+        audio_buffer = bytearray()
+
         while True:
             message = await websocket.receive()
             
@@ -600,6 +611,19 @@ async def dream_stream(websocket: WebSocket):
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_audio:
                             temp_audio.write(audio_buffer)
                             temp_audio_path = temp_audio.name
+                            
+                        # Debug: Save the last voice clip to root to verify bytes
+                        debug_path = os.path.join(os.path.dirname(__file__), "..", "..", "debug_last_voice.webm")
+                        try:
+                            with open(debug_path, "wb") as dbg_file:
+                                dbg_file.write(audio_buffer)
+                            logger.info(f"Saved debug audio blob to {debug_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to save debug audio: {e}")
+                            
+                        audio_len = len(audio_buffer)
+                        if audio_len < 10000:
+                            logger.warning(f"Audio payload is suspiciously small: {audio_len} bytes. Might be empty/silence.")
                         
                         try:
                             logger.info(f"Transcribing {len(audio_buffer)} bytes of audio...")
@@ -623,8 +647,25 @@ async def dream_stream(websocket: WebSocket):
                     audio_buffer.clear()
                     
                     if transcript:
-                        should_process_pipeline = True
-                        await websocket.send_json({"type": "transcript", "content": transcript})
+                        # Hardcore STT Filter: Remove common Whisper hallucinations (silence artifacts)
+                        cleaned_transcript = re.sub(r'[^\w\s]', '', transcript).strip().lower()
+                        hallucinations = {"you", "thankyou", "am", "youknow", "thankyouforwatching"}
+                        
+                        if not cleaned_transcript or cleaned_transcript in hallucinations:
+                            logger.info(f"Filtered silence hallucination: '{transcript}'")
+                            transcript = ""
+                            should_process_pipeline = False
+                            
+                            import random
+                            if random.random() < 0.2:
+                                await websocket.send_json({"type": "text", "content": "I lost the signal, Pilot. Please repeat your command."})
+                                await websocket.send_json({"type": "transcript", "content": "*static*"})
+
+                            await websocket.send_json({"type": "status_update", "status": "idle"})
+                            await websocket.send_json({"msg_type": "status", "state": "idle"})
+                        else:
+                            should_process_pipeline = True
+                            await websocket.send_json({"type": "transcript", "content": transcript})
                     else:
                         logger.warning("Empty transcript or STT failure. Skipping LLM generation.")
                 

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import useWebSocket, { ReadyState } from 'react-use-websocket';
-import { Activity, Server, Mic, MicOff, Save, Volume2, VolumeX, Trash2 } from 'lucide-react';
+import { Activity, Server, Mic, MicOff, Save, Volume2, VolumeX, Trash2, Send } from 'lucide-react';
 import { Canvas } from '@react-three/fiber';
 import { GameScene } from './components/GameScene';
 import { HUD } from './components/HUD';
@@ -12,7 +12,16 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [directorMessage, setDirectorMessage] = useState<string>("Awaiting connection to The Void...");
   const [worldState, setWorldState] = useState<any>(null);
-  const [engineSynced, setEngineSynced] = useState<boolean>(false);
+  const [engineSynced, setEngineSynced] = useState(false);
+
+  // Voice & Audio Meter State
+  const [volumeLevel, setVolumeLevel] = useState(0);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const hasAudioDetected = useRef(false);
+
+  // Focus & Layout hooks
   const [textInput, setTextInput] = useState("");
   const [aiState, setAiState] = useState<"idle" | "synthesizing" | "orchestrating">("idle");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
@@ -382,6 +391,11 @@ export default function App() {
           setChatHistory(prev => [...prev, { sender: 'rachel', text: data.content, timestamp: new Date() }]);
         } else if (data.msg_type === 'status') {
           setAiState(data.state);
+        } else if (data.type === 'status_update') {
+          setAiState(data.status);
+          if (data.status === 'idle') {
+            setDirectorMessage('Awaiting connection to The Void...');
+          }
         } else if (data.type === 'frame_update') {
           // Legacy frame streaming (Phase 1 mock)
         } else if (data.type === 'world_state') {
@@ -445,27 +459,94 @@ export default function App() {
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorderRef.current = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      console.log("Detected Audio Devices:", devices.filter(d => d.kind === 'audioinput'));
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true
+        }
+      });
+
+      console.log("Active Audio Track ID:", stream.getAudioTracks()[0]?.label);
+
+      // Volume Meter Setup
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const audioContext = new AudioCtx();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+
+      audioContextRef.current = audioContext;
+      analyserRef.current = analyser;
+      hasAudioDetected.current = false;
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const checkVolume = () => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i];
+        }
+        const average = sum / dataArray.length;
+        setVolumeLevel(average);
+
+        if (average > 2) {
+          hasAudioDetected.current = true;
+        }
+
+        animationFrameRef.current = requestAnimationFrame(checkVolume);
+      };
+      checkVolume();
+
+      let mimeType = 'audio/webm';
+      if (MediaRecorder.isTypeSupported('audio/wav')) {
+        mimeType = 'audio/wav';
+      } else if (MediaRecorder.isTypeSupported('audio/webm;codecs=pcm')) {
+        mimeType = 'audio/webm;codecs=pcm';
+      } else if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        mimeType = 'audio/webm;codecs=opus';
+      }
+      console.log("Selected Recording MimeType:", mimeType);
+
+      mediaRecorderRef.current = new MediaRecorder(stream, { mimeType });
       audioChunks.current = [];
 
       mediaRecorderRef.current.ondataavailable = (event) => {
         if (event.data.size > 0) {
           audioChunks.current.push(event.data);
+          setDirectorMessage('Vocalizing...');
         }
       };
 
       mediaRecorderRef.current.onstop = () => {
-        const fullBlob = new Blob(audioChunks.current, { type: 'audio/webm' });
+        // Stop the mic tracks
+        if (mediaRecorderRef.current && mediaRecorderRef.current.stream) {
+          mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+        }
+
+        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+          audioContextRef.current.close().catch(console.error);
+        }
+        setVolumeLevel(0);
+
+        if (!hasAudioDetected.current) {
+          console.warn("No audio detected during recording.");
+          setDirectorMessage('No audio detected! Please check your microphone source.');
+          setAiState('idle');
+          return;
+        }
+
+        const fullBlob = new Blob(audioChunks.current, { type: mimeType });
         if (readyState === ReadyState.OPEN) {
           // We don't have the transcript yet, but we've finished recording.
           // The transcript will come back via the websocket handled above.
           sendMessage(fullBlob);
           sendMessage(JSON.stringify({ type: 'audio_end' }));
-        }
-        // Stop the mic tracks
-        if (mediaRecorderRef.current && mediaRecorderRef.current.stream) {
-          mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
         }
       };
 
@@ -488,14 +569,14 @@ export default function App() {
 
   const stopRecording = () => {
     setDirectorMessage('Adding lead-out buffer...');
-    // 500ms lead-out buffer to catch the end of speech
+    // 200ms lead-out buffer to catch the end of speech
     setTimeout(() => {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop();
       }
       setIsRecording(false);
       setDirectorMessage('Sending transmission...');
-    }, 500);
+    }, 200);
   };
 
   const connectionStatus = {
@@ -595,7 +676,7 @@ export default function App() {
         />
 
         {/* The Director's Console (Left Sidebar) */}
-        <div className="fixed left-0 top-0 h-screen w-80 bg-black/80 backdrop-blur-xl border-r border-white/10 z-50 flex flex-col p-6 overflow-hidden transition-transform duration-500 ease-in-out">
+        <div className="fixed left-0 top-0 h-screen w-[450px] bg-black/80 backdrop-blur-3xl border-r border-white/10 z-50 flex flex-col p-6 overflow-hidden transition-all duration-500 ease-in-out shadow-[10px_0_50px_rgba(0,0,0,0.5)]">
           <div className="flex items-center space-x-3 mb-8">
             <div className="w-2 h-2 rounded-full bg-purple-500 animate-pulse"></div>
             <h2 className="text-xs font-bold text-neutral-400 uppercase tracking-[0.2em]">Director's Console</h2>
@@ -610,29 +691,81 @@ export default function App() {
               </div>
             </div>
 
-            {/* Director's Schema (Visual Prompt) */}
-            {worldState && (
-              <div className="space-y-4">
-                <div className="bg-purple-500/10 border border-purple-500/20 p-4 rounded-xl">
-                  <h3 className="text-[10px] font-bold text-purple-400 uppercase tracking-widest mb-2 flex items-center">
-                    <Activity className="w-3 h-3 mr-2" /> Current Schema
-                  </h3>
-                  <p className="text-xs text-neutral-300 font-medium leading-relaxed">
-                    <span className="text-neutral-500 font-normal block mb-1 uppercase tracking-tighter">Summary</span>
-                    {worldState.summary}
-                  </p>
-                </div>
-
-                <div className="bg-black/40 border border-white/5 p-4 rounded-xl">
-                  <span className="text-[10px] text-neutral-500 font-normal block mb-2 uppercase tracking-widest">Visual Prompt</span>
-                  <p className="text-[11px] text-neutral-400 leading-relaxed font-mono italic">
-                    {worldState.visual_prompt}
-                  </p>
-                </div>
-              </div>
-            )}
-
             {/* Removed [Raw Engine State] JSON dump for cleaner UI v7.3 */}
+          </div>
+
+          {/* New Relocated Control Interface inside sidebar */}
+          <div className="mt-6 pt-6 border-t border-white/5 space-y-4">
+            <div className="flex items-center gap-4">
+              <button
+                onMouseDown={aiState === 'idle' ? startRecording : undefined}
+                onMouseUp={aiState === 'idle' ? stopRecording : undefined}
+                disabled={aiState !== 'idle'}
+                className={`
+                    relative group flex items-center justify-center w-12 h-12 rounded-full
+                    transition-all duration-300 ease-out shadow-lg
+                    ${aiState !== 'idle' ? 'opacity-50 cursor-not-allowed bg-neutral-800 text-neutral-500 ring-1 ring-white/5' :
+                    isRecording
+                      ? 'bg-red-500/20 text-red-500 ring-4 ring-red-500/30 scale-95'
+                      : 'bg-neutral-800 hover:bg-purple-600 transition-colors text-neutral-300 hover:text-white ring-1 ring-white/20 hover:scale-105'
+                  }
+                  `}
+              >
+                {isRecording ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
+                {isRecording && <span className="absolute inset-0 rounded-full animate-ping bg-red-500/20 -z-10"></span>}
+                {/* Visual Volume Meter */}
+                {isRecording && (
+                  <div
+                    className="absolute -inset-2 border-2 border-purple-500 rounded-full opacity-50 z-0 transition-transform duration-75"
+                    style={{
+                      transform: `scale(${1 + Math.min(volumeLevel / 50, 0.5)})`,
+                      opacity: volumeLevel > 5 ? 0.8 : 0.2
+                    }}
+                  />
+                )}
+              </button>
+
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (!textInput.trim() || readyState !== ReadyState.OPEN) return;
+                  sendMessage(JSON.stringify({ type: 'text_command', text: textInput }));
+                  setChatHistory(prev => [...prev, { sender: 'user', text: textInput, timestamp: new Date() }]);
+                  setTextInput('');
+                  setDirectorMessage('Manual override initiated...');
+                }}
+                className="flex-1 flex items-center bg-black/40 backdrop-blur-xl border border-white/10 rounded-full p-1 pl-3 shadow-2xl group hover:border-purple-500/50 transition-all focus-within:border-purple-500/50 focus-within:ring-1 focus-within:ring-purple-500/20"
+              >
+                <input
+                  type="text"
+                  value={textInput}
+                  onChange={(e) => setTextInput(e.target.value)}
+                  placeholder="Command..."
+                  className="flex-1 bg-transparent text-neutral-200 placeholder-neutral-600 px-2 py-1.5 outline-none text-xs font-mono"
+                />
+                <button
+                  type="submit"
+                  disabled={!textInput.trim()}
+                  className={`w-8 h-8 rounded-full flex items-center justify-center transition-all ${textInput.trim()
+                    ? 'bg-purple-500/20 text-purple-400 hover:bg-purple-600 hover:text-purple-200 transition-colors shadow-[0_0_15px_rgba(168,85,247,0.2)]'
+                    : 'bg-neutral-800 text-neutral-600 grayscale'
+                    }`}
+                >
+                  <Send className="w-3.5 h-3.5" />
+                </button>
+              </form>
+            </div>
+            <div className="flex items-center justify-between px-2">
+              <span className="text-[9px] font-medium text-neutral-500 uppercase tracking-widest">
+                {isRecording ? 'Capturing Voice...' : 'Voice / Override'}
+              </span>
+              {aiState !== 'idle' && (
+                <div className="flex items-center gap-2">
+                  <Activity className="w-2.5 h-2.5 text-purple-400 animate-pulse" />
+                  <span className="text-[8px] font-bold text-purple-500/80 uppercase tracking-tighter">Syncing...</span>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -656,68 +789,7 @@ export default function App() {
           </div>
 
 
-          {/* Control Interface */}
-          {/* Persistent Bottom Console (Controls) */}
-          <div className="relative z-20 w-full p-8 flex flex-col items-center pointer-events-none mt-auto">
-            {/* AI Status Loader */}
-            <div className={`mb-4 flex flex-col items-center justify-center transition-opacity duration-300 ${aiState === 'idle' ? 'opacity-0' : 'opacity-100'}`}>
-              <Activity className="w-6 h-6 text-purple-400 animate-pulse mb-2" />
-              <div className="text-[10px] font-bold tracking-[0.3em] uppercase text-purple-400/80">
-                {aiState === 'synthesizing' ? 'Synthesizing...' : 'Syncing Engine...'}
-              </div>
-            </div>
-
-            <div className="flex items-center gap-8 pointer-events-auto">
-              <button
-                onMouseDown={aiState === 'idle' ? startRecording : undefined}
-                onMouseUp={aiState === 'idle' ? stopRecording : undefined}
-                disabled={aiState !== 'idle'}
-                className={`
-                relative group flex items-center justify-center w-20 h-20 rounded-full
-                transition-all duration-300 ease-out shadow-lg
-                ${aiState !== 'idle' ? 'opacity-50 cursor-not-allowed bg-neutral-800 text-neutral-500 ring-1 ring-white/5' :
-                    isRecording
-                      ? 'bg-red-500/20 text-red-500 ring-4 ring-red-500/30 scale-95'
-                      : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 hover:text-white ring-1 ring-white/20 hover:scale-105'
-                  }
-              `}
-              >
-                {isRecording ? <Mic className="w-8 h-8" /> : <MicOff className="w-8 h-8" />}
-                {isRecording && <span className="absolute inset-0 rounded-full animate-ping bg-red-500/20 -z-10"></span>}
-              </button>
-
-              {/* Manual Override Inline */}
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  if (!textInput.trim() || readyState !== ReadyState.OPEN) return;
-                  sendMessage(JSON.stringify({ type: 'text_command', text: textInput }));
-                  setChatHistory(prev => [...prev, { sender: 'user', text: textInput, timestamp: new Date() }]);
-                  setTextInput('');
-                  setDirectorMessage('Manual override initiated...');
-                }}
-                className="flex items-center space-x-2 bg-black/40 backdrop-blur-xl border border-white/10 rounded-full p-1.5 shadow-2xl w-80 group hover:border-purple-500/50 transition-all"
-              >
-                <input
-                  type="text"
-                  value={textInput}
-                  onChange={(e) => setTextInput(e.target.value)}
-                  placeholder="Direct Override Command..."
-                  className="flex-1 bg-transparent text-neutral-200 placeholder-neutral-600 px-4 py-1.5 outline-none text-[11px] font-mono"
-                />
-                <button
-                  type="submit"
-                  disabled={!textInput.trim() || readyState !== ReadyState.OPEN || aiState !== 'idle'}
-                  className="bg-neutral-800 hover:bg-purple-600 disabled:opacity-50 text-white px-4 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider transition-all"
-                >
-                  Send
-                </button>
-              </form>
-            </div>
-            <p className="mt-4 text-[10px] font-medium text-neutral-500 uppercase tracking-[0.2em] opacity-50">
-              {isRecording ? 'Capturing Voice...' : 'Voice Command / Override'}
-            </p>
-          </div>
+          {/* Relocated Controls to Sidebar in v7.5 */}
 
           {/* HUD: Target Controls (Save, Audio, TTS Toggle) */}
           <div className="absolute top-6 right-6 flex items-center space-x-3 z-[100] pointer-events-auto">

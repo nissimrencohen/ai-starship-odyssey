@@ -194,7 +194,7 @@ export function HUD({ playerHealth, score, currentLevel, entities, showDamageFla
       {/* ── Health Bar — top-left (past the Director sidebar) ────────── */}
       <div
         className="fixed top-6 z-[150] pointer-events-none"
-        style={{ left: '340px' }}
+        style={{ left: '470px' }}
       >
         <div className="text-[8px] uppercase tracking-[0.22em] text-neutral-500 mb-1 font-mono">
           HULL INTEGRITY
