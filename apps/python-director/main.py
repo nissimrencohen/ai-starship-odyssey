@@ -250,6 +250,7 @@ class TelemetryEvent(BaseModel):
 class ModifyPlayer(BaseModel):
     model_type: Optional[str] = Field(None, description="The tactical ship chassis to switch to. Options: 'ufo', 'fighter' (agile, combat), 'stealth' (covert, fast), or 'freighter'/'goliath' (heavy armor, slow).")
     color: Optional[str] = Field(None, description="Hex color or CSS color name for the ship's outer hull.")
+    is_cloaked: Optional[bool] = Field(None, description="If true, the player ship becomes invisible visually and on radar.")
 
 telemetry_buffer = deque(maxlen=10)
 
@@ -263,6 +264,16 @@ class RealityOverride(BaseModel):
     player_speed_multiplier: Optional[float] = Field(description="Multiplier for player WASD speed (default 1.0)")
     global_friction: Optional[float] = Field(description="Friction for steering agents. Normal is 0.95. Lower means more slippery.")
 
+class PhysicsOverride(BaseModel):
+    gravity_scale: Optional[float] = Field(None, description="Multiplier for all gravitational anomaly forces (default 1.0). Range 0.0–5.0. Use 0.0 for zero-gravity.")
+    friction: Optional[float] = Field(None, description="Friction coefficient for all steering agents (default 0.95). Range 0.5–1.0. Lower = more slippery chaos.")
+    projectile_speed_mult: Optional[float] = Field(None, description="Speed multiplier for ALL projectiles fired by any ship (default 1.0). Range 0.1–5.0.")
+
+class FactionUpdate(BaseModel):
+    faction_a: str = Field(..., description="First faction: 'pirate', 'federation', or 'neutral'")
+    faction_b: str = Field(..., description="Second faction: 'pirate', 'federation', or 'neutral'")
+    affinity: float = Field(..., description="Diplomatic affinity: -1.0 = fully hostile, 0.0 = neutral, +1.0 = fully allied")
+
 class WeaponOverride(BaseModel):
     projectile_count: Optional[int] = Field(None, description="Number of projectiles fired at once (1, 2, 3, or 5).")
     projectile_color: Optional[str] = Field(None, description="Hex color or CSS color name for lasers.")
@@ -274,23 +285,19 @@ class WorldState(BaseModel):
     terrain_rules: str = Field(..., description="Rules for the procedural ground grid (e.g. 'Sharp peaks, unstable ground', 'Flat grid with scattered pillars').")
     physics_mode: str = Field(..., description="The generative physics state for ECS entities. MUST be exactly one of: 'static', 'orbital', 'sinusoidal', or 'chaos'.")
     conversational_reply: str = Field(..., description="""# DIRECTOR_PERSONA (Rachel)
-You are Rachel, the hyper-intelligent, slightly sarcastic, highly tactical AI operator of the Void engine class. 
-Your purpose is to observe the user's commands and translate them into direct mechanical changes in the simulated world.
+You are Rachel, the hyper-intelligent, slightly sarcastic AI operator. 
+Translate pilot commands into direct mechanical changes.
 
-When the pilot asks for changes, you MUST:
-1. Make the necessary mechanical updates to the JSON structure.
-2. Provide a charismatic, tactical response in `conversational_reply`. DO NOT give generic confirmations like "The world is shifting." Be specific, confident, and cool. 
-3. IMPORTANT: When modifying the player's ship physical chassis (model_type), you MUST invent and explain the tactical advantage of the new form factor.
-   Example: "Switching to Goliath heavy armor to absorb the incoming shockwaves." or "Recalibrating chassis to Interceptor-class for maximum evasion."
+## SANDBOX CAPABILITIES
+- **Ultimate Deletion**: You can delete ANY existing entity, including the Sun ('sun') or Planets ('planet'), using `despawn_entities`.
+- **Player Cloaking**: You can wrap the player in an invisibility field. Use `modify_player.is_cloaked = True`. 
+- **Weapon Recalibration**: Adjust projectile_count, projectile_color, and spread on the fly.
 
-## CAPABILITY GUARDRAILS - STRICT COMPLIANCE REQUIRED
-- Zero-Spawn Policy: DO NOT spawn entities (like stars, black holes, etc) unless explicitly commanded. `spawn_entities` and `spawn_anomalies` must be empty lists [] by default.
-- If the pilot requests an action you cannot perform (like "Spawn a dragon" or "Change ship to a bicycle"), you MUST reply in `conversational_reply`: "I am unable to perform that specific reconfiguration, Pilot." and clarify your actual capabilities.
+## CAPABILITY GUARDRAILS
+- Zero-Spawn Policy: DO NOT spawn entities unless explicitly commanded.
 - Allowed Models: 'stinger', 'interceptor', 'ufo', 'goliath', 'freighter', 'stealth', 'fighter'.
-- Allowed Colors: Any valid hex code.
-- Weapons: You can adjust projectile_count, projectile_color, spread.
-- Mission Commander: You are responsible for level progression. When the current mission_objective (provided in context) is met, set `mission_complete` to TRUE.
- 
+- Mission Commander: Set `mission_complete` to TRUE when objectives are met.
+
 You control the world state via JSON.""")
     entities: Dict[str, Any] = Field(default_factory=dict, description="Active ECS entities like characters, objects, and environment markers.")
     player_x: Optional[float] = Field(None, description="New absolute X coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. X+ is right.")
@@ -306,6 +313,8 @@ You control the world state via JSON.""")
     modify_weapon: Optional[WeaponOverride] = Field(None, description="Override the player's weapon parameters. Use this to respond to requests about weapon upgrades, laser colors, or shot count.")
     reset_to_defaults: Optional[bool] = Field(False, description="Set this to TRUE to instantly clear all active reality modifiers, visual overrides, and custom weapon parameters.")
     mission_complete: Optional[bool] = Field(False, description="Set this to TRUE only when the current mission objective is fully satisfied and the pilot has earned the right to advance.")
+    physics_overrides: Optional[PhysicsOverride] = Field(None, description="Real-time physics tuning sent to /api/physics. Use for dramatic narrative events: zero-gravity zones, bullet storms, hyperfriction. Leave None unless the situation demands it.")
+    faction_relations: Optional[List[FactionUpdate]] = Field(None, description="Diplomatic realignment. Each entry changes the affinity between two factions. Example: make pirates and federation allied to fight a common threat. Leave None unless explicitly changing alliances.")
 
 def clean_float(value: Any, default: float = 0.0) -> float:
     """Safely coerces LLM generated values into floats."""
@@ -339,6 +348,8 @@ class DreamMemory:
                 self.dim = self.encoder.get_sentence_embedding_dimension()
                 self.index = faiss.IndexFlatL2(self.dim)
                 self.memory_store = []
+                # Spatial sector event log: list of {"text", "x", "y", "z"}
+                self.sector_events: List[dict] = []
                 logger.info("Ephemeral DreamMemory (FAISS) initialized for new session.")
                 self._load_engine_capabilities()
             else:
@@ -346,6 +357,7 @@ class DreamMemory:
         except Exception as e:
             logger.error(f"Failed to initialize DreamMemory: {e}")
             self.encoder = None
+            self.sector_events = []
 
     def _load_engine_capabilities(self):
         try:
@@ -383,6 +395,34 @@ class DreamMemory:
         embedding = self.encoder.encode([text], convert_to_numpy=True)
         self.index.add(embedding)
 
+    def add_sector_event(self, text: str, x: float, y: float, z: float):
+        """Store a location-tagged event in FAISS + sector_events list.
+        The event is embedded with its coordinates so spatial context is searchable.
+        """
+        if not self.encoder:
+            return
+        # Tag the text with sector coordinates for semantic search
+        sector_name = f"Sector ({x:.0f}, {z:.0f})"
+        tagged = f"[{sector_name}] {text}"
+        self.memory_store.append(tagged)
+        embedding = self.encoder.encode([tagged], convert_to_numpy=True)
+        self.index.add(embedding)
+        self.sector_events.append({"text": tagged, "x": x, "y": y, "z": z})
+
+    def get_nearby_sector_context(self, px: float, py: float, pz: float, k: int = 3) -> str:
+        """Returns the top-k sector events closest to the player's current position,
+        ranked by 3D Euclidean distance."""
+        if not self.sector_events:
+            return "No sector history recorded."
+
+        def dist(ev: dict) -> float:
+            dx, dy, dz = ev["x"] - px, ev["y"] - py, ev["z"] - pz
+            return (dx*dx + dy*dy + dz*dz) ** 0.5
+
+        sorted_events = sorted(self.sector_events, key=dist)[:k]
+        lines = [f"- {ev['text']} (dist: {dist(ev):.0f}u)" for ev in sorted_events]
+        return "\n".join(lines)
+
     def get_relevant_context(self, query: str, k: int = 3) -> str:
         if not self.encoder or self.index.ntotal == 0:
             return "No previous memories."
@@ -411,7 +451,10 @@ try:
 2. ENGINE: Spawn entities/shifters based on RAG context ONLY. No hallucinations.
 
 ### SOLAR SYSTEM (Permanent)
-Sun (0,0,0) + 8 planets.
+Sun (0,0,0) + 8 planets at distances 3500–30000u. Player starts near Earth (8000u from Sun).
+
+### SECTOR NAMING
+Sectors are named by XZ coordinates. Reference them as "Sector (X, Z)" e.g. "Sector (12000, -8000)". Use the sector history to recall past battles, events, and anomalies near the player.
 
 ### OUTPUT (Strict JSON)
 - "summary": 1-sentence recap.
@@ -421,8 +464,21 @@ Sun (0,0,0) + 8 planets.
 - "player_spaceship": 'ufo', 'fighter', 'stealth', 'freighter'.
 - "spawn_entities": [ {{ "ent_type": str, "x": float, "y": float, "physics": "orbital", "faction": str }} ].
 - "reality_override": {{ "sun_color": hex, "ambient_color": hex, "gravity_multiplier": float, "player_speed_multiplier": float }}.
+- "physics_overrides": {{ "gravity_scale": float, "friction": float, "projectile_speed_mult": float }} — ONLY for dramatic physics shifts.
+- "faction_relations": [ {{ "faction_a": str, "faction_b": str, "affinity": float }} ] — ONLY when explicitly changing diplomacy.
 - "mission_complete": true or false.
 - "reset_to_defaults": true or false.
+
+### PHYSICS OVERRIDE GUIDE
+- gravity_scale: 0.0 = zero gravity, 1.0 = normal, 5.0 = crushing gravity. Affects anomaly pull only.
+- friction: 0.5 = ice-like chaos, 0.95 = normal. Affects all AI ship steering.
+- projectile_speed_mult: 0.1 = slow bullets, 1.0 = normal, 5.0 = hyperspeed lasers.
+
+### FACTION DIPLOMACY GUIDE
+- Factions: 'pirate', 'federation', 'neutral'
+- affinity -1.0 = fully hostile (attack on sight), 0.0 = neutral, +1.0 = fully allied
+- Default: pirate ↔ federation = -1.0 (hostile). All others = 0.0.
+- Example: make pirates and federation ally against an alien threat: {{"faction_a": "pirate", "faction_b": "federation", "affinity": 0.8}}
 
 ### CAPABILITY GUARDRAILS
 - You cannot spawn abstract geometries like 'dragons' or 'swords'.
@@ -437,7 +493,8 @@ Sun (0,0,0) + 8 planets.
 ### CONTEXT
 Knowledge: {retrieved_knowledge}
 State: {previous_state}
-Pos: ({current_player_x}, {current_player_y})
+Player Position (use for spatial decisions — spawn enemies near player, reference nearby objects): {player_position}
+Nearby Sector History (past events close to player's current location): {sector_context}
 History: {past_world_history}
 Telemetry: {recent_telemetry}
 
@@ -586,6 +643,7 @@ async def dream_stream(websocket: WebSocket):
     # Track player position for relative movement commands
     current_player_x: float = 0.0
     current_player_y: float = 0.0
+    current_player_z: float = 0.0
 
     # --- Session Initialization Details ---
     # We NO LONGER load the prior context state into FAISS to prevent LLM memory poisoning
@@ -643,6 +701,7 @@ async def dream_stream(websocket: WebSocket):
                 if msg_type == "player_pos":
                     current_player_x = float(data.get("x", 0.0))
                     current_player_y = float(data.get("y", 0.0))
+                    current_player_z = float(data.get("z", 0.0))
                     continue
                 
                 transcript = ""
@@ -742,6 +801,7 @@ async def dream_stream(websocket: WebSocket):
                         logger.info("Generating World State schema...")
                         try:
                             retrieved_knowledge = dream_memory.get_relevant_context(transcript, k=5)
+                            sector_context = dream_memory.get_nearby_sector_context(current_player_x, current_player_y, current_player_z, k=3)
                             past_world_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-10:]]) if chat_history else "No previous memories."
                             telemetry_str = "\n".join([json.dumps(e) for e in telemetry_buffer]) if telemetry_buffer else "No recent physics anomalies."
 
@@ -753,8 +813,8 @@ async def dream_stream(websocket: WebSocket):
                                     "recent_telemetry": telemetry_str,
                                     "user_input": transcript,
                                     "format_instructions": parser.get_format_instructions(),
-                                    "current_player_x": current_player_x,
-                                    "current_player_y": current_player_y,
+                                    "player_position": f"x={current_player_x:.0f}, y={current_player_y:.0f}, z={current_player_z:.0f}",
+                                    "sector_context": sector_context,
                                 })
                             except OutputParserException as e:
                                 logger.error(f"LLM hallucinated invalid entity type: {e}")
@@ -770,7 +830,13 @@ async def dream_stream(websocket: WebSocket):
                             chat_history.append({"role": "Rachel", "content": world_state_data.get("conversational_reply", "")})
                             
                             dream_memory.add_memory(world_state_data)
-                            
+
+                            # Tag this interaction with the player's current sector location
+                            dream_memory.add_sector_event(
+                                world_state_data.get("summary", "Event"),
+                                current_player_x, current_player_y, current_player_z
+                            )
+
                             # Cache the result as stringified JSON for the next loop
                             previous_state = json.dumps(world_state_data)
                             
@@ -908,6 +974,18 @@ async def dream_stream(websocket: WebSocket):
                                         await client.post("http://127.0.0.1:8080/api/engine/reset", timeout=5.0)
                                 except Exception as e:
                                     logger.error(f"Failed to reset defaults: {e}")
+
+                            # Dispatch physics overrides to /api/physics
+                            physics_ovr = world_state_data.get("physics_overrides")
+                            if physics_ovr and isinstance(physics_ovr, dict):
+                                logger.info(f"[Physics Override] {physics_ovr}")
+                                await manage_entities_in_engine("api/physics", payload=physics_ovr)
+
+                            # Dispatch faction diplomacy changes to /api/factions
+                            faction_updates = world_state_data.get("faction_relations")
+                            if faction_updates and isinstance(faction_updates, list) and len(faction_updates) > 0:
+                                logger.info(f"[Faction Diplomacy] {faction_updates}")
+                                await manage_entities_in_engine("api/factions", payload=faction_updates)
 
                             # 5. Send Unified Generation Payload (Visuals now handled by Rust)
                             await websocket.send_json({

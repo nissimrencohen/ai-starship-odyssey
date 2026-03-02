@@ -4,51 +4,73 @@ import * as THREE from 'three';
 
 interface StarfieldProps {
     count?: number;
+    position?: [number, number, number];
 }
 
-export const Starfield: React.FC<StarfieldProps> = ({ count = 500 }) => {
+export const Starfield: React.FC<StarfieldProps> = ({ count = 5000, position = [0, 0, 0] }) => {
     const pointsRef = useRef<THREE.Points>(null);
 
-    const particles = useMemo(() => {
-        const temp = [];
+    const { posArray, colorArray } = useMemo(() => {
+        const positions = new Float32Array(count * 3);
+        const colors = new Float32Array(count * 3);
+        const colorEntries = [
+            new THREE.Color('#ffffff'), // White
+            new THREE.Color('#93c5fd'), // Pale Blue
+            new THREE.Color('#fde68a'), // Soft Yellow
+        ];
+
         for (let i = 0; i < count; i++) {
-            const radius = Math.random() * 5000 + 500;
+            // Spherical shell distribution: R between 200k and 500k
+            const radius = 200000 + Math.random() * 300000;
             const theta = Math.random() * Math.PI * 2;
             const phi = Math.acos(Math.random() * 2 - 1);
 
-            const x = radius * Math.sin(phi) * Math.cos(theta);
-            const y = radius * Math.sin(phi) * Math.sin(theta);
-            const z = radius * Math.cos(phi);
+            positions[i * 3] = radius * Math.sin(phi) * Math.cos(theta);
+            positions[i * 3 + 1] = radius * Math.sin(phi) * Math.sin(theta);
+            positions[i * 3 + 2] = radius * Math.cos(phi);
 
-            temp.push(x, y, z);
+            // Randomly select one of the colors
+            const clr = colorEntries[Math.floor(Math.random() * colorEntries.length)];
+            colors[i * 3] = clr.r;
+            colors[i * 3 + 1] = clr.g;
+            colors[i * 3 + 2] = clr.b;
         }
-        return new Float32Array(temp);
+        return { posArray: positions, colorArray: colors };
     }, [count]);
 
+    // Stars should slowly rotatate independently of the skybox position
     useFrame((state) => {
         if (pointsRef.current) {
-            pointsRef.current.rotation.y += 0.0005;
-            pointsRef.current.rotation.x += 0.0002;
+            pointsRef.current.rotation.y += 0.0001;
+            pointsRef.current.rotation.x += 0.00005;
         }
     });
 
     return (
-        <points ref={pointsRef}>
-            <bufferGeometry>
-                <bufferAttribute
-                    attach="attributes-position"
-                    count={particles.length / 3}
-                    array={particles}
-                    itemSize={3}
+        <group position={position}>
+            <points ref={pointsRef}>
+                <bufferGeometry>
+                    <bufferAttribute
+                        attach="attributes-position"
+                        count={posArray.length / 3}
+                        array={posArray}
+                        itemSize={3}
+                    />
+                    <bufferAttribute
+                        attach="attributes-color"
+                        count={colorArray.length / 3}
+                        array={colorArray}
+                        itemSize={3}
+                    />
+                </bufferGeometry>
+                <pointsMaterial
+                    size={1.5}
+                    vertexColors
+                    transparent
+                    opacity={0.8}
+                    sizeAttenuation={false}
                 />
-            </bufferGeometry>
-            <pointsMaterial
-                size={3}
-                color="#ffffff"
-                transparent
-                opacity={0.8}
-                sizeAttenuation
-            />
-        </points>
+            </points>
+        </group>
     );
 };

@@ -6,6 +6,14 @@ An AI-driven space exploration engine featuring a Rust core for state management
 
 "The Void" is a real-time, voice-interactive space sandbox where the environment and AI agents respond dynamically to your commands. Experience a fully interactive Solar System managed by a high-performance Rust backend and orchestrated by a sophisticated Python AI Director.
 
+## ✨ Core Features
+
+- **Sector History**: Dynamic memory expansion for LLM context, tracking mission progress and environmental changes.
+- **Dynamic Physics Overrides**: Real-time manipulation of orbital mechanics and entity physics via AI Director commands.
+- **Faction Diplomacy System**: Complex relationship mapping between the player and various AI-controlled factions.
+- **Solar System Simulation**: Procedurally generated celestial bodies with accurate (condensed) orbital mechanics.
+- **3D Arcade Flight**: Responsive Yaw/Pitch/Roll controls with dynamic chase camera and auto-forward thrust.
+
 ## 🛠️ Technology Stack
 
 | Component | Technology | Responsibility |
@@ -19,7 +27,7 @@ An AI-driven space exploration engine featuring a Rust core for state management
 - **`apps/web-client`**: React-based PWA utilizing `@react-three/fiber` for real-time 3D rendering and WebRTC for audio.
 - **`apps/python-director`**: The "Dream Architect" processing user intent via Groq and managing proactive AI reactions.
 - **`engines/core-state`**: High-performance ECS-based simulation engine in Rust, serving as the system's source of truth.
-- **`packages/`**: Shared types and utilities used across the monorepo.
+- **`docs/`**: Comprehensive project architecture, roadmap, and technical specifications.
 
 ## 🚀 Getting Started
 

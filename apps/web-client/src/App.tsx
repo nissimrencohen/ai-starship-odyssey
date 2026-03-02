@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import useWebSocket, { ReadyState } from 'react-use-websocket';
-import { Activity, Server, Mic, MicOff, Save, Volume2, VolumeX, Trash2, Send } from 'lucide-react';
+import { Activity, Server, Mic, MicOff, Save, Volume2, VolumeX, ChevronLeft, Send } from 'lucide-react';
 import { Canvas } from '@react-three/fiber';
 import { GameScene } from './components/GameScene';
 import { HUD } from './components/HUD';
@@ -25,6 +25,7 @@ export default function App() {
   const [textInput, setTextInput] = useState("");
   const [aiState, setAiState] = useState<"idle" | "synthesizing" | "orchestrating">("idle");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [isChatVisible, setIsChatVisible] = useState(true);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunks = useRef<Blob[]>([]);
 
@@ -34,61 +35,151 @@ export default function App() {
   });
 
   // ECS WebSocket connection
-  useEffect(() => {
-    console.log('Attempting connection to Rust on 8081...');
-  }, []);
   const { lastMessage: ecsMessage, sendMessage: sendEcsMessage, readyState: ecsReadyState } = useWebSocket('ws://127.0.0.1:8081/ws', {
     shouldReconnect: () => true,
     reconnectInterval: 500,
-    onOpen: () => console.log('CONNECTED TO RUST ENGINE!'),
     onError: (e) => console.error('Rust engine connection error:', e),
   });
 
   // Player Input Stream
   const activeKeysRef = useRef<Set<string>>(new Set());
+  const camYawRef = useRef<number>(Math.PI); // Face toward sun/Earth at spawn
+  const camPitchRef = useRef<number>(0);
+  const isPointerLockedRef = useRef<boolean>(false);
+  const [isPointerLocked, setIsPointerLocked] = useState(false);
 
+  // 60fps input loop — applies keyboard yaw, sends every frame when keys held (for reliable thrust)
+  const lastSentRef = useRef({ keys: '', yaw: 0, pitch: 0 });
   useEffect(() => {
+    let frame: number;
+    const YAW_SPEED = 0.028; // ~1.6°/frame @ 60fps → smooth keyboard turn
+    const loop = () => {
+      // Keyboard yaw: A/ArrowLeft = turn left, D/ArrowRight = turn right
+      if (activeKeysRef.current.has('KeyA') || activeKeysRef.current.has('ArrowLeft')) {
+        camYawRef.current -= YAW_SPEED;
+      }
+      if (activeKeysRef.current.has('KeyD') || activeKeysRef.current.has('ArrowRight')) {
+        camYawRef.current += YAW_SPEED;
+      }
+
+      const keysStr = Array.from(activeKeysRef.current).sort().join(',');
+      const yaw = camYawRef.current;
+      const pitch = camPitchRef.current;
+      const last = lastSentRef.current;
+
+      // Always send while any key is held (ensures thrust/shoot is never lost to WS reconnects)
+      const anyKeyHeld = activeKeysRef.current.size > 0;
+      const changed =
+        anyKeyHeld ||
+        keysStr !== last.keys ||
+        Math.abs(yaw - last.yaw) > 0.0005 ||
+        Math.abs(pitch - last.pitch) > 0.0005;
+
+      if (changed) {
+        sendEcsMessage(JSON.stringify({
+          msg_type: 'player_input',
+          keys: Array.from(activeKeysRef.current),
+          cam_yaw: yaw,
+          cam_pitch: pitch,
+        }));
+        lastSentRef.current = { keys: keysStr, yaw, pitch };
+      }
+      frame = requestAnimationFrame(loop);
+    };
+    frame = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frame);
+  }, [sendEcsMessage]);
+
+  // Key tracking
+  useEffect(() => {
+    const GAME_KEYS = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'ShiftLeft', 'ShiftRight']);
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ignore if user is typing in the chat input
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
-
-      const key = e.code;
-      if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(key)) {
-        if (!activeKeysRef.current.has(key)) {
-          activeKeysRef.current.add(key);
-          const payload = { msg_type: 'player_input', keys: Array.from(activeKeysRef.current) };
-          console.log('[INPUT SEND] KeyDown:', key, payload);
-          sendEcsMessage(JSON.stringify(payload));
-        }
-      }
+      if (GAME_KEYS.has(e.code)) { e.preventDefault(); activeKeysRef.current.add(e.code); }
     };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      const key = e.code;
-      if (activeKeysRef.current.has(key)) {
-        activeKeysRef.current.delete(key);
-        const payload = { msg_type: 'player_input', keys: Array.from(activeKeysRef.current) };
-        console.log('[INPUT SEND] KeyUp:', key, payload);
-        sendEcsMessage(JSON.stringify(payload));
-      }
-    };
-
+    const handleKeyUp = (e: KeyboardEvent) => { activeKeysRef.current.delete(e.code); };
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
+    return () => { window.removeEventListener('keydown', handleKeyDown); window.removeEventListener('keyup', handleKeyUp); };
+  }, []);
+
+  // Mouse look (pointer lock)
+  useEffect(() => {
+    const MOUSE_SENSITIVITY = 0.002;
+    const MAX_PITCH = Math.PI / 2.5; // ~72° up/down limit
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isPointerLockedRef.current) return;
+      camYawRef.current += e.movementX * MOUSE_SENSITIVITY;
+      camPitchRef.current = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, camPitchRef.current - e.movementY * MOUSE_SENSITIVITY));
     };
-  }, [sendEcsMessage]);
+
+    const handleLockChange = () => {
+      const locked = document.pointerLockElement !== null;
+      isPointerLockedRef.current = locked;
+      setIsPointerLocked(locked);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('pointerlockchange', handleLockChange);
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('pointerlockchange', handleLockChange);
+    };
+  }, []);
+
+  // Tab targeting: cycle through enemies sorted by distance from player
+  useEffect(() => {
+    const handleTab = (e: KeyboardEvent) => {
+      if (e.code !== 'Tab') return;
+      if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+      e.preventDefault();
+
+      const ents = ecsEntitiesRef.current;
+      const player = Object.values(ents).find((ent: any) => ent.ent_type === 'player') as any;
+      const px = player?.x || 0;
+      const pz = player?.z || 0;
+
+      const enemies = Object.values(ents).filter(
+        (ent: any) => (ent.ent_type === 'enemy' || ent.ent_type === 'alien_ship') && !ent.is_dying
+      ) as any[];
+
+      if (enemies.length === 0) { setTargetedEntityId(null); return; }
+
+      enemies.sort((a, b) => {
+        const da = Math.sqrt((a.x - px) ** 2 + ((a.z || 0) - pz) ** 2);
+        const db = Math.sqrt((b.x - px) ** 2 + ((b.z || 0) - pz) ** 2);
+        return da - db;
+      });
+
+      const ids = enemies.map((e: any) => e.id as number);
+      setTargetedEntityId(prev => {
+        const currentIdx = ids.indexOf(prev as number);
+        const nextIdx = e.shiftKey
+          ? (currentIdx <= 0 ? ids.length - 1 : currentIdx - 1)
+          : (currentIdx + 1) % ids.length;
+        return ids[nextIdx];
+      });
+    };
+    window.addEventListener('keydown', handleTab);
+    return () => window.removeEventListener('keydown', handleTab);
+  }, []); // stable — reads ecsEntitiesRef directly (ref, not state)
+
+  const requestPointerLock = useCallback(() => {
+    const canvas = document.querySelector('canvas');
+    if (canvas && !isPointerLockedRef.current) {
+      canvas.requestPointerLock();
+    }
+  }, []);
 
   const [ecsEntities, setEcsEntities] = useState<Record<string, any>>({});
   const ecsEntitiesRef = useRef<Record<string, any>>({});
   const [particles, setParticles] = useState<any[]>([]);
   const particlesRef = useRef<any[]>([]);
-  const [zoom, setZoom] = useState(1.0);
+  const [zoom, setZoom] = useState(1.5);
   const [isShaking, setIsShaking] = useState(false);
   const zoomDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastSentZoomRef = useRef(1.0);
+  const lastSentZoomRef = useRef(1.5);
   const shakeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [saveToast, setSaveToast] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
@@ -103,9 +194,14 @@ export default function App() {
   const [isGameOver, setIsGameOver] = useState(false);
   const [showDamageFlash, setShowDamageFlash] = useState(false);
   const [showSuccessFlash, setShowSuccessFlash] = useState(false);
+  const [showBoundaryFlash, setShowBoundaryFlash] = useState(false);
   const prevHealthRef = useRef(100);
   const damageFlashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const successFlashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const boundaryFlashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Tab targeting state
+  const [targetedEntityId, setTargetedEntityId] = useState<number | null>(null);
 
   // Track entities that just spawned to trigger the birth glow animation
   const [newbornIds, setNewbornIds] = useState<Set<number>>(new Set());
@@ -116,7 +212,7 @@ export default function App() {
   const initAudio = useCallback(() => {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      console.log('AudioContext initialized');
+      // AudioContext initialized
     }
     if (audioCtxRef.current.state === 'suspended') {
       audioCtxRef.current.resume();
@@ -172,7 +268,6 @@ export default function App() {
     try {
       const res = await fetch('http://127.0.0.1:8080/save', { method: 'POST', mode: 'cors' });
       if (res.ok) {
-        console.log('Universe saved to disk!');
         setSaveToast(true);
         setTimeout(() => setSaveToast(false), 3000);
       } else {
@@ -199,7 +294,7 @@ export default function App() {
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
       setZoom(prev => {
-        const next = Math.max(0.5, Math.min(5.0, prev - e.deltaY * 0.001));
+        const next = Math.max(0.5, Math.min(5.0, prev + e.deltaY * 0.001));
         return next;
       });
     };
@@ -225,21 +320,14 @@ export default function App() {
           camera_zoom: Math.round(zoom * 100) / 100, // clean float
         }),
       })
-        .then(res => { if (res.ok) console.log('State Sync Success!'); })
+        .then(res => { if (!res.ok) console.warn('State Sync failed:', res.status); })
         .catch(err => console.warn('Zoom sync failed:', err));
     }, 100);
   }, [zoom, worldState]);
 
-  // Audio and recording state handlers remain unchanged
-
-
   // Handle incoming ECS updates
   useEffect(() => {
     if (ecsMessage !== null) {
-      if (!(window as any)._loggedRawEcsMessage) {
-        console.log("[RAW ECS MESSAGE]", ecsMessage.data);
-        (window as any)._loggedRawEcsMessage = true;
-      }
       try {
         const data = JSON.parse(ecsMessage.data);
         if (data.type === 'render_frame') {
@@ -306,32 +394,33 @@ export default function App() {
           playCollisionSound(data.speed ?? 1.0, distance3D);
         }
         if (data.entities) {
+          let entitiesObj: Record<string, any> = {};
           if (Array.isArray(data.entities)) {
-            const entitiesObj: Record<string, any> = {};
             data.entities.forEach((ent: any) => {
               entitiesObj[ent.id] = ent;
             });
 
-            // Print exactly once when we receive our first frame
-            if (!(window as any)._loggedFirstFrame) {
-              console.log('--- FIRST FRAME RECEIVED ---');
-              console.log(`Entities count: ${data.entities.length}`);
-              console.log('Entities output:', data.entities);
-              (window as any)._loggedFirstFrame = true;
-            }
-
-            // ONLY log if the number of entities changes to prevent console spam
-            if (Object.keys(ecsEntitiesRef.current).length !== data.entities.length) {
-              console.log(`[ECS DEBUG] Received ${data.entities.length} entities from Rust Engine. Keys:`, Object.values(entitiesObj).map(e => e.ent_type));
-            }
+            (window as any)._loggedFirstFrame = true;
             ecsEntitiesRef.current = entitiesObj;
             setEcsEntities(entitiesObj);
-            if (Object.keys(entitiesObj).length > 0) {
-              console.log(`[ECS] Received ${Object.keys(entitiesObj).length} entities from Rust engine`);
-            }
           } else {
             ecsEntitiesRef.current = data.entities;
             setEcsEntities(data.entities);
+          }
+
+          // Boundary proximity — flash blue when within 2 000 u of the 32 000 u shell
+          const playerEntBoundary = Array.isArray(data.entities)
+            ? data.entities.find((e: any) => e.ent_type === 'player')
+            : null;
+          if (playerEntBoundary) {
+            const bx = playerEntBoundary.x || 0;
+            const by = playerEntBoundary.y || 0;
+            const bz = playerEntBoundary.z || 0;
+            if (Math.sqrt(bx * bx + by * by + bz * bz) > 30000) {
+              if (boundaryFlashTimeoutRef.current) clearTimeout(boundaryFlashTimeoutRef.current);
+              setShowBoundaryFlash(true);
+              boundaryFlashTimeoutRef.current = setTimeout(() => setShowBoundaryFlash(false), 800);
+            }
           }
 
           // Check for newborn and dying entities from the engine
@@ -399,10 +488,8 @@ export default function App() {
         } else if (data.type === 'frame_update') {
           // Legacy frame streaming (Phase 1 mock)
         } else if (data.type === 'world_state') {
-          console.log("World State Updated:", data.content);
           setWorldState(data.content);
         } else if (data.type === 'proactive_audio') {
-          console.log("Proactive Action Triggered by Engine!");
           setDirectorMessage("Rachel looks on: " + data.text);
           setChatHistory(prev => [...prev, { sender: 'rachel', text: data.text, timestamp: new Date() }]);
           setAiState("synthesizing"); // Re-using valid Loader state Enum
@@ -417,8 +504,6 @@ export default function App() {
           }
           setTimeout(() => setAiState("idle"), 4000);
         } else if (data.type === 'generation_result') {
-          console.log("Received Full Generation Payload!");
-
           if (data.world_state) {
             setWorldState(data.world_state);
           }
@@ -450,7 +535,8 @@ export default function App() {
         sendMessage(JSON.stringify({
           type: 'player_pos',
           x: player.x,
-          y: player.y
+          y: player.y,
+          z: player.z ?? 0,
         }));
       }
     }, 2000); // Every 2 seconds is enough for awareness without flooding
@@ -459,17 +545,12 @@ export default function App() {
 
   const startRecording = async () => {
     try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      console.log("Detected Audio Devices:", devices.filter(d => d.kind === 'audioinput'));
-
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true
         }
       });
-
-      console.log("Active Audio Track ID:", stream.getAudioTracks()[0]?.label);
 
       // Volume Meter Setup
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -510,7 +591,6 @@ export default function App() {
       } else if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
         mimeType = 'audio/webm;codecs=opus';
       }
-      console.log("Selected Recording MimeType:", mimeType);
 
       mediaRecorderRef.current = new MediaRecorder(stream, { mimeType });
       audioChunks.current = [];
@@ -643,6 +723,10 @@ export default function App() {
           0%, 100% { opacity: 1; }
           50%       { opacity: 0; }
         }
+        @keyframes boundary-flash {
+          0%   { opacity: 1; }
+          100% { opacity: 0; }
+        }
       `}</style>
 
       {/* Clears the error state explicitly */}
@@ -653,6 +737,7 @@ export default function App() {
             setDirectorMessage('Awaiting connection to The Void...');
             setChatHistory(prev => prev.filter(m => m.text !== "The Architect's connection is unstable."));
           };
+          return null;
         })()}
       </div>
 
@@ -661,7 +746,14 @@ export default function App() {
       >
 
         {/* WebGL 3D Game Scene */}
-        <div className="absolute inset-0 z-0 w-full h-full">
+        <div className="absolute inset-0 z-0 w-full h-full" onClick={requestPointerLock}>
+          {!isPointerLocked && (
+            <div className="absolute inset-0 flex items-end justify-center z-10 pb-8 pointer-events-none">
+              <div className="bg-black/60 backdrop-blur text-white/70 text-xs font-mono px-4 py-2 rounded-full border border-white/10">
+                Click to enable mouse look · Esc to release
+              </div>
+            </div>
+          )}
           <Canvas gl={{ antialias: true, alpha: true }} shadows>
             <GameScene
               ecsEntities={ecsEntities}
@@ -671,8 +763,55 @@ export default function App() {
               dyingIds={dyingIds}
               realityOverride={worldState?.reality_override}
               playerSpaceship={worldState?.player_spaceship}
+              camYawRef={camYawRef}
+              camPitchRef={camPitchRef}
+              targetedEntityId={targetedEntityId}
             />
           </Canvas>
+        </div>
+
+        {/* Boundary Warning Flash */}
+        {showBoundaryFlash && (
+          <div
+            className="absolute inset-0 pointer-events-none z-[175]"
+            style={{
+              background: 'radial-gradient(ellipse at center, transparent 30%, rgba(100, 40, 255, 0.55) 100%)',
+              animation: 'boundary-flash 0.8s ease-out forwards',
+            }}
+          />
+        )}
+
+        {/* ── Top-right control bar ──────────────────────────────────────── */}
+        <div className="fixed z-[150] flex items-center gap-2" style={{ top: '24px', right: '24px' }}>
+          {/* Director connection status */}
+          <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-black/40 backdrop-blur border border-white/10 rounded-lg">
+            <div className={`w-1.5 h-1.5 rounded-full ${readyState === ReadyState.OPEN ? 'bg-green-400' : 'bg-red-500 animate-pulse'}`} />
+            <span className="text-[9px] font-mono text-neutral-400 uppercase tracking-widest">
+              {readyState === ReadyState.OPEN ? 'Connected to Director' : 'Director Offline'}
+            </span>
+          </div>
+
+          {/* Rachel voice toggle */}
+          <button
+            onClick={() => setIsRachelEnabled(v => !v)}
+            className={`px-2.5 py-1.5 border rounded-lg text-[9px] font-mono font-bold uppercase tracking-widest transition-all ${isRachelEnabled
+                ? 'bg-purple-500/20 border-purple-500/50 text-purple-400 hover:bg-purple-500/30'
+                : 'bg-neutral-800/60 border-white/10 text-neutral-500 hover:text-neutral-300'
+              }`}
+            title="Toggle Rachel voice"
+          >
+            Rachel: {isRachelEnabled ? 'ON' : 'OFF'}
+          </button>
+
+
+          {/* Mute */}
+          <button
+            onClick={() => setIsMuted(v => !v)}
+            className="w-8 h-8 flex items-center justify-center bg-black/40 backdrop-blur border border-white/10 rounded-lg text-neutral-400 hover:text-white hover:bg-white/10 transition-all"
+            title={isMuted ? 'Unmute sounds' : 'Mute sounds'}
+          >
+            {isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+          </button>
         </div>
 
         {/* Tactical HUD Overlay */}
@@ -685,13 +824,23 @@ export default function App() {
           showSuccessFlash={showSuccessFlash}
           isGameOver={isGameOver}
           objective={objective}
+          isChatVisible={isChatVisible}
         />
 
         {/* The Director's Console (Left Sidebar) */}
-        <div className="fixed left-0 top-0 h-screen w-[450px] bg-black/80 backdrop-blur-3xl border-r border-white/10 z-50 flex flex-col p-6 overflow-hidden transition-all duration-500 ease-in-out shadow-[10px_0_50px_rgba(0,0,0,0.5)]">
-          <div className="flex items-center space-x-3 mb-8">
-            <div className="w-2 h-2 rounded-full bg-purple-500 animate-pulse"></div>
-            <h2 className="text-xs font-bold text-neutral-400 uppercase tracking-[0.2em]">Director's Console</h2>
+        <div className={`fixed left-0 top-0 h-screen w-[450px] bg-black/80 backdrop-blur-3xl border-r border-white/10 z-50 flex flex-col p-6 transition-all duration-500 cubic-bezier(0.4, 0, 0.2, 1) shadow-[10px_0_50px_rgba(0,0,0,0.5)] ${isChatVisible ? 'translate-x-0 opacity-100' : '-translate-x-full opacity-0'}`}>
+          <div className="flex items-center justify-between mb-8">
+            <div className="flex items-center space-x-3">
+              <div className="w-2 h-2 rounded-full bg-purple-500 animate-pulse"></div>
+              <h2 className="text-xs font-bold text-neutral-400 uppercase tracking-[0.2em]">Director's Console</h2>
+            </div>
+            <button
+              onClick={() => setIsChatVisible(false)}
+              className="p-1 hover:bg-white/10 rounded-lg transition-colors text-neutral-500 hover:text-white"
+              title="Minimize Console"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
           </div>
 
           <div className="flex-1 flex flex-col gap-6 min-h-0">
@@ -781,80 +930,16 @@ export default function App() {
           </div>
         </div>
 
-        {/* Main Content Viewport (Unobstructed Center) */}
-        <div className="relative z-10 flex flex-col w-full h-full pointer-events-none flex-1">
-          {/* Top Spacing for HUD */}
-          <div className="h-24 w-full"></div>
-
-          <div className="flex-1 flex items-center justify-center pointer-events-none">
-            {/* Void State UI: only visible when truly disconnected from EVERYTHING */}
-            {ecsReadyState !== ReadyState.OPEN && Object.keys(ecsEntities).length === 0 && !worldState && (
-              <div className="w-full max-w-xl aspect-video bg-neutral-900/50 backdrop-blur rounded-3xl overflow-hidden shadow-2xl border border-neutral-800 ring-1 ring-white/10 flex items-center justify-center pointer-events-auto">
-                <div className="flex flex-col items-center justify-center bg-gradient-to-b from-neutral-900/50 to-neutral-950 w-full h-full">
-                  <Activity className={`w-12 h-12 text-purple-500/40 mb-4 ${isRecording ? 'animate-pulse text-purple-400' : ''}`} />
-                  <p className="text-neutral-500 font-mono text-sm tracking-widest uppercase">
-                    {ecsReadyState === ReadyState.CONNECTING ? 'Connecting to Engine...' : 'The Void is Empty'}
-                  </p>
-                </div>
-              </div>
-            )}
-          </div>
-
-
-          {/* Relocated Controls to Sidebar in v7.5 */}
-
-          {/* HUD: Target Controls (Save, Audio, TTS Toggle) */}
-          <div className="absolute top-6 right-6 flex items-center space-x-3 z-[100] pointer-events-auto">
-            <button
-              onClick={handleClearWorld}
-              title="Clear Matrix"
-              className="relative z-[100] flex items-center justify-center w-9 h-9 rounded-lg bg-neutral-800/80 backdrop-blur border border-white/10 hover:bg-neutral-700 hover:border-red-500/40 text-neutral-400 hover:text-red-400 transition-all duration-200 shadow-lg mr-2"
-            >
-              <Trash2 className="w-4 h-4" />
-            </button>
-            <button
-              onClick={() => setIsRachelEnabled(r => !r)}
-              title={isRachelEnabled ? 'Disable Rachel Voice' : 'Enable Rachel Voice'}
-              className={`text-[10px] font-bold tracking-wider uppercase px-3 h-9 rounded-lg backdrop-blur border transition-all duration-200 shadow-lg ${isRachelEnabled
-                ? 'bg-purple-900/40 border-purple-500/30 text-purple-300 hover:bg-purple-800/50'
-                : 'bg-neutral-800/80 border-white/10 text-neutral-500 hover:bg-neutral-700 hover:text-neutral-400'
-                }`}
-            >
-              Rachel: {isRachelEnabled ? 'ON' : 'OFF'}
-            </button>
-            <button
-              onClick={handleSave}
-              title="Save Universe"
-              className="flex items-center justify-center w-9 h-9 rounded-lg bg-neutral-800/80 backdrop-blur border border-white/10 hover:bg-neutral-700 hover:border-purple-500/40 text-neutral-400 hover:text-purple-300 transition-all duration-200 shadow-lg"
-            >
-              <Save className="w-4 h-4" />
-            </button>
-            <button
-              onClick={() => { initAudio(); setIsMuted(m => !m); }}
-              title={isMuted ? 'Unmute' : 'Mute'}
-              className={`flex items-center justify-center w-9 h-9 rounded-lg backdrop-blur border transition-all duration-200 shadow-lg ${isMuted
-                ? 'bg-red-900/40 border-red-500/30 text-red-400 hover:bg-red-800/50'
-                : 'bg-neutral-800/80 border-white/10 text-neutral-400 hover:bg-neutral-700 hover:border-emerald-500/40 hover:text-emerald-300'
-                }`}
-            >
-              {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-            </button>
-            <div className={`w-2 h-2 rounded-full ${readyState === ReadyState.OPEN ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]' : 'bg-amber-500 animate-pulse'}`}></div>
-            <span className="text-xs font-mono text-neutral-500 uppercase tracking-wider">{connectionStatus}</span>
-          </div>
-
-          {/* Toast: Universe Saved */}
-          {saveToast && (
-            <div className="absolute top-16 right-6 toast-anim z-50">
-              <div className="flex items-center space-x-2 bg-emerald-500/20 backdrop-blur-md border border-emerald-400/30 text-emerald-300 px-4 py-2.5 rounded-xl shadow-2xl">
-                <Save className="w-4 h-4" />
-                <span className="text-sm font-medium tracking-wide">Universe Saved to Disk</span>
-              </div>
-            </div>
-          )}
-        </div>
+        {/* Global UI Toggle (Visible when sidebar is hidden) */}
+        {!isChatVisible && (
+          <button
+            onClick={() => setIsChatVisible(true)}
+            className="fixed left-6 top-6 z-50 w-10 h-10 bg-black/40 backdrop-blur-xl border border-white/10 rounded-xl flex items-center justify-center text-neutral-400 hover:text-white hover:bg-white/10 transition-all shadow-2xl group"
+          >
+            <Server className="w-5 h-5 group-hover:scale-110 transition-transform" />
+          </button>
+        )}
       </div>
     </>
   );
 }
-

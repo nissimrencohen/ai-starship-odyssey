@@ -4,13 +4,14 @@ mod systems;
 use bevy_ecs::prelude::*;
 use warp::Filter;
 use std::sync::{Arc, Mutex};
-use components::{WorldState, Transform, EntityType, Name, PhysicsType, BirthAge, DeathAge, SteeringAgent, SpatialAnomaly, Particle, Projectile, PlayerInputMessage, Health, Faction, Visuals, UpdatePlayerRequest, Parent, SpawnAge, WeaponParameters, CommandRequest};
+use components::{WorldState, Transform, EntityType, Name, PhysicsType, BirthAge, DeathAge, SteeringAgent, SpatialAnomaly, Particle, Projectile, PlayerInputMessage, Health, Faction, Visuals, UpdatePlayerRequest, Parent, SpawnAge, WeaponParameters, CommandRequest, TargetLock, PersistentId, ModelVariant, Scale, PhysicsConstants, FactionRelations};
 use serde::{Serialize, Deserialize};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use rand::Rng;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use systems::MAX_WORLD_RADIUS;
 
 // Global Entity ID counter for external AI targeting
 static GLOBAL_ENTITY_ID: AtomicU64 = AtomicU64::new(1);
@@ -23,22 +24,36 @@ struct PlayerInputState {
     pub left: bool,
     pub right: bool,
     pub shoot: bool,
+    pub boost: bool,
+    pub cam_yaw: f64,
+    pub cam_pitch: f64,
+}
+
+#[derive(Resource)]
+struct PlayerPhysicsState {
+    pub rotational_vel: f64,
+}
+
+impl Default for PlayerPhysicsState {
+    fn default() -> Self {
+        Self { rotational_vel: 0.0 }
+    }
 }
 
 impl Default for PlayerInputState {
     fn default() -> Self {
-        Self { up: false, down: false, left: false, right: false, shoot: false }
+        Self { up: false, down: false, left: false, right: false, shoot: false, boost: false, cam_yaw: 0.0, cam_pitch: 0.0 }
     }
 }
 
 #[derive(Serialize)]
 struct EntityData {
     id: u32,
-    x: f32,
-    y: f32,
-    z: f32,
-    rotation: f32,
-    speed: f32,
+    x: f64,
+    y: f64,
+    z: f64,
+    rotation: f64,
+    speed: f64,
     ent_type: String,
     color: String,
     is_newborn: bool,
@@ -46,30 +61,36 @@ struct EntityData {
     behavior: String,
     faction: String,
     name: Option<String>,
-    radius: Option<f32>,
+    radius: Option<f64>,
     anomaly_type: Option<String>,
-    anomaly_radius: Option<f32>,
+    anomaly_radius: Option<f64>,
     model_type: Option<String>,
     custom_color: Option<String>,
     parent_id: Option<u32>,
-    spawn_age: Option<f32>,
+    spawn_age: Option<f64>,
     persistent_id: Option<u64>,
     target_lock_id: Option<u32>,
+    is_cloaked: bool,
+    scale: Option<f64>,
+    model_variant: Option<u32>,
+    projectile_size: Option<f64>,
+    health_current: Option<f64>,
+    health_max: Option<f64>,
 }
 
 #[derive(Deserialize, Debug)]
 struct SpawnEntityRequest {
     ent_type: String,
-    x: f32,
-    y: f32,
+    x: f64,
+    y: f64,
     physics: String,
     faction: Option<String>,
-    radius: Option<f32>,
-    speed: Option<f32>,
-    amplitude: Option<f32>,
-    frequency: Option<f32>,
+    radius: Option<f64>,
+    speed: Option<f64>,
+    amplitude: Option<f64>,
+    frequency: Option<f64>,
     anomaly_type: Option<String>,
-    mass: Option<f32>,
+    mass: Option<f64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -84,11 +105,27 @@ struct ModifyRequest {
     id: u32,
     physics: Option<String>,
     color: Option<String>,
-    radius: Option<f32>,
-    speed: Option<f32>,
-    amplitude: Option<f32>,
-    frequency: Option<f32>,
+    radius: Option<f64>,
+    speed: Option<f64>,
+    amplitude: Option<f64>,
+    frequency: Option<f64>,
     behavior: Option<String>,
+}
+
+/// Request body for POST /api/physics
+#[derive(Deserialize, Debug)]
+struct PhysicsUpdateRequest {
+    gravity_scale: Option<f64>,
+    friction: Option<f64>,
+    projectile_speed_mult: Option<f64>,
+}
+
+/// Single faction-pair affinity update for POST /api/factions
+#[derive(Deserialize, Debug)]
+struct FactionPairUpdate {
+    faction_a: String,
+    faction_b: String,
+    affinity: f64,
 }
 
 #[derive(Serialize)]
@@ -96,23 +133,23 @@ struct CollisionEvent {
     #[serde(rename = "type")]
     msg_type: String,
     star_id: u32,
-    speed: f32,
-    distance: f32,
+    speed: f64,
+    distance: f64,
 }
 
 #[derive(Serialize)]
 struct SpatialGrid {
-    size: f32,
+    size: f64,
     divisions: u32,
 }
 
 #[derive(Serialize)]
 struct ParticleData {
-    x: f32,
-    y: f32,
-    z: f32,
-    lifespan: f32,
-    max_lifespan: f32,
+    x: f64,
+    y: f64,
+    z: f64,
+    lifespan: f64,
+    max_lifespan: f64,
     color: String,
 }
 
@@ -125,7 +162,7 @@ struct RenderFrameState {
     grid: SpatialGrid,
     entities: Vec<EntityData>,
     particles: Vec<ParticleData>,
-    player_health: f32,
+    player_health: f64,
     score: u32,
     current_level: u32,
     is_game_over: bool,
@@ -135,35 +172,60 @@ struct RenderFrameState {
 }
 
 // ---------- Helpers for Level Progression ----------
-fn spawn_wave(w: &mut World, count: usize, faction: &str, ent_type: &str, dist_range: (f32, f32)) {
+fn spawn_wave(w: &mut World, count: usize, faction: &str, ent_type: &str, dist_range: (f64, f64), variant: u32) {
     let mut rng = rand::thread_rng();
     for _ in 0..count {
-        let radius = rng.gen_range(dist_range.0..dist_range.1); 
-        let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+        let radius = rng.gen_range(dist_range.0..dist_range.1);
+        let angle = rng.gen_range(0.0..std::f64::consts::TAU);
         let speed = rng.gen_range(20.0..60.0);
+
+        // Per-tier weapon and visual parameters
+        let (proj_color, proj_size, proj_count, proj_spread) = match variant {
+            2 => ("#aa44ff".to_string(), 16.0_f64, 3_u32, 0.35_f64), // Mothership: violet bursts
+            1 => ("#00ff88".to_string(), 10.0_f64, 2_u32, 0.20_f64), // Ravager: twin green bolts
+            _ => ("#ff3333".to_string(),  6.0_f64, 1_u32, 0.10_f64), // Swarmer: single red shot
+        };
+
         let mut ent_mut = w.spawn((
             components::EntityType(ent_type.to_string()),
-            components::Transform { x: angle.cos() * radius, y: angle.sin() * radius, z: 0.0, rotation: angle },
+            components::Transform { x: angle.cos() * radius, y: rng.gen_range(-200.0..200.0), z: angle.sin() * radius, rotation: angle },
             components::PhysicsType::Orbital { radius, speed: rng.gen_range(0.5..1.5), angle },
             components::BirthAge(0.0),
             components::Faction(faction.to_string()),
             components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
+            components::Visuals {
+                model_type: None,
+                color: if variant == 2 { "#a855f7" } else if variant == 1 { "#10b981" } else { "#ef4444" }.to_string(),
+                is_cloaked: false,
+            },
+            components::ModelVariant(variant),
+            components::Scale(if variant == 2 { 6.0 } else if variant == 1 { 3.0 } else { 2.0 }), // 2× larger
+            Health {
+                max: if variant == 2 { 500.0 } else if variant == 1 { 150.0 } else { 40.0 },
+                current: if variant == 2 { 500.0 } else if variant == 1 { 150.0 } else { 40.0 },
+            },
         ));
-        
+
         if ent_type == "enemy" || ent_type == "companion" {
             ent_mut.insert(components::SteeringAgent {
-                behavior: "attack".to_string(), 
+                behavior: "attack".to_string(),
                 velocity: (0.0, 0.0, 0.0),
-                max_speed: speed,
+                max_speed: speed * 0.5 * (if variant == 2 { 0.5 } else { 1.0 }), // half speed
                 max_force: 2.0,
+            });
+            ent_mut.insert(WeaponParameters {
+                projectile_count: proj_count,
+                projectile_color: proj_color,
+                spread: proj_spread,
+                projectile_size: proj_size,
             });
         }
     }
 }
 
-fn spawn_anomaly(w: &mut World, anomaly_type: &str, mass: f32, radius: f32, dist: f32) {
+fn spawn_anomaly(w: &mut World, anomaly_type: &str, mass: f64, radius: f64, dist: f64) {
     let mut rng = rand::thread_rng();
-    let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+    let angle = rng.gen_range(0.0..std::f64::consts::TAU);
     w.spawn((
         components::EntityType("anomaly".to_string()),
         components::Transform { x: angle.cos() * dist, y: angle.sin() * dist, z: 0.0, rotation: 0.0 },
@@ -184,6 +246,14 @@ struct SnapshotEntity {
     ent_type: String,
     transform: components::Transform,
     physics_type: components::PhysicsType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_variant: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_type: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -192,24 +262,40 @@ struct Snapshot {
     environment_theme: String,
     terrain_rules: String,
     physics_mode: String,
-    camera_zoom: f32,
+    camera_zoom: f64,
+    player_health: f64,
+    score: u32,
+    current_level: u32,
     entities: Vec<SnapshotEntity>,
 }
 
-/// Captures all current entities + WorldState and writes world_snap.json
+/// Captures restorable entities (enemies, companions, alien_ships) + WorldState + player stats
+/// and writes world_snap.json next to the project root.
 fn save_world_to_disk(
     world: &mut World,
     state: &Arc<Mutex<WorldState>>,
+    player_health: f64,
+    score: u32,
+    current_level: u32,
 ) -> Result<(), String> {
     let ws = state.lock().map_err(|e| format!("Lock error: {}", e))?;
 
+    const SAVEABLE: &[&str] = &["enemy", "alien_ship", "companion", "space_station"];
+
     let mut entities = Vec::new();
-    let mut query = world.query::<(&EntityType, &Transform, &PhysicsType)>();
-    for (ent_type, transform, phys) in query.iter(world) {
+    let mut query = world.query::<(&EntityType, &Transform, &PhysicsType, Option<&components::ModelVariant>, Option<&components::Scale>, Option<&Visuals>)>();
+    for (ent_type, transform, phys, variant_opt, scale_opt, visuals_opt) in query.iter(world) {
+        if !SAVEABLE.contains(&ent_type.0.as_str()) {
+            continue;
+        }
         entities.push(SnapshotEntity {
             ent_type: ent_type.0.clone(),
             transform: transform.clone(),
             physics_type: phys.clone(),
+            model_variant: variant_opt.map(|m| m.0),
+            scale: scale_opt.map(|s| s.0),
+            color: visuals_opt.map(|v| v.color.clone()),
+            model_type: visuals_opt.and_then(|v| v.model_type.clone()),
         });
     }
 
@@ -219,6 +305,9 @@ fn save_world_to_disk(
         terrain_rules: ws.terrain_rules.clone(),
         physics_mode: ws.physics_mode.clone(),
         camera_zoom: ws.camera_zoom,
+        player_health,
+        score,
+        current_level,
         entities,
     };
 
@@ -288,9 +377,9 @@ fn sync_state_system(
 }
 
 pub struct RealityModifiers {
-    pub gravity: f32,
-    pub player_speed: f32,
-    pub friction: f32,
+    pub gravity: f64,
+    pub player_speed: f64,
+    pub friction: f64,
 }
 
 impl Default for RealityModifiers {
@@ -322,25 +411,30 @@ async fn main() {
     let state = Arc::new(Mutex::new(initial_state));
 
     // Shared lerp target: set by /state handler, consumed by the game loop each tick.
-    // Option<(f32, f32)> = None means "no override pending".
-    let player_target: Arc<Mutex<Option<(f32, f32)>>> = Arc::new(Mutex::new(None));
+    // Option<(f64, f64)> = None means "no override pending".
+    let player_target: Arc<Mutex<Option<(f64, f64)>>> = Arc::new(Mutex::new(None));
 
     let world = Arc::new(Mutex::new(World::new()));
     {
         let mut w = world.lock().unwrap();
         w.insert_resource(SharedState(state.clone()));
+        w.insert_resource(PlayerPhysicsState::default());
+        w.insert_resource(PhysicsConstants::default());
+        w.insert_resource(FactionRelations::default());
 
         // --- THE PLAYER ---
+        println!("[Engine] Spawning player at ({}, {}, {})", 8500.0, 500.0, 0.0);
         w.spawn((
             EntityType("player".to_string()),
-            Transform { x: 500.0, y: 0.0, z: 0.0, rotation: 0.0 }, // Start near Earth
-            PhysicsType::Static,
+            Transform { x: 8500.0, y: 500.0, z: 0.0, rotation: 0.0 }, // Start near Earth
+            PhysicsType::Velocity { vx: 0.0, vy: 0.0, vz: 0.0 },
             Health { max: 100.0, current: 100.0 },
-            Visuals { model_type: Some("ufo".to_string()), color: "cyan".to_string() },
+            Visuals { model_type: Some("ufo".to_string()), color: "cyan".to_string(), is_cloaked: false },
             WeaponParameters {
                 projectile_count: 1,
                 projectile_color: "#ef4444".to_string(),
                 spread: 0.15,
+                projectile_size: 8.0,
             },
             components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
         ));
@@ -355,32 +449,32 @@ async fn main() {
             components::SpatialAnomaly {
                 anomaly_type: "sun".to_string(), 
                 mass: 50000.0,
-                radius: 300.0, // Rescaled Sun
+                radius: 1500.0, // Increased Sun Physical Radius (1.5x)
             },
             components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
         ));
 
-        // 2. THE PLANETS: Condense for Phase 6.4 (1 AU = 1,000 units, Max 30,000)
+        // 2. THE PLANETS: Refactored for X-Z Plane and Hardcoded Distances
         let planet_configs = vec![
-            ("Mercury", 400.0,   0.8, 40.0),
-            ("Venus",   700.0,   0.6, 85.0),
-            ("Earth",   1000.0,  0.4, 100.0),
-            ("Mars",    1500.0,  0.35, 60.0),
-            ("Jupiter", 5000.0,  0.2, 250.0),
-            ("Saturn",  9000.0,  0.15, 210.0),
-            ("Uranus",  17000.0, 0.1, 140.0),
-            ("Neptune", 30000.0, 0.08, 130.0),
+            ("Mercury", 3500.0,  0.8, 80.0),   // 2x
+            ("Venus",   5500.0,  0.6, 170.0),  // 2x
+            ("Earth",   8000.0,  0.4, 200.0),  // 2x
+            ("Mars",    11000.0, 0.35, 120.0), // 2x
+            ("Jupiter", 17000.0, 0.2, 500.0),  // 2x
+            ("Saturn",  23000.0, 0.15, 420.0), // 2x
+            ("Uranus",  27000.0, 0.1, 280.0),  // 2x
+            ("Neptune", 30000.0, 0.08, 260.0), // 2x
         ];
 
         for (name, dist, speed, size) in planet_configs {
-            let angle = rand::thread_rng().gen_range(0.0..std::f32::consts::TAU);
+            let angle = if name == "Earth" { 0.0 } else { rand::thread_rng().gen_range(0.0..std::f64::consts::TAU) };
             let planet_id = w.spawn((
                 EntityType("planet".to_string()),
                 Name(name.to_string()),
                 Transform { 
                     x: angle.cos() * dist, 
-                    y: angle.sin() * dist, 
-                    z: 0.0, 
+                    y: rand::thread_rng().gen_range(-300.0..300.0), // Orbital Inclination
+                    z: angle.sin() * dist, 
                     rotation: 0.0 
                 },
                 PhysicsType::Orbital { radius: dist, speed, angle },
@@ -389,48 +483,102 @@ async fn main() {
                     mass: 0.0,
                     radius: size, 
                 },
+                components::Scale(1.0),
+                components::ModelVariant(0),
                 components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
             )).id().index();
 
-            // --- MOON SPANNING (Rescaled) ---
+            // --- MOON SPANNING (4x Rescaled) ---
             match name {
                 "Earth" => {
                     w.spawn((
                         EntityType("moon".to_string()),
                         Name("Luna".to_string()),
-                        Transform { x: 250.0, y: 0.0, z: 0.0, rotation: 0.0 },
-                        PhysicsType::Orbital { radius: 250.0, speed: 1.02, angle: 0.0 },
-                        components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 25.0 },
+                        Transform { x: 350.0, y: 0.0, z: 0.0, rotation: 0.0 }, // Increased offset
+                        PhysicsType::Orbital { radius: 350.0, speed: 1.02, angle: 0.0 },
+                        components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 100.0 }, // 4x (25 -> 100)
                         Parent(planet_id),
-                        Visuals { model_type: Some("sphere".to_string()), color: "#a8a8a8".to_string() }
+                        Visuals { model_type: Some("sphere".to_string()), color: "#a8a8a8".to_string(), is_cloaked: false }
                     ));
                 },
                 "Mars" => {
-                    w.spawn((EntityType("moon".to_string()), Name("Phobos".to_string()), Transform { x: 120.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 120.0, speed: 2.14, angle: 0.5 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 15.0 }, Parent(planet_id), Visuals { model_type: Some("asteroid".to_string()), color: "#5c534b".to_string() }));
-                    w.spawn((EntityType("moon".to_string()), Name("Deimos".to_string()), Transform { x: 200.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 200.0, speed: 1.35, angle: 2.1 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 12.0 }, Parent(planet_id), Visuals { model_type: Some("asteroid".to_string()), color: "#8c7e71".to_string() }));
+                    w.spawn((EntityType("moon".to_string()), Name("Phobos".to_string()), Transform { x: 220.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 220.0, speed: 2.14, angle: 0.5 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 60.0 }, Parent(planet_id), Visuals { model_type: Some("asteroid".to_string()), color: "#5c534b".to_string(), is_cloaked: false })); // 4x (15 -> 60)
+                    w.spawn((EntityType("moon".to_string()), Name("Deimos".to_string()), Transform { x: 300.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 300.0, speed: 1.35, angle: 2.1 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 48.0 }, Parent(planet_id), Visuals { model_type: Some("asteroid".to_string()), color: "#8c7e71".to_string(), is_cloaked: false })); // 4x (12 -> 48)
                 },
                 "Jupiter" => {
-                    w.spawn((EntityType("moon".to_string()), Name("Io".to_string()), Transform { x: 450.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 450.0, speed: 1.73, angle: 0.0 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 35.0 }, Parent(planet_id), Visuals { model_type: Some("sphere".to_string()), color: "#e6c13e".to_string() }));
-                    w.spawn((EntityType("moon".to_string()), Name("Europa".to_string()), Transform { x: 600.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 600.0, speed: 1.37, angle: 1.2 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 30.0 }, Parent(planet_id), Visuals { model_type: Some("sphere".to_string()), color: "#c2b19f".to_string() }));
+                    w.spawn((EntityType("moon".to_string()), Name("Io".to_string()), Transform { x: 650.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 650.0, speed: 1.73, angle: 0.0 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 140.0 }, Parent(planet_id), Visuals { model_type: Some("sphere".to_string()), color: "#e6c13e".to_string(), is_cloaked: false })); // 4x (35 -> 140)
+                    w.spawn((EntityType("moon".to_string()), Name("Europa".to_string()), Transform { x: 800.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 800.0, speed: 1.37, angle: 1.2 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 120.0 }, Parent(planet_id), Visuals { model_type: Some("sphere".to_string()), color: "#c2b19f".to_string(), is_cloaked: false })); // 4x (30 -> 120)
                 },
                 "Saturn" => {
-                    w.spawn((EntityType("moon".to_string()), Name("Titan".to_string()), Transform { x: 700.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 700.0, speed: 0.56, angle: 3.1 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 60.0 }, Parent(planet_id), Visuals { model_type: Some("sphere".to_string()), color: "#d19b45".to_string() }));
+                    w.spawn((EntityType("moon".to_string()), Name("Titan".to_string()), Transform { x: 900.0, y: 0.0, z: 0.0, rotation: 0.0 }, PhysicsType::Orbital { radius: 900.0, speed: 0.56, angle: 3.1 }, components::SpatialAnomaly { anomaly_type: "moon".to_string(), mass: 0.0, radius: 240.0 }, Parent(planet_id), Visuals { model_type: Some("sphere".to_string()), color: "#d19b45".to_string(), is_cloaked: false })); // 4x (60 -> 240)
                 },
                 _ => {}
             }
         }
 
-        // 3. SCATTERED ASTEROIDS (Requirement 3)
+        // 3. GLOBAL ASTEROID DISTRIBUTION — 3000 spread between 3k–32k.
+        // Only nearby asteroids are sent per frame (distance culling), so the total count
+        // doesn't affect network throughput. 
         let mut rng = rand::thread_rng();
-        for _ in 0..200 {
-            let x = rng.gen_range(-30000.0..30000.0);
-            let y = rng.gen_range(-30000.0..30000.0);
+        for _ in 0..3000 {
+            // Non-clumping polar distribution using sqrt()
+            let r = 3000.0 + (32000.0 - 3000.0) * rng.gen::<f64>().sqrt();
+            let theta = rng.gen_range(0.0..std::f64::consts::TAU);
+            let x = r * theta.cos();
+            let z = r * theta.sin();
+            let y = rng.gen_range(-8000.0..8000.0); // Expanded Y depth
+            let scale_val = rng.gen_range(0.5..2.5);
+            let variant = rng.gen_range(0..5);
             w.spawn((
                 EntityType("asteroid".to_string()),
-                Transform { x, y, z: 0.0, rotation: rng.gen_range(0.0..std::f32::consts::TAU) },
-                PhysicsType::Static,
-                components::SpatialAnomaly { anomaly_type: "asteroid".to_string(), mass: 0.0, radius: rng.gen_range(50.0..150.0) },
+                Transform { x, y, z, rotation: rng.gen_range(0.0..std::f64::consts::TAU) },
+                // No PhysicsType — asteroids are truly static and skipping them from ECS
+                // physics queries gives a huge performance boost (5000 fewer iterations/tick).
+                components::SpatialAnomaly { anomaly_type: "asteroid".to_string(), mass: 0.0, radius: rng.gen_range(5.0..40.0) },
+                components::Scale(scale_val),
+                components::ModelVariant(variant),
                 components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
+            ));
+        }
+
+        // 4. NEW ENTITY TYPES: SpaceStations & AlienShips
+        for i in 0..5 {
+            let r = 5000.0 + (30000.0 - 5000.0) * rng.gen::<f64>().sqrt();
+            let angle = rng.gen_range(0.0..std::f64::consts::TAU);
+            w.spawn((
+                EntityType("space_station".to_string()),
+                Name(format!("Station-{}", i)),
+                Transform { x: angle.cos() * r, y: rng.gen_range(-2000.0..2000.0), z: angle.sin() * r, rotation: 0.0 },
+                PhysicsType::Static,
+                components::SpatialAnomaly { anomaly_type: "station".to_string(), mass: 1000.0, radius: 400.0 },
+                components::Scale(1.0),
+                components::ModelVariant(0),
+                Visuals { model_type: Some("station".to_string()), color: "#ffffff".to_string(), is_cloaked: false },
+                components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
+            ));
+        }
+
+        for i in 0..12 {
+            let r = 3000.0 + (28000.0 - 3000.0) * rng.gen::<f64>().sqrt();
+            let angle = rng.gen_range(0.0..std::f64::consts::TAU);
+            w.spawn((
+                EntityType("enemy".to_string()),
+                Name(format!("Alien-{}", i)),
+                Transform { x: angle.cos() * r, y: rng.gen_range(-2000.0..2000.0), z: angle.sin() * r, rotation: 0.0 },
+                PhysicsType::Velocity { vx: 0.0, vy: 0.0, vz: 0.0 },
+                components::SteeringAgent {
+                    velocity: (0.0, 0.0, 0.0),
+                    max_speed: 7.5, // halved from 15.0
+                    max_force: 0.5,
+                    behavior: "wander".to_string(),
+                },
+                components::Faction("pirate".to_string()),
+                components::SpatialAnomaly { anomaly_type: "alien".to_string(), mass: 0.0, radius: 100.0 },
+                components::Scale(2.4), // doubled from 1.2
+                components::ModelVariant(rng.gen_range(0..2)),
+                Visuals { model_type: Some("enemy".to_string()), color: "rgba(239, 68, 68, 0.85)".to_string(), is_cloaked: false },
+                components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
+                WeaponParameters { projectile_count: 1, projectile_color: "#ff3333".to_string(), spread: 0.1, projectile_size: 6.0 },
             ));
         }
         println!("Solar System initialized with Sun, 8 planets, and scattered asteroids.");
@@ -459,6 +607,22 @@ async fn main() {
     let reality_for_sys = reality_modifiers.clone();
     let reality_for_state = reality_modifiers.clone();
 
+    // ---------- Survival State (declared before routes so handlers can access them) ----------
+    let player_health: Arc<Mutex<f64>> = Arc::new(Mutex::new(100.0));
+    let damage_cooldown: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    let player_knockback: Arc<Mutex<(f64, f64)>> = Arc::new(Mutex::new((0.0, 0.0)));
+    let total_kills: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let total_enemy_kills: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let total_asteroid_kills: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let level_start_time: Arc<Mutex<std::time::Instant>> = Arc::new(Mutex::new(std::time::Instant::now()));
+    let game_over_timer: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    // Signal: HTTP route sets true → game loop resets level + entities
+    let do_full_reset: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    // Signal: HTTP route sets Some(n) → game loop resets current_level to n
+    let override_level: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    // Shared current level for save route to read
+    let current_level_shared: Arc<Mutex<u32>> = Arc::new(Mutex::new(1));
+
     let update_state = warp::post()
         .and(warp::path("state"))
         .and(warp::body::json())
@@ -466,7 +630,7 @@ async fn main() {
         .and(warp::any().map(move || clients_for_state.clone()))
         .and(warp::any().map(move || player_target_for_state.clone()))
         .and(warp::any().map(move || reality_for_state.clone()))
-        .map(|new_state: WorldState, state: Arc<Mutex<WorldState>>, _clients: Clients, pt: Arc<Mutex<Option<(f32, f32)>>>, rm: Arc<Mutex<RealityModifiers>>| {
+        .map(|new_state: WorldState, state: Arc<Mutex<WorldState>>, _clients: Clients, pt: Arc<Mutex<Option<(f64, f64)>>>, rm: Arc<Mutex<RealityModifiers>>| {
             println!("Received new WorldState: {:?}", new_state.summary);
             
             let mut current_state = state.lock().unwrap();
@@ -507,11 +671,17 @@ async fn main() {
     // POST /save — persist the world snapshot to disk
     let world_for_save = world.clone();
     let state_for_save = state.clone();
+    let player_health_for_save = player_health.clone();
+    let total_kills_for_save = total_kills.clone();
+    let current_level_for_save = current_level_shared.clone();
     let save_route = warp::post()
         .and(warp::path("save"))
         .map(move || {
+            let health = *player_health_for_save.lock().unwrap();
+            let kills = *total_kills_for_save.lock().unwrap();
+            let level = *current_level_for_save.lock().unwrap();
             let mut w = world_for_save.lock().unwrap();
-            match save_world_to_disk(&mut w, &state_for_save) {
+            match save_world_to_disk(&mut w, &state_for_save, health, kills, level) {
                 Ok(_) => warp::reply::json(&serde_json::json!({ "status": "saved" })),
                 Err(e) => {
                     eprintln!("Save failed: {}", e);
@@ -763,44 +933,144 @@ async fn main() {
                 if let Some(mut visuals) = w.get_mut::<Visuals>(e) {
                     if let Some(mt) = req.model_type { visuals.model_type = Some(mt); }
                     if let Some(c) = req.color { visuals.color = c; }
+                    if let Some(cloaked) = req.is_cloaked { visuals.is_cloaked = cloaked; }
                 } else {
                     w.entity_mut(e).insert(Visuals {
                         model_type: Some(req.model_type.unwrap_or_else(|| "ufo".to_string())),
                         color: req.color.unwrap_or_else(|| "white".to_string()),
+                        is_cloaked: req.is_cloaked.unwrap_or(false),
                     });
                 }
             }
             warp::reply::json(&serde_json::json!({ "status": "updated_player" }))
         });
 
-    // POST /api/engine/reset — Globally clear overrides and modifiers
+    // POST /api/engine/reset — Full game reset: despawn enemies, re-seed world, reset all stats
     let world_for_reset = world.clone();
+    let state_for_reset = state.clone();
     let reality_for_reset = reality_modifiers.clone();
+    let player_target_for_reset = player_target.clone();
+    let player_health_for_reset = player_health.clone();
+    let total_kills_for_reset = total_kills.clone();
+    let total_enemy_kills_for_reset = total_enemy_kills.clone();
+    let total_asteroid_kills_for_reset = total_asteroid_kills.clone();
+    let game_over_timer_for_reset = game_over_timer.clone();
+    let do_full_reset_for_reset = do_full_reset.clone();
     let reset_route = warp::post()
         .and(warp::path!("api" / "engine" / "reset"))
         .map(move || {
+            println!("[Engine] Full Reset triggered.");
+
             // 1. Reset Global Reality Modifiers
+            *reality_for_reset.lock().unwrap() = RealityModifiers::default();
+
+            // 2. Reset Shared WorldState
+            *state_for_reset.lock().unwrap() = WorldState::default();
+
+            // 3. Clear pending player targets
+            *player_target_for_reset.lock().unwrap() = None;
+
+            // 4. Reset survival stats
+            *player_health_for_reset.lock().unwrap() = 100.0;
+            *total_kills_for_reset.lock().unwrap() = 0;
+            *total_enemy_kills_for_reset.lock().unwrap() = 0;
+            *total_asteroid_kills_for_reset.lock().unwrap() = 0;
+            *game_over_timer_for_reset.lock().unwrap() = 0.0;
+
+            // 5. Signal game loop to reset level, despawn enemies, teleport player
+            *do_full_reset_for_reset.lock().unwrap() = true;
+
+            warp::reply::json(&serde_json::json!({ "status": "full_reset_initiated" }))
+        });
+
+    // POST /load — Restore a previously saved snapshot
+    let world_for_load = world.clone();
+    let state_for_load = state.clone();
+    let player_health_for_load = player_health.clone();
+    let total_kills_for_load = total_kills.clone();
+    let total_enemy_kills_for_load = total_enemy_kills.clone();
+    let total_asteroid_kills_for_load = total_asteroid_kills.clone();
+    let game_over_timer_for_load = game_over_timer.clone();
+    let override_level_for_load = override_level.clone();
+    let load_route = warp::post()
+        .and(warp::path("load"))
+        .map(move || {
+            // Read snapshot file
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent().and_then(|p| p.parent())
+                .map(|p| p.join("world_snap.json"))
+                .unwrap_or_else(|| std::path::PathBuf::from("world_snap.json"));
+
+            let data = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => return warp::reply::json(&serde_json::json!({ "status": "error", "message": format!("Cannot read save file: {}", e) })),
+            };
+            let snap: Snapshot = match serde_json::from_str(&data) {
+                Ok(s) => s,
+                Err(e) => return warp::reply::json(&serde_json::json!({ "status": "error", "message": format!("Invalid save file: {}", e) })),
+            };
+
+            // Restore survival stats
+            *player_health_for_load.lock().unwrap() = snap.player_health;
+            *total_kills_for_load.lock().unwrap() = snap.score;
+            *total_enemy_kills_for_load.lock().unwrap() = 0;
+            *total_asteroid_kills_for_load.lock().unwrap() = 0;
+            *game_over_timer_for_load.lock().unwrap() = 0.0;
+
+            // Signal game loop to set current_level from save
+            *override_level_for_load.lock().unwrap() = Some(snap.current_level);
+
+            // Restore WorldState
             {
-                let mut rm = reality_for_reset.lock().unwrap();
-                *rm = RealityModifiers::default();
+                let mut ws = state_for_load.lock().unwrap();
+                ws.summary = snap.summary.clone();
+                ws.environment_theme = snap.environment_theme.clone();
+                ws.terrain_rules = snap.terrain_rules.clone();
+                ws.physics_mode = snap.physics_mode.clone();
+                ws.camera_zoom = snap.camera_zoom;
             }
 
-            // 2. Clear Player Visual Overrides & Component Data
-            let mut w = world_for_reset.lock().unwrap();
-            let mut query = w.query::<(Entity, &EntityType, Option<&mut Visuals>, Option<&mut WeaponParameters>)>();
-            for (_entity, ent_type, visuals_opt, weapon_opt) in query.iter_mut(&mut w) {
-                if ent_type.0 == "player" {
-                    if let Some(mut v) = visuals_opt {
-                        v.model_type = None; // Reset to default (handled by rendering)
-                        v.color = "#ffffff".to_string(); // Reset to default color
-                    }
-                    if let Some(mut wp) = weapon_opt {
-                        *wp = WeaponParameters::default();
-                    }
+            // Despawn restorable entity types, then re-spawn from snapshot
+            const RESTORABLE: &[&str] = &["enemy", "alien_ship", "companion", "space_station"];
+            let mut w = world_for_load.lock().unwrap();
+            let to_despawn: Vec<Entity> = {
+                let mut q = w.query::<(Entity, &EntityType)>();
+                q.iter(&w)
+                    .filter(|(_, et)| RESTORABLE.contains(&et.0.as_str()) || et.0 == "projectile" || et.0 == "explosion")
+                    .map(|(e, _)| e)
+                    .collect()
+            };
+            for e in to_despawn { w.despawn(e); }
+
+            let mut spawned = 0usize;
+            for ent in &snap.entities {
+                if !RESTORABLE.contains(&ent.ent_type.as_str()) { continue; }
+                let visuals = Visuals {
+                    model_type: ent.model_type.clone(),
+                    color: ent.color.clone().unwrap_or_else(|| "#ffffff".to_string()),
+                    is_cloaked: false,
+                };
+                let mut eb = w.spawn((
+                    EntityType(ent.ent_type.clone()),
+                    ent.transform.clone(),
+                    ent.physics_type.clone(),
+                    visuals,
+                    PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
+                ));
+                if let Some(mv) = ent.model_variant { eb.insert(ModelVariant(mv)); }
+                if let Some(sc) = ent.scale { eb.insert(Scale(sc)); }
+                // Re-attach AI steering for enemies
+                if ent.ent_type == "enemy" || ent.ent_type == "alien_ship" {
+                    eb.insert(SteeringAgent { velocity: (0.0, 0.0, 0.0), max_speed: 7.5, max_force: 0.5, behavior: "wander".to_string() });
+                    eb.insert(Faction("pirate".to_string()));
+                    eb.insert(SpatialAnomaly { anomaly_type: "alien".to_string(), mass: 0.0, radius: 100.0 });
+                    eb.insert(WeaponParameters { projectile_count: 1, projectile_color: "#ff3333".to_string(), spread: 0.1, projectile_size: 6.0 });
                 }
+                spawned += 1;
             }
-            
-            warp::reply::json(&serde_json::json!({ "status": "Engine Defaults Restored" }))
+
+            println!("[Load] Restored {} entities, level {}, health {:.0}, score {}", spawned, snap.current_level, snap.player_health, snap.score);
+            warp::reply::json(&serde_json::json!({ "status": "loaded", "entities": spawned, "level": snap.current_level }))
         });
 
     // POST /api/command — Interpret AI-orchestrated commands
@@ -813,27 +1083,106 @@ async fn main() {
             let mut w = world_for_command.lock().unwrap();
             
             if req.action == "set_weapon" {
-                let mut player_query = w.query::<(Entity, &EntityType)>();
-                let mut player_entity = None;
-                for (e, etype) in player_query.iter(&w) {
-                    if etype.0 == "player" {
-                        player_entity = Some(e);
-                        break;
+                // Target: specific entity by id, all entities of a type, or default to player
+                let mut target_entities: Vec<Entity> = Vec::new();
+                if let Some(id) = req.entity_id {
+                    for entity in w.iter_entities() {
+                        if entity.id().index() == id {
+                            target_entities.push(entity.id());
+                            break;
+                        }
+                    }
+                } else {
+                    let etype_filter = req.entity_type.as_deref().unwrap_or("player");
+                    let mut q = w.query::<(Entity, &EntityType)>();
+                    for (e, et) in q.iter(&w) {
+                        if et.0 == etype_filter {
+                            target_entities.push(e);
+                        }
                     }
                 }
-                
-                if let Some(e) = player_entity {
+                let proj_count = req.projectile_count;
+                let proj_color = req.projectile_color.clone();
+                let spread = req.spread;
+                let proj_size = req.projectile_size;
+                for e in target_entities {
                     if let Some(mut weapon) = w.get_mut::<WeaponParameters>(e) {
-                        if let Some(cnt) = req.projectile_count { weapon.projectile_count = cnt; }
-                        if let Some(clr) = req.projectile_color { weapon.projectile_color = clr; }
-                        if let Some(spr) = req.spread { weapon.spread = spr; }
+                        if let Some(cnt) = proj_count { weapon.projectile_count = cnt; }
+                        if let Some(ref clr) = proj_color { weapon.projectile_color = clr.clone(); }
+                        if let Some(spr) = spread { weapon.spread = spr; }
+                        if let Some(sz) = proj_size { weapon.projectile_size = sz; }
                     } else {
                         w.entity_mut(e).insert(WeaponParameters {
-                            projectile_count: req.projectile_count.unwrap_or(1),
-                            projectile_color: req.projectile_color.unwrap_or_else(|| "#00ff00".to_string()),
-                            spread: req.spread.unwrap_or(0.1),
+                            projectile_count: proj_count.unwrap_or(1),
+                            projectile_color: proj_color.clone().unwrap_or_else(|| "#ef4444".to_string()),
+                            spread: spread.unwrap_or(0.1),
+                            projectile_size: proj_size.unwrap_or(8.0),
                         });
                     }
+                }
+            } else if req.action == "set_visuals" {
+                // AI can set color/model_type/cloaking on any entity by id or type
+                let mut target_entities: Vec<Entity> = Vec::new();
+                if let Some(id) = req.entity_id {
+                    for entity in w.iter_entities() {
+                        if entity.id().index() == id {
+                            target_entities.push(entity.id());
+                            break;
+                        }
+                    }
+                } else {
+                    let etype_filter = req.entity_type.as_deref().unwrap_or("player");
+                    let mut q = w.query::<(Entity, &EntityType)>();
+                    for (e, et) in q.iter(&w) {
+                        if et.0 == etype_filter {
+                            target_entities.push(e);
+                        }
+                    }
+                }
+                let new_model_type = req.model_type.clone();
+                let new_color = req.color.clone();
+                let new_cloaked = req.is_cloaked;
+                for e in target_entities {
+                    if let Some(mut vis) = w.get_mut::<Visuals>(e) {
+                        if let Some(ref mt) = new_model_type { vis.model_type = Some(mt.clone()); }
+                        if let Some(ref c) = new_color { vis.color = c.clone(); }
+                        if let Some(cl) = new_cloaked { vis.is_cloaked = cl; }
+                    } else {
+                        w.entity_mut(e).insert(Visuals {
+                            model_type: new_model_type.clone(),
+                            color: new_color.clone().unwrap_or_else(|| "white".to_string()),
+                            is_cloaked: new_cloaked.unwrap_or(false),
+                        });
+                    }
+                }
+            } else if req.action == "despawn" {
+                if let Some(id) = req.entity_id {
+                    // Despawn by Index (External targeting often uses index)
+                    let mut found = None;
+                    for entity in w.iter_entities() {
+                        if entity.id().index() == id {
+                            found = Some(entity.id());
+                            break;
+                        }
+                    }
+                    if let Some(e) = found {
+                        w.despawn(e);
+                        println!("[Engine] Despawned entity id: {}", id);
+                    }
+                } else if let Some(etype_target) = req.entity_type {
+                    // Despawn all of a certain type (e.g. "asteroid")
+                    let mut to_despawn = Vec::new();
+                    let mut query = w.query::<(Entity, &EntityType)>();
+                    for (entity, etype) in query.iter(&w) {
+                        if etype.0 == etype_target {
+                            to_despawn.push(entity);
+                        }
+                    }
+                    let count = to_despawn.len();
+                    for e in to_despawn {
+                        w.despawn(e);
+                    }
+                    println!("[Engine] Despawned {} entities of type: {}", count, etype_target);
                 }
             }
             
@@ -853,7 +1202,39 @@ async fn main() {
             warp::reply::json(&serde_json::json!({ "status": "level_advanced_forced" }))
         });
 
-    let routes = get_state_route.or(update_state).or(save_route).or(spawn_route).or(clear_route).or(despawn_route).or(modify_route).or(update_player_route).or(command_route).or(next_level_route).or(reset_route).with(state_cors);
+    let world_for_physics = world.clone();
+    let physics_route = warp::post()
+        .and(warp::path("api"))
+        .and(warp::path("physics"))
+        .and(warp::body::json())
+        .map(move |req: PhysicsUpdateRequest| {
+            let mut w = world_for_physics.lock().unwrap();
+            if let Some(mut pc) = w.get_resource_mut::<PhysicsConstants>() {
+                if let Some(g) = req.gravity_scale { pc.gravity_scale = g; }
+                if let Some(f) = req.friction { pc.friction = f; }
+                if let Some(s) = req.projectile_speed_mult { pc.projectile_speed_mult = s; }
+                println!("[Engine] Physics Updated -> G: {}, Fric: {}, Proj: {}", pc.gravity_scale, pc.friction, pc.projectile_speed_mult);
+            }
+            warp::reply::json(&serde_json::json!({ "status": "physics_updated" }))
+        });
+
+    let world_for_factions = world.clone();
+    let factions_route = warp::post()
+        .and(warp::path("api"))
+        .and(warp::path("factions"))
+        .and(warp::body::json())
+        .map(move |updates: Vec<FactionPairUpdate>| {
+            let mut w = world_for_factions.lock().unwrap();
+            if let Some(mut fr) = w.get_resource_mut::<FactionRelations>() {
+                for update in &updates {
+                    fr.set_affinity(&update.faction_a, &update.faction_b, update.affinity);
+                    println!("[Engine] Faction Relation Updated: {} <-> {} = {}", update.faction_a, update.faction_b, update.affinity);
+                }
+            }
+            warp::reply::json(&serde_json::json!({ "status": "factions_updated", "count": updates.len() }))
+        });
+
+    let routes = get_state_route.or(update_state).or(save_route).or(load_route).or(spawn_route).or(clear_route).or(despawn_route).or(modify_route).or(update_player_route).or(command_route).or(next_level_route).or(physics_route).or(factions_route).or(reset_route).with(state_cors);
     // Serve state updates + save on 8080
     tokio::spawn(async {
         println!("State API listening on http://127.0.0.1:8080 (endpoints: /state, /save, /api/engine/next-level)");
@@ -870,22 +1251,6 @@ async fn main() {
         warp::serve(ws_route.with(cors)).run(([127, 0, 0, 1], 8081)).await;
     });
     
-    // ---------- Survival State ----------
-    // Player health (0–100). Tracked outside ECS for easy cross-scope access.
-    let player_health: Arc<Mutex<f32>> = Arc::new(Mutex::new(100.0));
-    // Invincibility window after a hit (seconds). Prevents one-frame death spiral.
-    let damage_cooldown: Arc<Mutex<f32>> = Arc::new(Mutex::new(0.0));
-    // Knockback velocity applied to the player on hit, decays each frame.
-    let player_knockback: Arc<Mutex<(f32, f32)>> = Arc::new(Mutex::new((0.0, 0.0)));
-    // Cumulative kill count broadcast to React.
-    let total_kills: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    let total_enemy_kills: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    let total_asteroid_kills: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    // Time tracking for survival levels
-    let level_start_time: Arc<Mutex<std::time::Instant>> = Arc::new(Mutex::new(std::time::Instant::now()));
-    // > 0.0 means the player is dead; counts down 3 s then resets.
-    let game_over_timer: Arc<Mutex<f32>> = Arc::new(Mutex::new(0.0));
-
     // Main Game Loop (60 FPS)
     let player_target_for_loop = player_target.clone();
     let player_health_for_loop = player_health.clone();
@@ -897,39 +1262,37 @@ async fn main() {
     let level_start_time_for_loop = level_start_time.clone();
     let game_over_timer_for_loop = game_over_timer.clone();
     let force_next_level_for_loop = force_next_level.clone();
+    let do_full_reset_for_loop = do_full_reset.clone();
+    let override_level_for_loop = override_level.clone();
+    let current_level_shared_for_loop = current_level_shared.clone();
     let mut current_level: u32 = 1;
     let mut kills_at_level_start: u32 = 0;
     let mut enemy_kills_at_level_start: u32 = 0;
     let mut asteroid_kills_at_level_start: u32 = 0;
     let mut print_counter: u64 = 0;
     let mut last_shot_time = std::time::Instant::now();
+    let mut last_tick_time = std::time::Instant::now();
 
     loop {
+        // Real elapsed time since last tick — capped at 100ms to avoid huge jumps after pauses
+        let tick_dt = last_tick_time.elapsed().as_secs_f64().min(0.1);
+        last_tick_time = std::time::Instant::now();
+
         let mut success_kill_this_frame = false;
         if print_counter == 0 { println!("  [TICK START]"); }
+        print_counter += 1;
         
-        // Evaluate input for this frame (Rotational Steering)
-        let (mut turn_dir, mut thrust, shoot) = {
-            if print_counter == 0 { println!("  locking player_input_state..."); }
+        // Evaluate input for this frame
+        let (thrust_forward, thrust_back, cam_yaw, cam_pitch, boost_active, shoot) = {
             let state = player_input_state.lock().unwrap();
-            let mut td: f32 = 0.0;
-            let mut th: f32 = 0.0;
-            if state.up { th += 1.0; }     // Forward thrust
-            if state.down { th -= 0.5; }   // Minor reverse thrust
-            if state.left { td -= 1.0; }   // Turn left
-            if state.right { td += 1.0; }  // Turn right
-            (td, th, state.shoot)
+            (state.up, state.down, state.cam_yaw, state.cam_pitch, state.boost, state.shoot)
         };
 
-        if print_counter == 0 { println!("  locking game_over_timer..."); }
         let is_game_over_this_frame = *game_over_timer_for_loop.lock().unwrap() > 0.0;
-        if is_game_over_this_frame {
-            turn_dir = 0.0;
-            thrust = 0.0;
-        }
         let shoot = shoot && !is_game_over_this_frame;
+        let thrust_forward = thrust_forward && !is_game_over_this_frame;
+        let thrust_back = thrust_back && !is_game_over_this_frame;
 
-        if print_counter == 0 { println!("  locking player_knockback..."); }
         let knockback = {
             let mut kb = player_knockback_for_loop.lock().unwrap();
             let v = *kb;
@@ -938,7 +1301,7 @@ async fn main() {
             v
         };
 
-        let mut projectiles_to_spawn = Vec::new(); // (x, y, rot, color, Option<target_lock_id>)
+        let mut projectiles_to_spawn: Vec<(f64, f64, f64, f64, f64, String, f64, Option<u32>)> = Vec::new(); // (x, y, z, yaw, pitch, color, size, target)
 
         let (speed_multiplier, gravity_mod, friction_mod) = {
             let rm = reality_for_sys.lock().unwrap();
@@ -946,129 +1309,205 @@ async fn main() {
         };
 
         {
-            if print_counter == 0 { println!("  locking world..."); }
             let mut w = world.lock().unwrap();
-            
-            if print_counter == 0 { println!("  locking reality_for_sys (write resource)..."); }
-            w.insert_resource(systems::RealityModifiersRes { 
-                gravity: gravity_mod, 
-                friction: friction_mod 
+
+            // --- Check do_full_reset signal (from /api/engine/reset) ---
+            let full_reset = {
+                let mut flag = do_full_reset_for_loop.lock().unwrap();
+                let v = *flag; *flag = false; v
+            };
+            if full_reset {
+                current_level = 1;
+                kills_at_level_start = 0;
+                enemy_kills_at_level_start = 0;
+                asteroid_kills_at_level_start = 0;
+                *level_start_time_for_loop.lock().unwrap() = std::time::Instant::now();
+                // Despawn enemies, companions, projectiles (keep solar system)
+                let to_despawn: Vec<Entity> = {
+                    let mut q = w.query::<(Entity, &EntityType)>();
+                    q.iter(&w).filter(|(_, et)| {
+                        matches!(et.0.as_str(), "enemy" | "alien_ship" | "companion" | "projectile" | "explosion")
+                    }).map(|(e, _)| e).collect()
+                };
+                for e in to_despawn { w.despawn(e); }
+                // Teleport player to spawn + reset ECS health + remove temp components
+                let player_entities: Vec<Entity> = {
+                    let mut q = w.query::<(Entity, &EntityType)>();
+                    q.iter(&w).filter(|(_, et)| et.0 == "player").map(|(e, _)| e).collect()
+                };
+                for pe in player_entities {
+                    if let Some(mut t) = w.get_mut::<Transform>(pe) {
+                        t.x = 8500.0; t.y = 500.0; t.z = 0.0;
+                    }
+                    if let Some(mut phys) = w.get_mut::<PhysicsType>(pe) {
+                        *phys = PhysicsType::Velocity { vx: 0.0, vy: 0.0, vz: 0.0 };
+                    }
+                    if let Some(mut h) = w.get_mut::<Health>(pe) { h.current = h.max; }
+                    if let Some(mut v) = w.get_mut::<Visuals>(pe) {
+                        *v = Visuals { model_type: Some("ufo".to_string()), color: "cyan".to_string(), is_cloaked: false };
+                    }
+                    if let Some(mut wp) = w.get_mut::<WeaponParameters>(pe) { *wp = WeaponParameters::default(); }
+                    w.entity_mut(pe).remove::<DeathAge>().remove::<TargetLock>();
+                }
+                // Spawn a fresh initial wave
+                spawn_wave(&mut w, 12, "pirate", "enemy", (3000.0, 28000.0), 0);
+                println!("[Engine] Full reset complete. Level 1, fresh wave spawned.");
+            }
+
+            // --- Check override_level signal (from /load) ---
+            if let Some(new_level) = override_level_for_loop.lock().unwrap().take() {
+                current_level = new_level;
+                kills_at_level_start = *total_kills_for_loop.lock().unwrap();
+                enemy_kills_at_level_start = *total_enemy_kills_for_loop.lock().unwrap();
+                asteroid_kills_at_level_start = *total_asteroid_kills_for_loop.lock().unwrap();
+                *level_start_time_for_loop.lock().unwrap() = std::time::Instant::now();
+                println!("[Engine] Level overridden to {}", current_level);
+            }
+
+            w.insert_resource(systems::RealityModifiersRes {
+                gravity: gravity_mod,
+                friction: friction_mod
             });
-            
-            if print_counter == 0 { println!("  running schedule..."); }
+            w.insert_resource(systems::DeltaTime(tick_dt));
+
             schedule.run(&mut w);
 
-            // --- HARD COLLISIONS (Requirement 2): Pre-collect planetary bodies & Moons ---
+            // --- HARD COLLISIONS: Pre-collect planetary bodies ---
             let mut planetary_bodies = Vec::new();
             {
-                let mut collision_query = w.query::<(Entity, &EntityType, &Transform, &components::SpatialAnomaly, Option<&Parent>)>();
-                // First pass: find planet positions
-                let mut planet_world_pos = std::collections::HashMap::new();
-                for (ent, etype, trans, _, _) in collision_query.iter(&w) {
-                    if etype.0 == "planet" || etype.0 == "sun" {
-                        planet_world_pos.insert(ent.index(), (trans.x, trans.y));
-                    }
-                }
-                // Second pass: compute global collision positions
-                for (_ent, etype, trans, anomaly, parent_opt) in collision_query.iter(&w) {
-                    if etype.0 == "sun" || etype.0 == "planet" {
-                        planetary_bodies.push((trans.x, trans.y, anomaly.radius));
-                    } else if etype.0 == "moon" {
-                        if let Some(p) = parent_opt {
-                            if let Some((px, py)) = planet_world_pos.get(&p.0) {
-                                // Moon position is local to planet in physics
-                                planetary_bodies.push((px + trans.x, py + trans.y, anomaly.radius));
-                            }
-                        }
+                // The original query was limited to SpatialAnomaly, which not all planets have.
+                // This new query is more general and calculates radius based on type/name.
+                for (_, t, e, s, name_opt) in w.query::<(Entity, &Transform, &EntityType, Option<&components::Scale>, Option<&components::Name>)>().iter(&w) {
+                    if e.0 == "sun" || e.0 == "planet" || e.0 == "moon" {
+                        let r = if e.0 == "sun" { 1000.0 } else { 
+                            // Use name-based radius matching EntityRenderer
+                            let name = name_opt.map_or("", |n| &n.0);
+                            let base = match name {
+                                "Mercury" => 40.0,
+                                "Venus" => 85.0,
+                                "Earth" => 100.0,
+                                "Mars" => 60.0,
+                                "Jupiter" => 250.0,
+                                "Saturn" => 210.0,
+                                "Uranus" => 140.0,
+                                "Neptune" => 130.0,
+                                "Moon" => 20.0,
+                                _ => 50.0, // Default for unknown planets/moons
+                            };
+                            base * s.map_or(1.0, |sc| sc.0)
+                        };
+                        planetary_bodies.push((t.x, t.y, t.z, r));
                     }
                 }
             }
 
-            if print_counter == 0 { println!("  locking player_target..."); }
             let maybe_target = *player_target_for_loop.lock().unwrap();
             
-            if print_counter == 0 { println!("  process player movement..."); }
             
-            // Collect player data once to move collision logic to a unified block
             let mut p_x = 0.0;
             let mut p_y = 0.0;
+            let mut p_alt = 0.0;
             let mut p_rot = 0.0;
-            let mut ent_player = Entity::from_raw(0); // placeholder
+            let mut ent_player = Entity::from_raw(0);
             let mut move_processed = false;
 
             {
-                let mut player_query = w.query::<(Entity, &EntityType, &mut Transform)>();
-                for (entity, ent_type, mut transform) in player_query.iter_mut(&mut w) {
+                let dt = tick_dt; // Use real tick_dt instead of hardcoded 0.016
+                let mut player_query = w.query::<(Entity, &EntityType, &mut Transform, &mut PhysicsType)>();
+                for (entity, ent_type, mut transform, mut phys) in player_query.iter_mut(&mut w) {
                     if ent_type.0 == "player" {
                         ent_player = entity;
-                        // 1. Calculate DESIRED next position (Manual or AI)
-                        let mut next_x = transform.x;
-                        let mut next_y = transform.y;
-                        let mut next_rot = transform.rotation;
 
-                        if turn_dir != 0.0 || thrust != 0.0 {
-                            // Manual Pilot: Smooth Rotational Steering
-                            next_rot += turn_dir * 3.5 * 0.016; // Turn speed: 3.5 radians/sec
-                            next_x += next_rot.cos() * thrust * 1500.0 * speed_multiplier * 0.016;
-                            next_y += next_rot.sin() * thrust * 1500.0 * speed_multiplier * 0.016;
-                        } else if let Some((tx, ty)) = maybe_target {
-                            // AI Pilot Lerp
-                            next_x += (tx - transform.x) * 0.12;
-                            next_y += (ty - transform.y) * 0.12;
-                            if (tx - transform.x).abs() < 2.0 && (ty - transform.y).abs() < 2.0 {
-                                next_x = tx;
-                                next_y = ty;
-                                *player_target_for_loop.lock().unwrap() = None;
+                        // Ship heading follows camera yaw from mouse
+                        transform.rotation = cam_yaw;
+
+                        if let PhysicsType::Velocity { ref mut vx, ref mut vy, ref mut vz } = *phys {
+                            let mut thrust_force = 3000.0; // Reduced by a third from 4500.0
+                            if boost_active { thrust_force *= 2.5; }
+
+                            // Forward direction = camera facing in 3D (yaw + pitch)
+                            let dir_x = cam_yaw.cos() * cam_pitch.cos();
+                            let dir_y = cam_pitch.sin();
+                            let dir_z = cam_yaw.sin() * cam_pitch.cos();
+
+                            if thrust_forward {
+                                *vx += dir_x * thrust_force * dt;
+                                *vy += dir_y * thrust_force * dt;
+                                *vz += dir_z * thrust_force * dt;
+                            }
+                            if thrust_back {
+                                *vx -= dir_x * thrust_force * 0.6 * dt;
+                                *vy -= dir_y * thrust_force * 0.6 * dt;
+                                *vz -= dir_z * thrust_force * 0.6 * dt;
+                            }
+
+                            // Apply knockback impulse
+                            *vx += knockback.0;
+                            *vz += knockback.1;
+
+                            // Drag - increased for smoother glide
+                            let damping = 0.97; // Increased from 0.96
+                            *vx *= damping;
+                            *vy *= damping;
+                            *vz *= damping;
+
+                            // Integrate Position
+                            transform.x += *vx * dt;
+                            transform.y += *vy * dt;
+                            transform.z += *vz * dt;
+
+                            // Celestial Collisions (Sun, Planets, Moons)
+                            for (ox, oy, oz, oradius) in &planetary_bodies {
+                                let dx = transform.x - ox;
+                                let dy = transform.y - oy;
+                                let dz = transform.z - oz;
+                                let dist_sq = dx * dx + dy * dy + dz * dz;
+                                let combined_radius = oradius + 25.0; // ship_radius
+                                if dist_sq < combined_radius * combined_radius {
+                                    let dist = dist_sq.sqrt().max(0.1);
+                                    let overlap = combined_radius - dist;
+                                    transform.x += (dx / dist) * overlap;
+                                    transform.y += (dy / dist) * overlap;
+                                    transform.z += (dz / dist) * overlap;
+                                    // Zero out velocity on collision for impact feel
+                                    *vx = 0.0; *vy = 0.0; *vz = 0.0;
+                                }
                             }
                         }
-
-                        // Apply knockback if any
-                        next_x += knockback.0 * 0.016;
-                        next_y += knockback.1 * 0.016;
-
-                        // 2. GLOBAL HARD COLLISIONS (Requirement 1)
-                        for (ox, oy, oradius) in &planetary_bodies {
-                            let dx = next_x - ox;
-                            let dy = next_y - oy;
-                            let dist_sq = dx * dx + dy * dy;
-                            let ship_radius = 20.0; // Slightly larger ship collision
-                            let combined_radius = oradius + ship_radius;
-                            
-                            if dist_sq < combined_radius * combined_radius {
-                                let dist = dist_sq.sqrt();
-                                let overlap = combined_radius - dist;
-                                let nx = dx / dist;
-                                let ny = dy / dist;
+                            // Boundary Clamp (Hard Normalization)
+                            let p_dist = (transform.x * transform.x + transform.z * transform.z).sqrt();
+                            if p_dist > MAX_WORLD_RADIUS {
+                                let factor = MAX_WORLD_RADIUS / p_dist;
+                                transform.x *= factor;
+                                transform.z *= factor;
                                 
-                                next_x += nx * overlap;
-                                next_y += ny * overlap;
+                                // Reset velocity if hitting boundary
+                                if let PhysicsType::Velocity { ref mut vx, ref mut vz, .. } = *phys {
+                                    *vx = 0.0;
+                                    *vz = 0.0;
+                                }
                             }
+
+                            p_x = transform.x;
+                            p_alt = transform.y;
+                            p_y = transform.z; // Use p_y as depth Plane for legacy targeting compatibility
+                            p_rot = transform.rotation;
+                            move_processed = true;
+                            break;
                         }
-
-                        // 3. Finalize Transform
-                        transform.x = next_x;
-                        transform.y = next_y;
-                        transform.rotation = next_rot;
-
-                        p_x = transform.x;
-                        p_y = transform.y;
-                        p_rot = transform.rotation;
-                        move_processed = true;
-                        break;
                     }
                 }
-            }
 
             // --- AUTO-TARGETING ---
             let mut current_target_lock = None;
             {
                 let mut target_query = w.query_filtered::<(Entity, &Transform, &EntityType, Option<&DeathAge>), Without<Projectile>>();
-                let mut min_dist_sq = std::f32::MAX;
+                let mut min_dist_sq = std::f64::MAX;
                 for (t_e, t_t, t_type, death_age) in target_query.iter(&w) {
                     if death_age.is_none() && (t_type.0 == "enemy" || t_type.0 == "asteroid") {
                         let dx = p_x - t_t.x;
-                        let dy = p_y - t_t.y;
-                        let dist_sq = dx*dx + dy*dy;
+                        let dz = p_y - t_t.z; // p_y is player Z, t_t.z is target Z
+                        let dist_sq = dx*dx + dz*dz;
                         if dist_sq < min_dist_sq && dist_sq < 9000000.0 { // lock up to 3000px away
                             min_dist_sq = dist_sq;
                             current_target_lock = Some(t_e.index());
@@ -1082,48 +1521,67 @@ async fn main() {
                 w.entity_mut(ent_player).remove::<components::TargetLock>();
             }
 
-            if shoot && move_processed && last_shot_time.elapsed().as_secs_f32() > 0.15 {
-                let wp = w.get::<WeaponParameters>(ent_player).cloned().unwrap_or(WeaponParameters {
-                    projectile_count: 1,
-                    projectile_color: "#ef4444".to_string(),
-                    spread: 0.15,
-                });
-
+            if shoot && move_processed && last_shot_time.elapsed().as_secs_f64() > 0.15 {
+                let wp = w.get::<WeaponParameters>(ent_player).cloned().unwrap_or_default();
                 for i in 0..wp.projectile_count {
                     let mut offset_angle = 0.0;
                     if wp.projectile_count > 1 {
-                        offset_angle = (i as f32 - (wp.projectile_count as f32 - 1.0) / 2.0) * wp.spread;
+                        offset_angle = (i as f64 - (wp.projectile_count as f64 - 1.0) / 2.0) * wp.spread;
                     }
                     let final_rot = p_rot + offset_angle;
-                    // Strict Nose Alignment: spawn at nose (r=25) with direction-aligned velocity
-                    let nose_dist = 25.0;
+                    // Spawn projectiles 40 units ahead of the ship center to clear the mesh
                     projectiles_to_spawn.push((
-                        p_x + final_rot.cos() * nose_dist,
-                        p_y + final_rot.sin() * nose_dist,
+                        p_x + final_rot.cos() * cam_pitch.cos() * 40.0,
+                        p_alt + cam_pitch.sin() * 40.0,
+                        p_y + final_rot.sin() * cam_pitch.cos() * 40.0,
                         final_rot,
+                        cam_pitch,
                         wp.projectile_color.clone(),
-                        current_target_lock
+                        wp.projectile_size,
+                        current_target_lock,
                     ));
                 }
-                last_shot_time = std::time::Instant::now(); // Track shot time
+                last_shot_time = std::time::Instant::now();
             }
 
-            // --- AGGRO AI (Requirement 3) ---
+            // --- AGGRO AI ---
             {
-                let mut enemy_query = w.query::<(&EntityType, &mut Transform, &mut components::SteeringAgent, Option<&DeathAge>)>();
-                for (et, mut t, mut agent, death_age) in enemy_query.iter_mut(&mut w) {
-                    if death_age.is_none() && et.0 == "enemy" {
+                let mut enemy_query = w.query::<(&EntityType, &mut Transform, &mut components::SteeringAgent, Option<&DeathAge>, Option<&WeaponParameters>)>();
+                for (et, mut t, mut agent, death_age, weapon_opt) in enemy_query.iter_mut(&mut w) {
+                    if death_age.is_none() && (et.0 == "enemy" || et.0 == "alien_ship") {
                         let dx = p_x - t.x;
-                        let dy = p_y - t.y;
-                        let dist_sq = dx * dx + dy * dy;
-                        if dist_sq < 16_000_000.0 { // 4000.0 squared
+                        let dy = p_alt - t.y;
+                        let dz = p_y - t.z;
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
+                        if dist_sq < 16_000_000.0 { // 4000 units range
                             agent.behavior = "attack".to_string();
-                            t.rotation = dy.atan2(dx); // Face player
-                            if rand::random::<f32>() < 0.015 { // ~1 shot per sec
-                                projectiles_to_spawn.push((t.x, t.y, t.rotation, "enemy".to_string(), Some(ent_player.index())));
+                            let dist_xz = (dx * dx + dz * dz).sqrt().max(1.0);
+                            let aim_yaw = dz.atan2(dx);
+                            let aim_pitch = dy.atan2(dist_xz); // elevation toward player Y
+                            t.rotation = aim_yaw;
+                            if rand::random::<f64>() < 0.010 {
+                                let (color, size, count, spread) = if let Some(wp) = weapon_opt {
+                                    (wp.projectile_color.clone(), wp.projectile_size, wp.projectile_count, wp.spread)
+                                } else {
+                                    ("#ff3333".to_string(), 6.0_f64, 1_u32, 0.1_f64)
+                                };
+                                for shot_i in 0..count {
+                                    let spread_offset = if count > 1 {
+                                        (shot_i as f64 - (count as f64 - 1.0) * 0.5) * spread
+                                    } else {
+                                        0.0
+                                    };
+                                    projectiles_to_spawn.push((
+                                        t.x, t.y, t.z,
+                                        aim_yaw + spread_offset,
+                                        aim_pitch,
+                                        color.clone(),
+                                        size,
+                                        Some(ent_player.index()),
+                                    ));
+                                }
                             }
                         } else {
-                            // If they are far away, return to idle
                             agent.behavior = "idle".to_string();
                         }
                     }
@@ -1166,29 +1624,11 @@ async fn main() {
             {
                 let mut p_query = w.query::<(Entity, &mut Projectile, &mut Transform, Option<&components::TargetLock>)>();
                 for (entity, mut proj, mut p_trans, lock_opt) in p_query.iter_mut(&mut w) {
-                    proj.lifespan -= 0.016;
+                    proj.lifespan -= tick_dt;
                     
-                    // --- HUNTER'S EYE HOMING ---
-                    if let Some(lock) = lock_opt {
-                        if let Some(&(tx, ty)) = target_positions.get(&lock.0) {
-                            let speed = (proj.velocity.0 * proj.velocity.0 + proj.velocity.1 * proj.velocity.1).sqrt();
-                            let current_angle = proj.velocity.1.atan2(proj.velocity.0);
-                            let target_angle = (ty - p_trans.y).atan2(tx - p_trans.x);
-                            
-                            // Interpolate angle (max turn speed 0.06 radians per frame)
-                            let mut diff = target_angle - current_angle;
-                            while diff > std::f32::consts::PI { diff -= 2.0 * std::f32::consts::PI; }
-                            while diff < -std::f32::consts::PI { diff += 2.0 * std::f32::consts::PI; }
-                            
-                            let new_angle = current_angle + diff.clamp(-0.06, 0.06);
-                            proj.velocity.0 = speed * new_angle.cos();
-                            proj.velocity.1 = speed * new_angle.sin();
-                            p_trans.rotation = new_angle; // Update visual rotation
-                        }
-                    }
+                    // Projectiles fly in a straight line now as intended for 3D
 
-                    p_trans.x += proj.velocity.0 * 0.016;
-                    p_trans.y += proj.velocity.1 * 0.016;
+                    // Movement handled by PhysicsType::Projectile in the ECS schedule
                     
                     if proj.lifespan <= 0.0 {
                         dead_projectiles.push(entity);
@@ -1202,20 +1642,20 @@ async fn main() {
             }
 
             // 2. Combat Collision Detection
-            let mut projectiles_info: Vec<(Entity, f32, f32)> = Vec::new();
+            let mut projectiles_info: Vec<(Entity, f64, f64, f64)> = Vec::new();
             {
                 let mut p_query = w.query::<(Entity, &Transform, &Projectile)>();
                 for (entity, t, _) in p_query.iter(&mut w) {
-                    projectiles_info.push((entity, t.x, t.y));
+                    projectiles_info.push((entity, t.x, t.y, t.z));
                 }
             }
 
-            let mut target_info: Vec<(Entity, f32, f32, String)> = Vec::new();
+            let mut target_info: Vec<(Entity, f64, f64, f64, String)> = Vec::new();
             {
                 let mut target_query = w.query_filtered::<(Entity, &Transform, &EntityType, Option<&DeathAge>), Without<Projectile>>();
-                for (entity, t, ent_type, death_age) in target_query.iter(&mut w) {
-                    if death_age.is_none() && (ent_type.0 == "star" || ent_type.0 == "companion" || ent_type.0 == "enemy" || ent_type.0 == "asteroid") {
-                        target_info.push((entity, t.x, t.y, ent_type.0.clone()));
+                for (entity, t, ent_type, da) in target_query.iter(&mut w) {
+                    if da.is_none() && (ent_type.0 == "star" || ent_type.0 == "companion" || ent_type.0 == "enemy" || ent_type.0 == "asteroid") {
+                        target_info.push((entity, t.x, t.y, t.z, ent_type.0.clone()));
                     }
                 }
             }
@@ -1223,17 +1663,18 @@ async fn main() {
             let mut combat_kills = 0;
             let mut enemy_kills_this_frame = 0;
             let mut asteroid_kills_this_frame = 0;
-            let mut explosions_to_spawn: Vec<(f32, f32)> = Vec::new(); // Queue for new 3D explosion entities
+            let mut explosions_to_spawn: Vec<(f64, f64, f64)> = Vec::new(); // Queue for new 3D explosion entities
             let mut to_kill: Vec<Entity> = Vec::new(); // Queue for entity destruction
 
-            for (p_entity, px, py) in projectiles_info {
-                for (t_entity, tx, ty, t_type) in &target_info {
+            for (p_entity, px, py, pz) in projectiles_info {
+                for (t_entity, tx, ty, tz, t_type) in &target_info {
                     let dx = px - tx;
                     let dy = py - ty;
-                    if (dx*dx + dy*dy).sqrt() < 30.0 { // 30px collision radius
-                        to_kill.push(p_entity); // Destroy projectile
-                        to_kill.push(*t_entity); // Destroy target
-                        explosions_to_spawn.push((*tx, *ty)); // Add to explosion queue
+                    let dz = pz - tz;
+                    if (dx*dx + dy*dy + dz*dz).sqrt() < 40.0 { // Increased 3D collision radius
+                        to_kill.push(p_entity);
+                        to_kill.push(*t_entity);
+                        explosions_to_spawn.push((*tx, *ty, *tz)); // 3D explosion
                         combat_kills += 1;
                         success_kill_this_frame = true;
                         if t_type == "enemy" { enemy_kills_this_frame += 1; }
@@ -1267,12 +1708,12 @@ async fn main() {
             // 2.5. AI-vs-AI Faction Collision Detection
             // Opposing factions (pirate vs federation) destroy each other on proximity.
             {
-                let mut faction_entities: Vec<(Entity, f32, f32, String)> = Vec::new();
+                let mut faction_entities: Vec<(Entity, f64, f64, f64, String)> = Vec::new();
                 {
                     let mut fq = w.query_filtered::<(Entity, &Transform, &Faction, &EntityType, Option<&DeathAge>), Without<Projectile>>();
                     for (entity, t, faction, ent_type, death_age) in fq.iter(&w) {
                         if death_age.is_none() && ent_type.0 != "player" && ent_type.0 != "planet" && ent_type.0 != "sun" {
-                            faction_entities.push((entity, t.x, t.y, faction.0.clone()));
+                            faction_entities.push((entity, t.x, t.y, t.z, faction.0.clone()));
                         }
                     }
                 }
@@ -1283,20 +1724,21 @@ async fn main() {
                     if already_killed.contains(&faction_entities[i].0) { continue; }
                     for j in (i + 1)..faction_entities.len() {
                         if already_killed.contains(&faction_entities[j].0) { continue; }
-                        let (_, ax, ay, ref af) = faction_entities[i];
-                        let (_, bx, by, ref bf) = faction_entities[j];
+                        let (_, ax, ay, az, ref af) = faction_entities[i];
+                        let (_, bx, by, bz, ref bf) = faction_entities[j];
                         // Check hostility: pirate <-> federation
                         let hostile = (af == "pirate" && bf == "federation") || (af == "federation" && bf == "pirate");
                         if !hostile { continue; }
                         let dx = ax - bx;
                         let dy = ay - by;
-                        if dx * dx + dy * dy < 900.0 { // 30px squared
+                        let dz = az - bz;
+                        if dx * dx + dy * dy + dz * dz < 2500.0 { // 50px radius in 3D
                             to_kill.push(faction_entities[i].0);
                             to_kill.push(faction_entities[j].0);
-                            explosions_to_spawn.push((ax, ay));
-                            explosions_to_spawn.push((bx, by));
                             already_killed.insert(faction_entities[i].0);
                             already_killed.insert(faction_entities[j].0);
+                            explosions_to_spawn.push((ax, ay, az));
+                            explosions_to_spawn.push((bx, by, bz));
                             faction_kills += 1;
                         }
                     }
@@ -1383,57 +1825,70 @@ async fn main() {
 
                 if got <= 0.0 && cd <= 0.0 {
                     // Step 1: collect player position
-                    let (px, py) = {
+                    let (px, py, pz) = {
                         let mut pq = w.query::<(&EntityType, &Transform)>();
-                        let mut pos = (0.0_f32, 0.0_f32);
+                        let mut pos = (0.0_f64, 0.0_f64, 0.0_f64);
                         for (et, t) in pq.iter(&w) {
-                            if et.0 == "player" { pos = (t.x, t.y); break; }
+                            if et.0 == "player" { pos = (t.x, t.y, t.z); break; }
                         }
                         pos
                     };
 
                     // Step 2: collect hostile entities in collision range
-                    // Federation entities do NOT damage the player.
-                    let mut hostile_hits: Vec<Entity> = Vec::new();
-                    let mut hit_dir = (0.0_f32, 0.0_f32);
+                    let mut hostile_hits: Vec<(Entity, String)> = Vec::new();
+                    let mut hit_dir = (0.0_f64, 0.0_f64, 0.0_f64);
                     {
                         let mut hq = w.query::<(Entity, &Transform, &EntityType, Option<&DeathAge>, Option<&Faction>)>();
                         for (e, t, et, da, faction_opt) in hq.iter(&w) {
                             if da.is_some() { continue; }
                             if et.0 == "enemy" || et.0 == "asteroid" {
-                                // Skip federation entities — they are allies
                                 if let Some(f) = faction_opt {
                                     if f.0 == "federation" { continue; }
                                 }
                                 let dx = px - t.x;
                                 let dy = py - t.y;
-                                let dist = (dx * dx + dy * dy).sqrt();
-                                if dist < 42.0 {
-                                    if hit_dir == (0.0, 0.0) {
+                                let dz = pz - t.z;
+                                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                                if dist < 55.0 { // Increased 3D collision radius for player
+                                    if hit_dir == (0.0, 0.0, 0.0) {
                                         let d = dist.max(1.0);
-                                        hit_dir = (dx / d, dy / d);
+                                        hit_dir = (dx / d, dy / d, dz / d);
                                     }
-                                    hostile_hits.push(e);
+                                    hostile_hits.push((e, et.0.clone()));
                                 }
                             }
                         }
                     }
 
                     if !hostile_hits.is_empty() {
+                        let mut hits_this_frame = 0;
+                        let mut enemies_hit = 0;
+                        let mut asteroids_hit = 0;
+
                         // Apply damage and invincibility window
                         let new_health = {
                             let mut h = player_health_for_loop.lock().unwrap();
                             *h = (*h - 20.0).max(0.0);
                             *h
                         };
-                        *damage_cooldown_for_loop.lock().unwrap() = 1.0; // 1-second invincibility
+                        *damage_cooldown_for_loop.lock().unwrap() = 1.0; 
                         *player_knockback_for_loop.lock().unwrap() = (hit_dir.0 * 520.0, hit_dir.1 * 520.0);
 
-                        // Trigger Shatter Engine on the colliding hostile(s)
-                        for e in &hostile_hits {
+                        for (e, et_type) in &hostile_hits {
                             if let Some(mut em) = w.get_entity_mut(*e) {
                                 em.insert(DeathAge(0.0));
+                                hits_this_frame += 1;
+                                if et_type == "enemy" { enemies_hit += 1; }
+                                if et_type == "asteroid" { asteroids_hit += 1; }
                             }
+                        }
+
+                        // Credit kills to the player for colliding!
+                        if hits_this_frame > 0 {
+                            *total_kills_for_loop.lock().unwrap() += hits_this_frame as u32;
+                            *total_enemy_kills_for_loop.lock().unwrap() += enemies_hit as u32;
+                            *total_asteroid_kills_for_loop.lock().unwrap() += asteroids_hit as u32;
+                            success_kill_this_frame = true;
                         }
 
                         // Game Over condition
@@ -1443,7 +1898,7 @@ async fn main() {
                             // Shatter the Player visually — spawn golden explosion particles
                             let mut rng = rand::thread_rng();
                             for _ in 0..35 {
-                                let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+                                let angle = rng.gen_range(0.0..std::f64::consts::TAU);
                                 let speed = rng.gen_range(160.0..440.0);
                                 w.spawn((
                                     Particle {
@@ -1532,12 +1987,12 @@ async fn main() {
             }
             
             // Spawn 3D Explosions
-            for (ex, ey) in explosions_to_spawn {
+            for (ex, ey, ez) in explosions_to_spawn {
                 w.spawn((
                     EntityType("explosion".to_string()),
-                    Transform { x: ex, y: ey, z: 0.0, rotation: 0.0 },
-                    SpawnAge(0.0), // TTL = 0.5 enforced in age tick
-                    Visuals { model_type: Some("sphere".to_string()), color: "#f59e0b".to_string() }
+                    Transform { x: ex, y: ey, z: ez, rotation: 0.0 }, // Fixed: Use ez
+                    SpawnAge(0.0), 
+                    Visuals { model_type: Some("sphere".to_string()), color: "#f59e0b".to_string(), is_cloaked: false }
                 ));
             }
             
@@ -1556,17 +2011,20 @@ async fn main() {
 
         if projectiles_to_spawn.len() > 0 {
             let mut w = world.lock().unwrap();
-            for (px, py, prot, pcolor, target_lock) in projectiles_to_spawn {
-                let speed = 2500.0;
+            // Safety cap: never exceed 300 live projectiles to prevent server slowdown
+            let live_count = { let mut q = w.query::<&Projectile>(); q.iter(&w).count() };
+            if live_count >= 300 { projectiles_to_spawn.clear(); }
+            for (px, py, pz, prot, ppitch, pcolor, psize, target_lock) in projectiles_to_spawn {
                 let mut ent = w.spawn((
                     EntityType("projectile".to_string()),
-                    Transform { x: px, y: py, z: 0.0, rotation: prot },
+                    Transform { x: px, y: py, z: pz, rotation: prot },
                     Projectile {
-                        velocity: (prot.cos() * speed, prot.sin() * speed, 0.0),
-                        lifespan: 1.5,
+                        velocity: (0.0, 0.0, 0.0), // unused — PhysicsType::Projectile drives movement
+                        lifespan: 2.5,
                         color: pcolor,
+                        size: psize,
                     },
-                    PhysicsType::Projectile { speed: 40.0 },
+                    PhysicsType::Projectile { speed: 50.0, pitch_angle: ppitch },
                     components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
                 ));
                 if let Some(target_id) = target_lock {
@@ -1584,20 +2042,36 @@ async fn main() {
         let mut objective = "".to_string();
         let mut level_advanced = false;
 
+        // --- PHASE 8.6: BOUNDARY WARNING ---
+        let mut out_of_bounds = false;
+        {
+            let mut w = world.lock().unwrap();
+            let mut pq = w.query::<(&EntityType, &Transform)>();
+            for (et, t) in pq.iter(&w) {
+                if et.0 == "player" {
+                    let dist = (t.x * t.x + t.y * t.y + t.z * t.z).sqrt();
+                    if dist > MAX_WORLD_RADIUS {
+                        out_of_bounds = true;
+                    }
+                    break;
+                }
+            }
+        }
+
         {
             let mut w = world.lock().unwrap();
             
             let mut p_pos = (0.0, 0.0);
-            let mut mars_pos = (std::f32::MAX, std::f32::MAX);
-            let mut jup_pos = (std::f32::MAX, std::f32::MAX);
+            let mut mars_pos = (std::f64::MAX, std::f64::MAX);
+            let mut jup_pos = (std::f64::MAX, std::f64::MAX);
             
             {
                 let mut tq = w.query::<(&EntityType, Option<&Name>, &Transform)>();
                 for (et, name, t) in tq.iter(&w) {
-                    if et.0 == "player" { p_pos = (t.x, t.y); }
+                    if et.0 == "player" { p_pos = (t.x, t.z); }
                     if let Some(n) = name {
-                        if n.0 == "Mars" { mars_pos = (t.x, t.y); }
-                        if n.0 == "Jupiter" { jup_pos = (t.x, t.y); }
+                        if n.0 == "Mars" { mars_pos = (t.x, t.z); }
+                        if n.0 == "Jupiter" { jup_pos = (t.x, t.z); }
                     }
                 }
             }
@@ -1663,6 +2137,10 @@ async fn main() {
                 objective = "VICTORY: The Void is quiet.".to_string();
             }
 
+            if out_of_bounds {
+                objective = "Pilot, you are leaving the mission sector. Return immediately.".to_string();
+            }
+
             if level_advanced {
                 println!(">>> ADVANCED TO LEVEL {}! <<<", current_level);
                 
@@ -1683,9 +2161,16 @@ async fn main() {
 
                 // --- PHASE 8.3: DYNAMIC WAVE SPAWNING ---
                 // Ensure a base wave level spawns even if not explicitly defined in the level ladder
-                let enemy_count = (current_level as usize * 2) + 1;
-                let range = (3000.0 + (current_level as f32 * 500.0), 6000.0 + (current_level as f32 * 1000.0));
-                spawn_wave(&mut w, enemy_count, "pirate", "enemy", range);
+                let enemy_count = (current_level as usize * 2) + 2; // Slightly more enemies
+                let range = if current_level <= 2 {
+                    (1500.0, 4000.0) // Much closer for early verification
+                } else {
+                    (3000.0 + (current_level as f64 * 500.0), 6000.0 + (current_level as f64 * 1000.0))
+                };
+                
+                // Tier logic: Higher levels spawn scarier ships
+                let variant = if current_level >= 10 { 2 } else if current_level >= 5 { 1 } else { 0 };
+                spawn_wave(&mut w, enemy_count, "pirate", "enemy", range, variant);
                 
                 kills_at_level_start = current_score;
                 enemy_kills_at_level_start = current_enemy_kills;
@@ -1696,17 +2181,34 @@ async fn main() {
         
         let mut entities_data: Vec<EntityData> = Vec::new();
         let mut particles_data: Vec<ParticleData> = Vec::new();
-        let mut player_pos = (0.0_f32, 0.0_f32);
+        let mut player_pos = (0.0_f64, 0.0_f64);
 
         // First pass: collect all entity data and find player position
         {
             let mut w = world.lock().unwrap();
-            let mut query = w.query::<(Entity, &Transform, &EntityType, Option<&Name>, Option<&PhysicsType>, Option<&BirthAge>, Option<&DeathAge>, Option<&components::SteeringAgent>, Option<&components::SpatialAnomaly>, Option<&Projectile>, Option<&Faction>, Option<&Visuals>, Option<&Parent>, Option<&SpawnAge>, Option<&components::PersistentId>)>();
-            for (entity, transform, ent_type, name, phys_type, birth_age, death_age, steering, anomaly, _projectile, faction_opt, visuals, parent_opt, spawn_age_opt, persistent_id_opt) in query.iter(&w) {
-                let speed: f32 = match phys_type {
+            let mut query = w.query::<(
+                Entity,
+                &Transform,
+                &EntityType,
+                (Option<&PhysicsType>, Option<&BirthAge>, Option<&DeathAge>),
+                (Option<&SteeringAgent>, Option<&SpatialAnomaly>, Option<&Projectile>),
+                (Option<&Faction>, Option<&Visuals>, Option<&Parent>),
+                (Option<&SpawnAge>, Option<&PersistentId>, Option<&ModelVariant>, Option<&Scale>, Option<&Name>, Option<&TargetLock>, Option<&Health>)
+            )>();
+            for (
+                entity,
+                transform,
+                ent_type,
+                (phys_type, birth_age, death_age),
+                (steering, anomaly, _projectile),
+                (faction_opt, visuals, parent_opt),
+                (spawn_age_opt, persistent_id_opt, variant_opt, scale_opt, name_opt, target_lock_opt, health_opt)
+            ) in query.iter(&w) {
+                let speed: f64 = match phys_type {
                     Some(PhysicsType::Orbital { speed, .. }) => *speed,
-                    Some(PhysicsType::Sinusoidal { frequency, .. }) => *frequency * 0.3,
-                    Some(PhysicsType::Projectile { speed }) => *speed,
+                    Some(PhysicsType::Sinusoidal { frequency, .. }) => frequency * 0.3,
+                    Some(PhysicsType::Projectile { speed, .. }) => *speed,
+                    Some(PhysicsType::Velocity { vx, vy, vz }) => (vx*vx + vy*vy + vz*vz).sqrt(),
                     Some(PhysicsType::Static) | None => 0.0,
                 };
                 let is_newborn = birth_age.map_or(false, |b: &BirthAge| b.0 < 2.0);
@@ -1721,8 +2223,8 @@ async fn main() {
 
                 let mut model_type = None;
                 let mut custom_color = None;
+                let mut projectile_size_out: Option<f64> = None;
 
-                // Color is determined by speed in React, keep legacy color for non-stars
                 let color = match ent_type.0.as_str() {
                     "player"     => "player",
                     "companion"  => "companion",
@@ -1732,14 +2234,25 @@ async fn main() {
                     _            => "other",
                 };
 
+                let mut is_cloaked = false;
                 if let Some(v) = visuals {
                     model_type = v.model_type.clone();
                     custom_color = Some(v.color.clone());
+                    is_cloaked = v.is_cloaked;
+                }
+                // Projectiles carry color and size directly on the component
+                if let Some(proj) = _projectile {
+                    custom_color = Some(proj.color.clone());
+                    projectile_size_out = Some(proj.size);
                 }
 
                 if ent_type.0 == "player" {
-                    player_pos = (transform.x, transform.y);
+                    player_pos = (transform.x, transform.z);
                 }
+                let scale = scale_opt.map(|s| s.0);
+                let model_variant = variant_opt.map(|m| m.0);
+                let name = name_opt.map(|n| n.0.clone());
+
                 entities_data.push(EntityData {
                     id: entity.index(),
                     x: transform.x,
@@ -1753,10 +2266,12 @@ async fn main() {
                     is_dying,
                     behavior,
                     faction,
-                    name: name.map(|n| n.0.clone()),
+                    name,
                     radius: match ent_type.0.as_str() {
                         "sun"    => Some(120.0),
-                        "planet" => Some(anomaly.map_or(20.0, |a| a.radius)), // Fallback or anomaly-stored size
+                        "planet" => Some(anomaly.map_or(20.0, |a| a.radius)),
+                        "enemy"  => Some(if model_variant == Some(2) { 100.0 } else if model_variant == Some(1) { 40.0 } else { 18.0 }),
+                        "companion" => Some(18.0),
                         _        => None,
                     },
                     anomaly_type,
@@ -1766,7 +2281,13 @@ async fn main() {
                     parent_id: parent_opt.map(|p| p.0),
                     spawn_age: spawn_age_opt.map(|s| s.0),
                     persistent_id: persistent_id_opt.map(|p| p.0),
-                    target_lock_id: w.get::<components::TargetLock>(entity).map(|l| l.0),
+                    target_lock_id: target_lock_opt.map(|l| l.0),
+                    is_cloaked,
+                    scale,
+                    model_variant,
+                    projectile_size: projectile_size_out,
+                    health_current: health_opt.map(|h| h.current),
+                    health_max: health_opt.map(|h| h.max),
                 });
             }
             
@@ -1784,13 +2305,30 @@ async fn main() {
             }
         } // drop world lock
 
+        // Distance culling: only send asteroids within 3000 units of the player.
+        // 5000 asteroids exist in the world but only ~30-50 are nearby at any time.
+        // This keeps frame payload small for consistent 60fps.
+        {
+            let view_radius_sq = 3000.0_f64 * 3000.0_f64;
+            let (px, pz) = player_pos;
+            entities_data.retain(|ent| {
+                if ent.ent_type == "asteroid" {
+                    let dx = ent.x - px;
+                    let dz = ent.z - pz;
+                    dx * dx + dz * dz <= view_radius_sq
+                } else {
+                    true
+                }
+            });
+        }
+
         // Collision detection: broadcast collision_event for any star within 20px of player
         let collision_clients = clients.clone();
         for ent in &entities_data {
             if ent.ent_type == "star" {
                 let dx = player_pos.0 - ent.x;
-                let dy = player_pos.1 - ent.y;
-                let d = (dx * dx + dy * dy).sqrt();
+                let dz = player_pos.1 - ent.z;
+                let d = (dx * dx + dz * dz).sqrt();
                 if d < 20.0 {
                     let event = CollisionEvent {
                         msg_type: "collision_event".to_string(),
@@ -1812,6 +2350,9 @@ async fn main() {
             let wstate = state.lock().unwrap();
             (wstate.environment_theme.clone(), wstate.terrain_rules.clone())
         };
+
+        // Keep current_level_shared in sync so save route can read it
+        *current_level_shared_for_loop.lock().unwrap() = current_level;
 
         let current_health = *player_health.lock().unwrap();
         let current_score = *total_kills.lock().unwrap();
@@ -1886,6 +2427,9 @@ async fn client_connection(ws: warp::ws::WebSocket, clients: Clients, input_stat
                                 state.left = cmd.keys.contains(&"KeyA".to_string()) || cmd.keys.contains(&"ArrowLeft".to_string());
                                 state.right = cmd.keys.contains(&"KeyD".to_string()) || cmd.keys.contains(&"ArrowRight".to_string());
                                 state.shoot = cmd.keys.contains(&"Space".to_string());
+                                state.boost = cmd.keys.contains(&"ShiftLeft".to_string()) || cmd.keys.contains(&"ShiftRight".to_string());
+                                state.cam_yaw = cmd.cam_yaw;
+                                state.cam_pitch = cmd.cam_pitch;
                             }
                         }
                     }

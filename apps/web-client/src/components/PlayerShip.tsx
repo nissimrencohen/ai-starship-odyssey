@@ -17,19 +17,19 @@ const ShipFallback = ({ type = 'ufo', color }: { type?: string, color?: string }
             <group>
                 <mesh>
                     <coneGeometry args={[12, 60, 4]} />
-                    <meshStandardMaterial color={cPrimary} emissive={cSecondary} emissiveIntensity={2} />
+                    <meshStandardMaterial color={cPrimary} emissive={cSecondary} emissiveIntensity={2} wireframe={false} />
                 </mesh>
                 <mesh position={[22, -16, 0]} rotation={[0, 0, Math.PI / 5]}>
                     <boxGeometry args={[28, 6, 8]} />
-                    <meshStandardMaterial color={cSecondary} emissive={cSecondary} emissiveIntensity={0.5} />
+                    <meshStandardMaterial color={cSecondary} emissive={cSecondary} emissiveIntensity={0.5} wireframe={false} />
                 </mesh>
                 <mesh position={[-22, -16, 0]} rotation={[0, 0, -Math.PI / 5]}>
                     <boxGeometry args={[28, 6, 8]} />
-                    <meshStandardMaterial color={cSecondary} emissive={cSecondary} emissiveIntensity={0.5} />
+                    <meshStandardMaterial color={cSecondary} emissive={cSecondary} emissiveIntensity={0.5} wireframe={false} />
                 </mesh>
                 <mesh position={[0, -34, 0]}>
                     <sphereGeometry args={[8, 16, 16]} />
-                    <meshBasicMaterial color="#ef4444" />
+                    <meshBasicMaterial color="#ef4444" wireframe={false} />
                 </mesh>
             </group>
         );
@@ -38,15 +38,15 @@ const ShipFallback = ({ type = 'ufo', color }: { type?: string, color?: string }
             <group rotation={[Math.PI / 2, 0, 0]}>
                 <mesh position={[0, -10, 0]}>
                     <boxGeometry args={[20, 50, 20]} />
-                    <meshStandardMaterial color={color || '#475569'} roughness={0.8} />
+                    <meshStandardMaterial color={color || '#475569'} roughness={0.8} wireframe={false} />
                 </mesh>
                 <mesh position={[0, 15, 0]}>
                     <boxGeometry args={[10, 20, 10]} />
-                    <meshStandardMaterial color="#1e293b" />
+                    <meshStandardMaterial color="#1e293b" wireframe={false} />
                 </mesh>
                 <mesh position={[0, -35, 0]}>
                     <sphereGeometry args={[8, 16, 16]} />
-                    <meshBasicMaterial color="#f59e0b" />
+                    <meshBasicMaterial color="#f59e0b" wireframe={false} />
                 </mesh>
             </group>
         );
@@ -55,15 +55,15 @@ const ShipFallback = ({ type = 'ufo', color }: { type?: string, color?: string }
             <group rotation={[Math.PI / 2, 0, 0]}>
                 <mesh position={[0, 0, 0]}>
                     <coneGeometry args={[16, 50, 3]} />
-                    <meshStandardMaterial color={color || '#0f172a'} roughness={0.9} emissive={color || '#3b82f6'} emissiveIntensity={0.2} />
+                    <meshStandardMaterial color={color || '#0f172a'} roughness={0.9} emissive={color || '#3b82f6'} emissiveIntensity={0.2} wireframe={false} />
                 </mesh>
                 <mesh position={[0, -20, -5]} rotation={[Math.PI / 6, 0, 0]}>
                     <boxGeometry args={[40, 4, 15]} />
-                    <meshStandardMaterial color={color || '#0f172a'} roughness={0.9} />
+                    <meshStandardMaterial color={color || '#0f172a'} roughness={0.9} wireframe={false} />
                 </mesh>
                 <mesh position={[0, -25, 0]}>
                     <sphereGeometry args={[5, 16, 16]} />
-                    <meshBasicMaterial color={color || '#3b82f6'} />
+                    <meshBasicMaterial color={color || '#3b82f6'} wireframe={false} />
                 </mesh>
             </group>
         );
@@ -74,15 +74,15 @@ const ShipFallback = ({ type = 'ufo', color }: { type?: string, color?: string }
         <group>
             <mesh position={[0, 0, 0]}>
                 <sphereGeometry args={[15, 32, 16]} />
-                <meshStandardMaterial color={cPrimary} emissive={cPrimary} emissiveIntensity={1} />
+                <meshStandardMaterial color={cPrimary} emissive={cPrimary} emissiveIntensity={1} wireframe={false} />
             </mesh>
             <mesh position={[0, -2, 0]} scale={[2, 0.3, 2]}>
                 <sphereGeometry args={[20, 32, 16]} />
-                <meshStandardMaterial color="#cbd5e1" metalness={0.9} roughness={0.1} />
+                <meshStandardMaterial color="#cbd5e1" metalness={0.9} roughness={0.1} wireframe={false} />
             </mesh>
             <mesh position={[0, -7, 0]}>
                 <sphereGeometry args={[6, 16, 16]} />
-                <meshBasicMaterial color={cPrimary} />
+                <meshBasicMaterial color={cPrimary} wireframe={false} />
             </mesh>
         </group>
     );
@@ -112,6 +112,17 @@ export const preloadShipModel = (url: string) => {
     }
 };
 
+// Map ship type names → GLTF asset URLs served by the Python Director
+const SHIP_MODEL_URLS: Record<string, string> = {
+    fighter:     'http://127.0.0.1:8000/assets/models/fighter.gltf',
+    stinger:     'http://127.0.0.1:8000/assets/models/fighter.gltf',
+    interceptor: 'http://127.0.0.1:8000/assets/models/fighter.gltf',
+    freighter:   'http://127.0.0.1:8000/assets/models/freighter.gltf',
+    goliath:     'http://127.0.0.1:8000/assets/models/freighter.gltf',
+    stealth:     'http://127.0.0.1:8000/assets/models/stealth.gltf',
+    ufo:         'http://127.0.0.1:8000/assets/models/ufo.gltf',
+};
+
 const ShipModel = ({ url }: { url: string }) => {
     const { scene } = useGLTF(url);
     return <primitive object={scene} />;
@@ -119,41 +130,54 @@ const ShipModel = ({ url }: { url: string }) => {
 
 interface PlayerShipProps {
     position: [number, number, number];
-    rotation: number;
-    modelUrl?: string; // Optional URL for explicit glTF injection
-    shipType?: string; // The semantic type from the AI (e.g., 'freighter', 'stealth')
+    rotationRef: React.MutableRefObject<number>;
+    camPitchRef: React.MutableRefObject<number>;
+    modelUrl?: string;
+    shipType?: string;
     shipColor?: string;
+    isCloaked?: boolean;
 }
 
-export const PlayerShip: React.FC<PlayerShipProps> = ({ position, rotation, modelUrl, shipType, shipColor }) => {
+export const PlayerShip: React.FC<PlayerShipProps> = ({ position, rotationRef, camPitchRef, modelUrl, shipType, shipColor, isCloaked }) => {
     const groupRef = useRef<THREE.Group>(null);
 
-    // Attempt standard preloads if a known modelUrl format is provided
+    // Resolve model URL: explicit prop first, then type mapping, then no model
+    const resolvedModelUrl = modelUrl || (shipType ? SHIP_MODEL_URLS[shipType] : undefined);
+
     React.useEffect(() => {
-        if (modelUrl) preloadShipModel(modelUrl);
-    }, [modelUrl]);
+        if (resolvedModelUrl) preloadShipModel(resolvedModelUrl);
+    }, [resolvedModelUrl]);
 
-    useFrame((state, delta) => {
+    useFrame(() => {
         if (groupRef.current) {
-            // Smoothly follow the physics position (already in three.js coords from GameScene)
-            groupRef.current.position.lerp(new THREE.Vector3(...position), 0.15);
+            groupRef.current.position.lerp(new THREE.Vector3(...position), 0.4); // Increased from 0.15
 
-            // Rotate around Y-axis (up) so the ship faces its heading direction
-            // on the XZ floor, with the dome always pointing upward toward the camera.
-            const targetRotation = new THREE.Quaternion().setFromAxisAngle(
+            // Read latest values from refs every frame for real-time response
+            const rotation = rotationRef.current;
+            const camPitch = camPitchRef.current;
+
+            // Yaw: ship faces its heading direction (camera yaw)
+            const yawQ = new THREE.Quaternion().setFromAxisAngle(
                 new THREE.Vector3(0, 1, 0),
                 -rotation + Math.PI / 2
             );
-            groupRef.current.quaternion.slerp(targetRotation, 0.15);
+            // Pitch: tilt nose up/down based on camera pitch
+            // Inverted camPitch to fix the "look up -> nose down" visual bug
+            const pitchQ = new THREE.Quaternion().setFromAxisAngle(
+                new THREE.Vector3(1, 0, 0),
+                -camPitch
+            );
+            const targetQ = yawQ.multiply(pitchQ);
+            groupRef.current.quaternion.slerp(targetQ, 0.4); // Increased from 0.15
         }
     });
 
     return (
-        <group ref={groupRef}>
-            {modelUrl ? (
+        <group ref={groupRef} visible={!isCloaked}>
+            {resolvedModelUrl ? (
                 <Suspense fallback={<ShipFallback type={shipType} color={shipColor} />}>
                     <GLTFErrorBoundary fallback={<ShipFallback type={shipType} color={shipColor} />}>
-                        <ShipModel url={modelUrl} />
+                        <ShipModel url={resolvedModelUrl} />
                     </GLTFErrorBoundary>
                 </Suspense>
             ) : (
@@ -163,17 +187,6 @@ export const PlayerShip: React.FC<PlayerShipProps> = ({ position, rotation, mode
             {/* Thruster light */}
             <pointLight position={[0, -36, 0]} color={shipColor || (shipType === 'ufo' || !shipType ? "#22d3ee" : "#ef4444")} intensity={150} distance={400} />
 
-            {/* 3D Aiming Crosshair (Requirement 5) */}
-            <group position={[0, 0, 150]}>
-                <mesh rotation={[Math.PI / 2, 0, 0]}>
-                    <ringGeometry args={[10, 12, 32]} />
-                    <meshBasicMaterial color="#ef4444" transparent opacity={0.6} side={THREE.DoubleSide} />
-                </mesh>
-                <mesh>
-                    <sphereGeometry args={[2, 8, 8]} />
-                    <meshBasicMaterial color="#ef4444" transparent opacity={0.8} />
-                </mesh>
-            </group>
         </group>
     );
 };
