@@ -42,6 +42,7 @@ graph TD
 
     subgraph AI ["🧠 AI Logic (Python)"]
         Director["🎬 Python Director (Port 8000)"]:::python
+        STT["🎤 Groq Whisper (STT)"]:::python
         LLM["🤖 LLM (Groq/Gemini)"]:::python
         TTS["🗣️ ElevenLabs (Voice)"]:::python
         Memory["🧠 FAISS (Memory)"]:::python
@@ -63,6 +64,7 @@ graph TD
     ECS -->|"Events / Kills (HTTP)"| Director
 
     %% Details
+    Director -.-> STT
     Director -.-> LLM
     Director -.-> TTS
     Director -.-> Memory
