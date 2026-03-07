@@ -22,6 +22,10 @@ from sentence_transformers import SentenceTransformer
 from pathlib import Path
 import numpy as np
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
 # Load .env from the project root directory (c:\Project\.env)
 dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
 if not os.path.exists(dotenv_path):
@@ -45,9 +49,6 @@ except ImportError:
     tiktoken = None
 
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Voice-to-Dream Director API")
 
