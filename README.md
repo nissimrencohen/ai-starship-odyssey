@@ -22,31 +22,36 @@ Three independent services communicate over local WebSocket and HTTP to bring th
 | :--- | :--- | :--- |
 | **Web Client (Vite)** | `http://localhost:5173` | React/Three.js frontend. 3D Visualization, Tactical HUD, voice input processing. Sends player 60fps movement. |
 | **Python Director** | `http://localhost:8000` | The "Dream Architect". Manages the LLM (Llama 3 / Gemini), FAISS memory, Groq STT (speech-to-text), ElevenLabs TTS. |
-| **Rust Engine (State)**| `http://localhost:8080` | High-performance ECS-based simulation engine in Bevy ECS/Warp. Handles API events for spawning, modifying entities. |
+| **Rust Engine (State)** | `http://localhost:8080` | High-performance ECS-based simulation engine in Bevy ECS/Warp. Handles API events for spawning, modifying entities. |
 | **Rust Engine (WS)** | `ws://localhost:8081` | Real-time physics broadcast line at 60 FPS. Instantly streams state frames to React and receives user exact coordinates. |
 
 ### Architectural Flow Diagram
 
 ```mermaid
 graph TD
-    subgraph "Frontend (Browser)"
-        Client["Web Client (Port 5173)"]
-        HUD["HUD / UI"]
-        Three["Three.js (3D Scene)"]
+    classDef default fill:#1e293b,stroke:#0f172a,stroke-width:2px,color:#f8fafc;
+    classDef browser fill:#0284c7,stroke:#0369a1,stroke-width:2px,color:#ffffff;
+    classDef python fill:#16a34a,stroke:#15803d,stroke-width:2px,color:#ffffff;
+    classDef rust fill:#ea580c,stroke:#c2410c,stroke-width:2px,color:#ffffff;
+
+    subgraph Browser ["🌐 Frontend (Browser)"]
+        Client["💻 Web Client (Port 5173)"]:::browser
+        HUD["🎛️ HUD / UI"]:::browser
+        Three["🌌 Three.js (3D Scene)"]:::browser
     end
 
-    subgraph "AI Logic (Python)"
-        Director["Python Director (Port 8000)"]
-        LLM["LLM (Groq/Gemini)"]
-        TTS["ElevenLabs (Voice)"]
-        Memory["FAISS (Memory)"]
-        HF["HuggingFace (Assets)"]
+    subgraph AI ["🧠 AI Logic (Python)"]
+        Director["🎬 Python Director (Port 8000)"]:::python
+        LLM["🤖 LLM (Groq/Gemini)"]:::python
+        TTS["🗣️ ElevenLabs (Voice)"]:::python
+        Memory["🧠 FAISS (Memory)"]:::python
+        HF["🎨 HuggingFace (Assets)"]:::python
     end
 
-    subgraph "Game Engine (Rust)"
-        StateAPI["State API (Port 8080)"]
-        WS["WebSocket (Port 8081)"]
-        ECS["Entity Component System"]
+    subgraph Engine ["⚙️ Game Engine (Rust)"]
+        StateAPI["🔌 State API (Port 8080)"]:::rust
+        WS["⚡ WebSocket (Port 8081)"]:::rust
+        ECS["🧩 Entity Component System"]:::rust
     end
 
     %% Communications
@@ -68,7 +73,8 @@ graph TD
 
 ## ⚡ Core Features & Data Flow
 
-### Voice Command to World Change Flow:
+### Voice Command to World Change Flow
+
 1. The **Web Client** records your voice and sends it to the **Python Director**.
 2. **Director** translates speech to text (Groq Whisper), and determines context via **FAISS** RAG memory.
 3. The **LLM** decides whether to spawn enemies, change reality overrides, or generate new dynamic textures.

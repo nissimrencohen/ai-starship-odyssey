@@ -460,6 +460,7 @@ You control the world state via JSON.""")
     player_y: Optional[float] = Field(None, description="New absolute Y coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. Y+ is down.")
     spawn_entities: List[SpawnEntity] = Field(default_factory=list, description="List of new entities to birth into the world. Max 20. Must be empty [] unless explicitly requested.")
     asteroid_rings: List[AsteroidRing] = Field(default_factory=list, description="Create realistic volumetric asteroid rings around a planet or moon.")
+    important_facts: Optional[List[str]] = Field(None, description="Use this to extract and permanently remember undeniable facts, hidden items, or established lore spoken by the player in this exact prompt. E.g. ['Player hid cryptographic gold behind the volcanic asteroid ring.']. Provide ONLY facts, no fluff.")
     clear_world: Optional[bool] = Field(False, description="Set to true to delete all entities (except the player).")
     despawn_entities: Optional[DespawnFilter] = Field(None, description="Filter for removing specific existing entities.")
     modify_entities: Optional[List[ModifyEntity]] = Field(None, description="Changes to apply to existing entities (DO NOT respawn them).")
@@ -620,6 +621,8 @@ def save_dream_memory(memory_store, sector_events):
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
         logger.error(f"Failed to save dream memory: {e}")
 
@@ -676,7 +679,10 @@ class DreamMemory:
                 if loaded_sectors:
                     self.sector_events.extend(loaded_sectors)
                 
-                logger.info(f"Persistent DreamMemory initialized. Loaded {len(self.memory_store)} memories and {len(self.sector_events)} sector events.")
+                if loaded_memories or loaded_sectors:
+                    logger.info(f"Persistent DreamMemory initialized. Rehydrated {len(self.memory_store)} memories and {len(self.sector_events)} sector events from persistent storage.")
+                else:
+                    logger.warning("No persistent memory found or file was empty. Starting with amnesia.")
             else:
                 raise ValueError("Global encoder is offline.")
         except Exception as e:
@@ -802,7 +808,7 @@ class DreamMemory:
             return "No previous memories."
 
         # Cast a wide semantic net so we have enough candidates to filter
-        search_k = min(max(k * 5, 15), self.index.ntotal)
+        search_k = min(max(k * 15, 30), self.index.ntotal)
         query_emb = self.encoder.encode([query], convert_to_numpy=True)
         # ── Search Session (Live) Memory ──
         D_live, I_live = self.index.search(query_emb, search_k)
@@ -2095,6 +2101,14 @@ async def dream_stream(websocket: WebSocket):
                                 world_state_data.get("summary", "Event"),
                                 current_player_x, current_player_y, current_player_z
                             )
+
+                            # ── NARRATIVE Fact Extraction: Active Memory Commits ──────────
+                            important_facts = world_state_data.get("important_facts", [])
+                            if important_facts and isinstance(important_facts, list):
+                                for fact in important_facts:
+                                    if isinstance(fact, str) and fact.strip():
+                                        logger.info(f"[Player Fact] Committing explicitly to memory: {fact}")
+                                        dream_memory.add_typed_memory(f"PLAYER FACT: {fact}", "NARRATIVE")
 
                             # ── Ecological Memory: auto-embed physics distortions ─────────
                             reality_ovr_raw = world_state_data.get("reality_override")
