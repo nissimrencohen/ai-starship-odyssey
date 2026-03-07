@@ -4,8 +4,9 @@ import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import { PlayerShip } from './PlayerShip';
 import { Starfield } from './Starfield';
-import { EntityRenderer } from './EntityRenderer';
+import { EntityRenderer, VisualConfig } from './EntityRenderer';
 import { ParticleSystem } from './ParticleSystem';
+import { CameraSystem } from '../three/CameraSystem';
 
 // ── Laser Aim Beam ─────────────────────────────────────────────────────────
 // Renders a thin glowing cylinder from the ship nose in the aim direction.
@@ -14,15 +15,29 @@ const _upVec = new THREE.Vector3(0, 1, 0);
 
 const LaserBeam: React.FC<{
     shipPos: THREE.Vector3;
+    laserOriginRef?: React.MutableRefObject<THREE.Group | null>;
     yawRef: React.MutableRefObject<number>;
     pitchRef: React.MutableRefObject<number>;
     entities: Record<string, any>;
-}> = ({ shipPos, yawRef, pitchRef, entities }) => {
+    color?: string;
+    isFiring?: boolean;
+}> = ({ shipPos, laserOriginRef, yawRef, pitchRef, entities, color, isFiring }) => {
     const meshRef = useRef<THREE.Mesh>(null);
     const glowRef = useRef<THREE.Mesh>(null);
-
-    useFrame(() => {
+    useFrame((_, delta) => {
         if (!meshRef.current || !glowRef.current) return;
+
+        // Force visibility always ON for targeting laser
+        meshRef.current.visible = true;
+        glowRef.current.visible = true;
+
+        // Determine actual start pos
+        const startPos = new THREE.Vector3();
+        if (laserOriginRef && laserOriginRef.current) {
+            laserOriginRef.current.getWorldPosition(startPos);
+        } else {
+            startPos.copy(shipPos);
+        }
 
         const yaw = yawRef.current;
         const pitch = pitchRef.current;
@@ -32,12 +47,12 @@ const LaserBeam: React.FC<{
         const dirZ = Math.sin(yaw) * Math.cos(pitch);
         const dir = new THREE.Vector3(dirX, dirY, dirZ);
 
-        // Raycast against asteroids and enemies
+        // Raycast against asteroids and enemies from startPos
         let hitDist = 4000;
         for (const ent of Object.values(entities)) {
             if (ent.ent_type !== 'asteroid' && ent.ent_type !== 'enemy' && ent.ent_type !== 'sun' && ent.ent_type !== 'planet') continue;
             const ep = new THREE.Vector3(ent.x, ent.y, ent.z);
-            const toEnt = ep.clone().sub(shipPos);
+            const toEnt = ep.clone().sub(startPos);
             const proj = toEnt.dot(dir);
             if (proj < 0 || proj > hitDist) continue;
             const perp = toEnt.clone().sub(dir.clone().multiplyScalar(proj)).length();
@@ -46,9 +61,9 @@ const LaserBeam: React.FC<{
         }
 
         const halfLen = hitDist / 2;
-        const midX = shipPos.x + dirX * halfLen;
-        const midY = shipPos.y + dirY * halfLen;
-        const midZ = shipPos.z + dirZ * halfLen;
+        const midX = startPos.x + dirX * halfLen;
+        const midY = startPos.y + dirY * halfLen;
+        const midZ = startPos.z + dirZ * halfLen;
 
         // Orient cylinder along direction (cylinders default to Y-up)
         const q = new THREE.Quaternion().setFromUnitVectors(_upVec, dir);
@@ -64,15 +79,15 @@ const LaserBeam: React.FC<{
 
     return (
         <group>
-            {/* Core beam */}
+            {/* Core beam - Thinner and less intense for always-on targeting */}
             <mesh ref={meshRef}>
-                <cylinderGeometry args={[0.6, 0.6, 1, 6]} />
-                <meshBasicMaterial color="#ff2222" transparent opacity={0.85} toneMapped={false} />
+                <cylinderGeometry args={[1.0, 1.0, 1, 8]} />
+                <meshStandardMaterial color={color || "#ff2222"} emissive={color || "#ff2222"} emissiveIntensity={5} transparent opacity={0.6} toneMapped={false} />
             </mesh>
             {/* Soft outer glow */}
             <mesh ref={glowRef}>
-                <cylinderGeometry args={[2.5, 2.5, 1, 6]} />
-                <meshBasicMaterial color="#ff0000" transparent opacity={0.08} toneMapped={false} />
+                <cylinderGeometry args={[4.0, 4.0, 1, 8]} />
+                <meshStandardMaterial color={color || "#ff0000"} emissive={color || "#ff0000"} emissiveIntensity={2} transparent opacity={0.15} toneMapped={false} />
             </mesh>
         </group>
     );
@@ -82,14 +97,23 @@ const LaserBeam: React.FC<{
 // ── HitMarker dot at beam end ──────────────────────────────────────────────
 const HitDot: React.FC<{
     shipPos: THREE.Vector3;
+    laserOriginRef?: React.MutableRefObject<THREE.Group | null>;
     yawRef: React.MutableRefObject<number>;
     pitchRef: React.MutableRefObject<number>;
     entities: Record<string, any>;
-}> = ({ shipPos, yawRef, pitchRef, entities }) => {
+}> = ({ shipPos, laserOriginRef, yawRef, pitchRef, entities }) => {
     const ref = useRef<THREE.Mesh>(null);
 
     useFrame(() => {
         if (!ref.current) return;
+
+        // Determine actual start pos
+        const startPos = new THREE.Vector3();
+        if (laserOriginRef && laserOriginRef.current) {
+            laserOriginRef.current.getWorldPosition(startPos);
+        } else {
+            startPos.copy(shipPos);
+        }
 
         const yaw = yawRef.current;
         const pitch = pitchRef.current;
@@ -104,7 +128,7 @@ const HitDot: React.FC<{
         for (const ent of Object.values(entities)) {
             if (ent.ent_type !== 'asteroid' && ent.ent_type !== 'enemy' && ent.ent_type !== 'sun' && ent.ent_type !== 'planet') continue;
             const ep = new THREE.Vector3(ent.x, ent.y, ent.z);
-            const toEnt = ep.clone().sub(shipPos);
+            const toEnt = ep.clone().sub(startPos);
             const proj = toEnt.dot(dir);
             if (proj < 0 || proj > hitDist) continue;
             const perp = toEnt.clone().sub(dir.clone().multiplyScalar(proj)).length();
@@ -112,9 +136,9 @@ const HitDot: React.FC<{
             if (perp < r) { hitDist = proj; hit = true; }
         }
 
-        const ex = shipPos.x + dirX * hitDist;
-        const ey = shipPos.y + dirY * hitDist;
-        const ez = shipPos.z + dirZ * hitDist;
+        const ex = startPos.x + dirX * hitDist;
+        const ey = startPos.y + dirY * hitDist;
+        const ez = startPos.z + dirZ * hitDist;
         ref.current.position.set(ex, ey, ez);
         ref.current.visible = hit;
     });
@@ -128,7 +152,7 @@ const HitDot: React.FC<{
 };
 
 // ── World Boundary Shell ────────────────────────────────────────────────────
-// Fresnel-shaded sphere marking the edge of the playable universe (radius 32 000 u).
+// Fresnel-shaded sphere marking the edge of the playable universe (radius 64 000 u).
 // Rendered on BackSide so it glows inward when the player approaches.
 const BOUNDARY_VERT = `
 varying vec3 vNormal;
@@ -152,9 +176,12 @@ void main() {
 }
 `;
 
+// ── World Boundary Shell ─────────────────────────────────────────────────────
+// Gateway Core is now a named ECS space_station entity (ModelVariant 5 → gateway.glb)
+// rendered by EntityRenderer and visible on the mini-radar. No hardcoded decoration needed.
 const BoundaryShell: React.FC = () => (
     <mesh>
-        <sphereGeometry args={[32000, 48, 48]} />
+        <sphereGeometry args={[64000, 48, 48]} />
         <shaderMaterial
             side={THREE.BackSide}
             transparent
@@ -168,6 +195,7 @@ const BoundaryShell: React.FC = () => (
 // ── Main Scene ─────────────────────────────────────────────────────────────
 interface GameSceneProps {
     ecsEntities: Record<string, any>;
+    ecsEntitiesRef: React.MutableRefObject<Record<string, any>>;
     particles: any[];
     zoom: number;
     newbornIds: Set<number>;
@@ -177,70 +205,70 @@ interface GameSceneProps {
     camYawRef: React.MutableRefObject<number>;
     camPitchRef: React.MutableRefObject<number>;
     targetedEntityId?: number | null;
+    visualConfig?: VisualConfig;
+    spectatorTargetId?: number | null;
+    globalOverride?: {
+        sun_visible?: boolean;
+        ambient_color?: string;
+        ambient_intensity?: number;
+        skybox_color?: string;
+    };
+    customTextureUrl?: string | null;
 }
 
 export const GameScene: React.FC<GameSceneProps> = ({
-    ecsEntities, particles, zoom, newbornIds, dyingIds,
-    realityOverride, playerSpaceship, camYawRef, camPitchRef, targetedEntityId
+    ecsEntities, ecsEntitiesRef, particles, zoom, newbornIds, dyingIds,
+    realityOverride, playerSpaceship, camYawRef, camPitchRef, targetedEntityId, visualConfig, spectatorTargetId,
+    globalOverride, customTextureUrl
 }) => {
     const cameraRef = useRef<THREE.PerspectiveCamera>(null);
     const smoothedPos = useRef(new THREE.Vector3(8500, 500, 0));
     const smoothedCamPos = useRef(new THREE.Vector3(8400, 600, -200));
 
-    const player = Object.values(ecsEntities).find((e: any) => e.ent_type === 'player');
-    const rx = player ? (player.x as number) : 8500;
-    const ry = player ? (player.y as number) : 500;
-    const rz = player ? (player.z as number) : 0;
+    // Raw target from server — updated in useFrame from the live ref (not during React render)
+    const targetPosRef = useRef(new THREE.Vector3(8500, 500, 0));
 
     // Ship position updated in useFrame (mutated in-place so LaserBeam sees live position)
     const shipPosRef = useRef(new THREE.Vector3(8500, 500, 0));
 
-    useFrame(() => {
-        if (!cameraRef.current) return;
+    // Refs for groups whose position is driven entirely in useFrame (no React prop jitter)
+    const shipGroupRef = useRef<THREE.Group>(null);
+    const starfieldGroupRef = useRef<THREE.Group>(null);
+    const laserOriginRef = useRef<THREE.Group>(null);
 
-        smoothedPos.current.lerp(new THREE.Vector3(rx, ry, rz), 0.4);
-        shipPosRef.current.copy(smoothedPos.current);
+    useFrame((state, delta) => {
+        // Update player ship position ref with smoothing
+        const truePlayerEnt = Object.values(ecsEntitiesRef.current).find((e: any) => e.ent_type === 'player') as any;
+        const posAlpha = 1 - Math.pow(0.6, delta * 60);
 
-        const yaw = camYawRef.current;
-        const pitch = camPitchRef.current;
+        if (truePlayerEnt) {
+            const pTarget = new THREE.Vector3(truePlayerEnt.x, truePlayerEnt.y || 0, truePlayerEnt.z || 0);
+            shipPosRef.current.lerp(pTarget, posAlpha);
+        }
 
-        // FIXED CAMERA POSITION PHASE 9.3 (SHIP-RELATIVE CHASE)
-        // Camera distance scales with zoom
-        const baseDist = 300 + zoom * 100;
+        // Drive ship group position from the player ref
+        if (shipGroupRef.current) {
+            shipGroupRef.current.position.copy(shipPosRef.current);
+        }
 
-        // Relative offset from ship: Rear-view, slightly above
-        const relOffset = new THREE.Vector3(0, 80, -baseDist);
-
-        // Calculate ship-relative rotation (must match PlayerShip.tsx)
-        const yawQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -yaw + Math.PI / 2);
-        const pitchQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -pitch);
-        const rotationQ = yawQ.multiply(pitchQ);
-
-        // Apply rotation to the offset
-        const worldOffset = relOffset.applyQuaternion(rotationQ);
-
-        // Apply the offset to the smoothed ship position
-        const targetCam = smoothedPos.current.clone().add(worldOffset);
-
-        // Smoothly interpolate camera position
-        smoothedCamPos.current.lerp(targetCam, 0.15);
-        cameraRef.current.position.copy(smoothedCamPos.current);
-
-        // Look slightly above the ship so it's centered in the lower-middle of the screen
-        const lookTarget = smoothedPos.current.clone().add(new THREE.Vector3(0, 30, 0).applyQuaternion(rotationQ));
-        cameraRef.current.lookAt(lookTarget);
+        // Starfield follows camera
+        if (starfieldGroupRef.current) {
+            starfieldGroupRef.current.position.copy(state.camera.position);
+        }
     });
 
-    const shipPos: [number, number, number] = [
-        smoothedPos.current.x,
-        smoothedPos.current.y,
-        smoothedPos.current.z,
-    ];
+    const player = Object.values(ecsEntities).find((e: any) => e.ent_type === 'player') as any;
 
     return (
         <>
+            <CameraSystem
+                spectatorTargetId={spectatorTargetId ?? null}
+                ecsEntitiesRef={ecsEntitiesRef}
+                camYawRef={camYawRef}
+                camPitchRef={camPitchRef}
+                zoom={zoom}
+            />
             <PerspectiveCamera
-                ref={cameraRef}
                 makeDefault
                 fov={70}
                 near={0.1}
@@ -248,37 +276,55 @@ export const GameScene: React.FC<GameSceneProps> = ({
                 position={[8400, 600, -200]}
             />
 
-            <ambientLight intensity={0.4} color={realityOverride?.ambient_color || '#ffffff'} />
-            <directionalLight position={[200, 100, 100]} intensity={1.5} />
+            <ambientLight
+                intensity={globalOverride?.ambient_intensity !== undefined ? globalOverride.ambient_intensity : 0.4}
+                color={globalOverride?.ambient_color || realityOverride?.ambient_color || '#ffffff'}
+            />
+            <directionalLight position={[200, 100, 100]} intensity={globalOverride?.sun_visible === false ? 0 : 1.5} />
             <pointLight
                 position={[0, 0, 0]}
-                intensity={80000}
+                intensity={globalOverride?.sun_visible === false ? 0 : 80000}
                 decay={1.2}
                 color={realityOverride?.sun_color || '#fcd34d'}
             />
 
             <Environment preset="night" />
-            <Starfield count={5000} position={shipPos} />
+            {/* Starfield: group position driven by useFrame → no React-state jitter */}
+            {globalOverride?.sun_visible !== false && (
+                <group ref={starfieldGroupRef}>
+                    <Starfield count={5000} position={[0, 0, 0]} />
+                </group>
+            )}
+            {globalOverride?.skybox_color && <color attach="background" args={[globalOverride.skybox_color]} />}
             <BoundaryShell />
 
             {player && (
                 <>
-                    <PlayerShip
-                        position={[rx, ry, rz]}
-                        rotationRef={camYawRef}
-                        camPitchRef={camPitchRef}
-                        shipType={player?.model_type || playerSpaceship}
-                        shipColor={player?.custom_color}
-                        isCloaked={player?.is_cloaked}
-                    />
+                    {/* Ship group position driven by smoothedPos ref in useFrame — never jumps on React re-render */}
+                    <group ref={shipGroupRef}>
+                        <PlayerShip
+                            position={[0, 0, 0]}
+                            rotationRef={camYawRef}
+                            camPitchRef={camPitchRef}
+                            shipType={player?.model_type || playerSpaceship}
+                            shipColor={player?.custom_color}
+                            isCloaked={player?.is_cloaked}
+                            laserOriginRef={laserOriginRef}
+                            playerEnt={player}
+                        />
+                    </group>
                     <LaserBeam
                         shipPos={shipPosRef.current}
+                        laserOriginRef={laserOriginRef}
                         yawRef={camYawRef}
                         pitchRef={camPitchRef}
                         entities={ecsEntities}
+                        color={player?.custom_color}
+                        isFiring={player?.is_firing}
                     />
                     <HitDot
                         shipPos={shipPosRef.current}
+                        laserOriginRef={laserOriginRef}
                         yawRef={camYawRef}
                         pitchRef={camPitchRef}
                         entities={ecsEntities}
@@ -288,10 +334,15 @@ export const GameScene: React.FC<GameSceneProps> = ({
 
             <EntityRenderer
                 entities={ecsEntities}
+                entitiesRef={ecsEntitiesRef}
                 newbornIds={newbornIds}
                 dyingIds={dyingIds}
                 realityOverride={realityOverride}
                 targetedEntityId={targetedEntityId}
+                spectatorTargetId={spectatorTargetId}
+                visualConfig={visualConfig}
+                globalOverride={globalOverride}
+                customTextureUrl={customTextureUrl}
             />
             <ParticleSystem particles={particles} />
         </>

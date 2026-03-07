@@ -1,0 +1,263 @@
+﻿cargo :     Checking core-state v0.1.0 (C:\Project\engines\core-state)
+At line:1 char:1
++ cargo check > errors.txt 2>&1 ; Get-Content errors.txt -Encoding Unic ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Checking co...nes\core-state):String) 
+    [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: unused import: `crate::systems::*`
+ --> src\game_loop.rs:3:5
+  |
+3 | use crate::systems::*;
+  |     ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::time::Instant`
+ --> src\game_loop.rs:9:5
+  |
+9 | use std::time::Instant;
+  |     ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `warp::ws::Message`
+  --> src\game_loop.rs:10:5
+   |
+10 | use warp::ws::Message;
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PlayerInputState`
+   --> src\api.rs:148:22
+    |
+148 | use crate::{Clients, PlayerInputState, RealityModifiers};
+    |                      ^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::api::*`
+ --> src\main.rs:7:5
+  |
+7 | use crate::api::*;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `crate::game_loop::*`
+ --> src\main.rs:9:5
+  |
+9 | use crate::game_loop::*;
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `BirthAge`, `CommandRequest`, `DeathAge`, `Faction`, 
+`ModelVariant`, `Particle`, `PersistentId`, `PlayerInputMessage`, `Projectile`, 
+`Scale`, `SpatialAnomaly`, `SpawnAge`, `TargetLock`, and `UpdatePlayerRequest`
+  --> src\main.rs:13:72
+   |
+13 | ...e, BirthAge, DeathAge, SteeringAgent, SpatialAnomaly, Particle, Projectile, 
+PlayerInputMessage, Health, Faction, Visuals, UpdatePlayerRequest, Parent, SpawnAge, 
+WeaponParameters, CommandRequest, TargetLock, PersistentId, ModelVariant, Scale, P...
+   |       ^^^^^^^^  ^^^^^^^^                 ^^^^^^^^^^^^^^  ^^^^^^^^  ^^^^^^^^^^  
+^^^^^^^^^^^^^^^^^^          ^^^^^^^           ^^^^^^^^^^^^^^^^^^^          ^^^^^^^^    
+                ^^^^^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+  --> src\main.rs:14:13
+   |
+14 | use serde::{Serialize, Deserialize};
+   |             ^^^^^^^^^  ^^^^^^^^^^^
+
+warning: unused import: `SeedableRng`
+  --> src\main.rs:17:17
+   |
+17 | use rand::{Rng, SeedableRng};
+   |                 ^^^^^^^^^^^
+
+warning: unused import: `rand_chacha::ChaCha8Rng`
+  --> src\main.rs:18:5
+   |
+18 | use rand_chacha::ChaCha8Rng;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::io::Write`
+  --> src\main.rs:19:5
+   |
+19 | use std::io::Write;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `systems::MAX_WORLD_RADIUS`
+  --> src\main.rs:21:5
+   |
+21 | use systems::MAX_WORLD_RADIUS;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src\game_loop.rs:442:40
+    |
+442 |                 for (entity, mut proj, mut p_trans, lock_opt) in 
+p_query.iter_mut(&mut w) {
+    |                                        ----^^^^^^^
+    |                                        |
+    |                                        help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `warp::Filter`
+  --> src\main.rs:11:5
+   |
+11 | use warp::Filter;
+   |     ^^^^^^^^^^^^
+
+warning: unused variable: `speed_multiplier`
+  --> src\game_loop.rs:80:14
+   |
+80 |         let (speed_multiplier, gravity_mod, friction_mod) = {
+   |              ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an 
+underscore: `_speed_multiplier`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `maybe_target`
+   --> src\game_loop.rs:200:17
+    |
+200 |             let maybe_target = *player_target_for_loop.lock().unwrap();
+    |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an 
+underscore: `_maybe_target`
+
+warning: unused variable: `p_trans`
+   --> src\game_loop.rs:442:40
+    |
+442 |                 for (entity, mut proj, mut p_trans, lock_opt) in 
+p_query.iter_mut(&mut w) {
+    |                                        ^^^^^^^^^^^ help: if this is intentional, 
+prefix it with an underscore: `_p_trans`
+
+warning: unused variable: `lock_opt`
+   --> src\game_loop.rs:442:53
+    |
+442 |                 for (entity, mut proj, mut p_trans, lock_opt) in 
+p_query.iter_mut(&mut w) {
+    |                                                     ^^^^^^^^ help: if this is 
+intentional, prefix it with an underscore: `_lock_opt`
+
+warning: unused variable: `hpid`
+   --> src\game_loop.rs:569:45
+    |
+569 |                 for (he, hx, hy, hz, htype, hpid) in hostiles {
+    |                                             ^^^^ help: if this is intentional, 
+prefix it with an underscore: `_hpid`
+
+warning: unused variable: `et_type`
+   --> src\game_loop.rs:726:33
+    |
+726 |                         for (_, et_type, mass, _, pid) in &hostile_hits {
+    |                                 ^^^^^^^ help: if this is intentional, prefix it 
+with an underscore: `_et_type`
+
+warning: value assigned to `objective` is never read
+   --> src\game_loop.rs:919:29
+    |
+919 |         let mut objective = "".to_string();
+    |                             ^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `damage_cooldown`
+   --> src\api.rs:161:9
+    |
+161 |     let damage_cooldown = engine_state.damage_cooldown.clone();
+    |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an 
+underscore: `_damage_cooldown`
+
+warning: unused variable: `player_knockback`
+   --> src\api.rs:162:9
+    |
+162 |     let player_knockback = engine_state.player_knockback.clone();
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an 
+underscore: `_player_knockback`
+
+warning: unused variable: `level_start_time`
+   --> src\api.rs:166:9
+    |
+166 |     let level_start_time = engine_state.level_start_time.clone();
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an 
+underscore: `_level_start_time`
+
+warning: unused variable: `force_next_level`
+   --> src\api.rs:170:9
+    |
+170 |     let force_next_level = engine_state.force_next_level.clone();
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an 
+underscore: `_force_next_level`
+
+warning: unused variable: `reality_for_sys`
+   --> src\api.rs:179:9
+    |
+179 |     let reality_for_sys = reality_modifiers.clone();
+    |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an 
+underscore: `_reality_for_sys`
+
+warning: unused variable: `world_for_reset`
+   --> src\api.rs:557:9
+    |
+557 |     let world_for_reset = world.clone();
+    |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an 
+underscore: `_world_for_reset`
+
+warning: type `PlayerInputState` is more private than the item 
+`EngineState::player_input_state`
+  --> src\engine_state.rs:13:5
+   |
+13 |     pub player_input_state: Arc<Mutex<PlayerInputState>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field 
+`EngineState::player_input_state` is reachable at visibility `pub`
+   |
+note: but type `PlayerInputState` is only usable at visibility `pub(crate)`
+  --> src\main.rs:28:1
+   |
+28 | struct PlayerInputState {
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+   = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `PlayerInputState` is more private than the item `client_connection`
+    --> src\game_loop.rs:1298:1
+     |
+1298 | pub async fn client_connection(ws: warp::ws::WebSocket, clients: Clients, 
+input_state: Arc<Mutex<PlayerInputState>>) {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `client_connection` is reachable at 
+visibility `pub`
+     |
+note: but type `PlayerInputState` is only usable at visibility `pub(crate)`
+    --> src\main.rs:28:1
+     |
+  28 | struct PlayerInputState {
+     | ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `rotational_vel` is never read
+  --> src\main.rs:41:9
+   |
+40 | struct PlayerPhysicsState {
+   |        ------------------ field in this struct
+41 |     pub rotational_vel: f64,
+   |         ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `default_zoom` is never used
+ --> src\components.rs:5:4
+  |
+5 | fn default_zoom() -> f64 { 1.0 }
+  |    ^^^^^^^^^^^^
+
+warning: field `target_id` is never read
+   --> src\components.rs:353:9
+    |
+345 | pub struct CommandRequest {
+    |            -------------- field in this struct
+...
+353 |     pub target_id: Option<u32>,
+    |         ^^^^^^^^^
+    |
+    = note: `CommandRequest` has a derived impl for the trait `Debug`, but this is 
+intentionally ignored during dead code analysis
+
+warning: `core-state` (bin "core-state") generated 32 warnings (run `cargo fix --bin 
+"core-state" -p core-state` to apply 25 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.80s

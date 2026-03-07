@@ -1,8 +1,13 @@
 use bevy_ecs::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
-fn default_zoom() -> f64 { 1.0 }
-fn default_rotation() -> f64 { 0.0 }
+fn default_zoom() -> f64 {
+    1.0
+}
+fn default_rotation() -> f64 {
+    0.0
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RealityOverride {
@@ -49,6 +54,45 @@ pub struct WorldState {
     pub ship_color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission_complete: Option<bool>,
+
+    // AI-Controlled UI & Environment State
+    #[serde(default)]
+    pub radar_filters: HashMap<String, bool>,
+    #[serde(default)]
+    pub audio_settings: AudioSettings,
+    #[serde(default)]
+    pub mission_parameters: Option<MissionParameters>,
+}
+
+#[derive(Resource, Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AudioSettings {
+    pub game_muted: bool,
+    pub ai_muted: bool,
+}
+
+#[derive(Resource, Debug, Serialize, Deserialize, Clone)]
+pub struct MissionParameters {
+    pub seed: u64,
+    pub density: f64,
+    pub min_scale: f64,
+    pub max_scale: f64,
+}
+
+impl Default for MissionParameters {
+    fn default() -> Self {
+        Self {
+            seed: 42,
+            density: 1.0,
+            min_scale: 0.5,
+            max_scale: 2.5,
+        }
+    }
+}
+
+/// Persistent state to track which unique entities have been destroyed across a session.
+#[derive(Resource, Debug, Default, Clone)]
+pub struct PersistentWorldState {
+    pub destroyed_ids: HashSet<u64>,
 }
 
 impl Default for WorldState {
@@ -67,6 +111,21 @@ impl Default for WorldState {
             ship_model: None,
             ship_color: None,
             mission_complete: None,
+            radar_filters: [
+                ("sun", true),
+                ("planet", true),
+                ("moon", false),
+                ("federation", true),
+                ("enemy", true),
+                ("station", true),
+                ("asteroid", false),
+                ("you", true),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect(),
+            audio_settings: AudioSettings::default(),
+            mission_parameters: Some(MissionParameters::default()),
         }
     }
 }
@@ -110,16 +169,34 @@ pub struct Projectile {
     pub color: String,
     #[serde(default = "default_projectile_size")]
     pub size: f64,
+    #[serde(default)]
+    pub shooter_id: Option<Entity>,
 }
 
 // Example ECS Component: PhysicsType for generative behavior
 #[derive(Component, Debug, Serialize, Deserialize, Clone)]
 pub enum PhysicsType {
     Static,
-    Orbital { radius: f64, speed: f64, angle: f64 },
-    Sinusoidal { amplitude: f64, frequency: f64, time: f64 },
-    Velocity { vx: f64, vy: f64, vz: f64 },
-    Projectile { speed: f64, #[serde(default)] pitch_angle: f64 },
+    Orbital {
+        radius: f64,
+        speed: f64,
+        angle: f64,
+    },
+    Sinusoidal {
+        amplitude: f64,
+        frequency: f64,
+        time: f64,
+    },
+    Velocity {
+        vx: f64,
+        vy: f64,
+        vz: f64,
+    },
+    Projectile {
+        speed: f64,
+        #[serde(default)]
+        pitch_angle: f64,
+    },
 }
 
 // Example ECS Component: Type/Name
@@ -134,7 +211,6 @@ pub struct Scale(pub f64);
 
 #[derive(Component, Debug, Serialize, Deserialize, Clone)]
 pub struct ModelVariant(pub u32);
-
 
 /// Birth effect timer. Starts at 0.0 on spawn, incremented each game tick (0.016s).
 /// Physics system multiplies speed by min(age / 2.0, 1.0) → 0→full over ~2 seconds.
@@ -216,7 +292,9 @@ pub struct WeaponParameters {
     pub projectile_size: f64,
 }
 
-fn default_projectile_size() -> f64 { 8.0 }
+fn default_projectile_size() -> f64 {
+    8.0
+}
 
 impl Default for WeaponParameters {
     fn default() -> Self {
@@ -242,7 +320,11 @@ pub struct PhysicsConstants {
 
 impl Default for PhysicsConstants {
     fn default() -> Self {
-        Self { gravity_scale: 1.0, friction: 0.95, projectile_speed_mult: 1.0 }
+        Self {
+            gravity_scale: 1.0,
+            friction: 0.95,
+            projectile_speed_mult: 1.0,
+        }
     }
 }
 
@@ -256,15 +338,23 @@ pub struct FactionRelations {
 
 impl FactionRelations {
     fn canonical_key(a: &str, b: &str) -> String {
-        if a <= b { format!("{}:{}", a, b) } else { format!("{}:{}", b, a) }
+        if a <= b {
+            format!("{}:{}", a, b)
+        } else {
+            format!("{}:{}", b, a)
+        }
     }
 
     pub fn get_affinity(&self, a: &str, b: &str) -> f64 {
-        *self.relations.get(&Self::canonical_key(a, b)).unwrap_or(&0.0)
+        *self
+            .relations
+            .get(&Self::canonical_key(a, b))
+            .unwrap_or(&0.0)
     }
 
     pub fn set_affinity(&mut self, a: &str, b: &str, affinity: f64) {
-        self.relations.insert(Self::canonical_key(a, b), affinity.clamp(-1.0, 1.0));
+        self.relations
+            .insert(Self::canonical_key(a, b), affinity.clamp(-1.0, 1.0));
     }
 
     pub fn are_hostile(&self, a: &str, b: &str) -> bool {
@@ -305,5 +395,3 @@ pub struct CommandRequest {
     #[serde(default)]
     pub is_cloaked: Option<bool>,
 }
-
-

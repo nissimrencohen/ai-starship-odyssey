@@ -1,5 +1,16 @@
 {
+  "name": "ai-starship-odyssey",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "concurrently \"npm run start:engine\" \"npm run start:director\" \"npm run start:client\"",
+    "start:engine": "cd engines/core-state && cargo run --release",
+    "start:director": "cd apps/python-director && .\\venv\\Scripts\\activate && uvicorn main:app --port 8000",
+    "start:client": "cd apps/web-client && npm run dev"
+  },
   "dependencies": {
     "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
   }
 }

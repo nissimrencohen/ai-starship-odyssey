@@ -1,18 +1,18 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import useWebSocket, { ReadyState } from 'react-use-websocket';
-import { Activity, Server, Mic, MicOff, Save, Volume2, VolumeX, ChevronLeft, Send } from 'lucide-react';
+import { Activity, Server, Mic, MicOff, ChevronLeft, Send } from 'lucide-react';
 import { Canvas } from '@react-three/fiber';
 import { GameScene } from './components/GameScene';
 import { HUD } from './components/HUD';
 import { ChatLog, ChatMessage } from './components/ChatLog';
 
-const WS_URL = 'ws://127.0.0.1:8000/api/v1/dream-stream';
+const WS_URL = 'ws://localhost:8000/api/v1/dream-stream';
 
 export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [directorMessage, setDirectorMessage] = useState<string>("Awaiting connection to The Void...");
   const [worldState, setWorldState] = useState<any>(null);
-  const [engineSynced, setEngineSynced] = useState(false);
+  const [customTextureUrl, setCustomTextureUrl] = useState<string | null>(null);
 
   // Voice & Audio Meter State
   const [volumeLevel, setVolumeLevel] = useState(0);
@@ -35,7 +35,7 @@ export default function App() {
   });
 
   // ECS WebSocket connection
-  const { lastMessage: ecsMessage, sendMessage: sendEcsMessage, readyState: ecsReadyState } = useWebSocket('ws://127.0.0.1:8081/ws', {
+  const { lastMessage: ecsMessage, sendMessage: sendEcsMessage } = useWebSocket('ws://localhost:8081/ws', {
     shouldReconnect: () => true,
     reconnectInterval: 500,
     onError: (e) => console.error('Rust engine connection error:', e),
@@ -75,7 +75,8 @@ export default function App() {
         Math.abs(yaw - last.yaw) > 0.0005 ||
         Math.abs(pitch - last.pitch) > 0.0005;
 
-      if (changed) {
+      const isLocked = spectatorTargetIdRef.current !== null || isTimeFrozenRef.current || isFocusModePausedRef.current;
+      if (changed && !isLocked) {
         sendEcsMessage(JSON.stringify({
           msg_type: 'player_input',
           keys: Array.from(activeKeysRef.current),
@@ -95,6 +96,9 @@ export default function App() {
     const GAME_KEYS = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'ShiftLeft', 'ShiftRight']);
     const handleKeyDown = (e: KeyboardEvent) => {
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+      if (e.code === 'Escape') {
+        setSpectatorTargetId(null);
+      }
       if (GAME_KEYS.has(e.code)) { e.preventDefault(); activeKeysRef.current.add(e.code); }
     };
     const handleKeyUp = (e: KeyboardEvent) => { activeKeysRef.current.delete(e.code); };
@@ -170,10 +174,18 @@ export default function App() {
     if (canvas && !isPointerLockedRef.current) {
       canvas.requestPointerLock();
     }
+    // Initialize AudioContext on first user gesture (browser autoplay policy)
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    }
+    if (audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume();
+    }
   }, []);
 
   const [ecsEntities, setEcsEntities] = useState<Record<string, any>>({});
   const ecsEntitiesRef = useRef<Record<string, any>>({});
+  const ecsFrameCounterRef = useRef(0);
   const [particles, setParticles] = useState<any[]>([]);
   const particlesRef = useRef<any[]>([]);
   const [zoom, setZoom] = useState(1.5);
@@ -181,7 +193,6 @@ export default function App() {
   const zoomDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSentZoomRef = useRef(1.5);
   const shakeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [saveToast, setSaveToast] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [isRachelEnabled, setIsRachelEnabled] = useState(true);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -192,6 +203,8 @@ export default function App() {
   const [currentLevel, setCurrentLevel] = useState(1);
   const [objective, setObjective] = useState("");
   const [isGameOver, setIsGameOver] = useState(false);
+  const [blackHoleDeath, setBlackHoleDeath] = useState(false);
+  const blackHoleDeathFiredRef = useRef(false);
   const [showDamageFlash, setShowDamageFlash] = useState(false);
   const [showSuccessFlash, setShowSuccessFlash] = useState(false);
   const [showBoundaryFlash, setShowBoundaryFlash] = useState(false);
@@ -203,21 +216,122 @@ export default function App() {
   // Tab targeting state
   const [targetedEntityId, setTargetedEntityId] = useState<number | null>(null);
 
+  // Spectator mode state
+  const [spectatorTargetId, setSpectatorTargetId] = useState<number | null>(null);
+  const spectatorTargetIdRef = useRef<number | null>(null);
+  useEffect(() => { spectatorTargetIdRef.current = spectatorTargetId; }, [spectatorTargetId]);
+
+  const [isTimeFrozen, setIsTimeFrozen] = useState(false);
+  const isTimeFrozenRef = useRef(false);
+  useEffect(() => { isTimeFrozenRef.current = isTimeFrozen; }, [isTimeFrozen]);
+
+  // Focus mode pause (tactical map open)
+  const isFocusModePausedRef = useRef(false);
+
+  // Full reset: clears BH overlay + calls engine reset
+  const bhAutoResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gameOverResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleFullReset = useCallback(async () => {
+    if (bhAutoResetTimerRef.current) { clearTimeout(bhAutoResetTimerRef.current); bhAutoResetTimerRef.current = null; }
+    try { await fetch('http://127.0.0.1:8080/api/engine/reset', { method: 'POST' }); } catch (_) { }
+    setBlackHoleDeath(false);
+    blackHoleDeathFiredRef.current = false;
+    setSpectatorTargetId(null);
+    setIsGameOver(false);
+    setZoom(1.5);
+  }, []);
+
+  // Pause/resume Rust physics when tactical map opens/closes or spectator mode changes
+  const syncEnginePauseState = useCallback(() => {
+    const shouldPause = isFocusModePausedRef.current || spectatorTargetIdRef.current !== null;
+    fetch(`http://127.0.0.1:8080/api/${shouldPause ? 'pause' : 'resume'}`, { method: 'POST' }).catch(() => { });
+  }, []);
+
+  const handleFocusModeChange = useCallback((isOpen: boolean) => {
+    isFocusModePausedRef.current = isOpen;
+    syncEnginePauseState();
+  }, [syncEnginePauseState]);
+
+  // Planet radii for zoom calculation
+  const getPlanetRadius = (name: string) => {
+    switch (name) {
+      case 'Mercury': return 120;
+      case 'Venus': return 255;
+      case 'Earth': return 300;
+      case 'Mars': return 180;
+      case 'Jupiter': return 750;
+      case 'Saturn': return 630;
+      case 'Uranus': return 420;
+      case 'Neptune': return 390;
+      default: return 150;
+    }
+  };
+
+  const prevSpectatorTargetId = useRef<number | null>(null);
+  const visualConfig = worldState?.visual_config;
+
+  useEffect(() => {
+    // When spectator target changes, recalculate default zoom
+    if (spectatorTargetId !== prevSpectatorTargetId.current) {
+      if (spectatorTargetId !== null) {
+        const target = ecsEntitiesRef.current[spectatorTargetId];
+        if (target) {
+          let r = 30; // Default radius fallback
+          if (target.ent_type === 'planet') {
+            r = target.name === 'Sun' || target.name === 'sun' ? 1000 : getPlanetRadius(target.name);
+          } else if (target.ent_type === 'moon') {
+            r = target.radius || 30;
+          } else if (target.radius) {
+            r = target.radius;
+          } else if (target.ent_type === 'player') {
+            r = 15;
+          }
+
+          const vScale = visualConfig?.planet_scale_overrides?.[target.name] ?? 1.0;
+          const totalRadius = r * vScale;
+
+          const idealZoom = (totalRadius * 3.5 - 300) / 100;
+          setZoom(Math.max(0.01, Math.min(25.0, idealZoom)));
+
+          // Initialize yaw/pitch for spectator mode
+          if (target.ent_type === 'planet' || target.ent_type === 'moon' || target.name === 'Sun' || target.name === 'sun') {
+            // Stars/Planets: look from "outside in" relative to system center
+            camYawRef.current = Math.atan2(target.z || 0, target.x || 0);
+          } else if (target.rotation !== undefined) {
+            // Ships/Entities: look from their heading
+            camYawRef.current = target.rotation;
+          }
+          camPitchRef.current = 0.15;
+        }
+      } else {
+        // Returned to player
+        setZoom(1.5);
+        const playerEnt = Object.values(ecsEntitiesRef.current).find((e: any) => e.ent_type === 'player') as any;
+        if (playerEnt) {
+          camYawRef.current = playerEnt.rotation || 0;
+          camPitchRef.current = 0;
+        }
+      }
+      syncEnginePauseState();
+      prevSpectatorTargetId.current = spectatorTargetId;
+    }
+  }, [spectatorTargetId, syncEnginePauseState, visualConfig]);
+
   // Track entities that just spawned to trigger the birth glow animation
   const [newbornIds, setNewbornIds] = useState<Set<number>>(new Set());
   // Track dying entities for implosion animation
   const [dyingIds, setDyingIds] = useState<Set<number>>(new Set());
 
-  // Initialize AudioContext on first user interaction (browser autoplay policy)
-  const initAudio = useCallback(() => {
-    if (!audioCtxRef.current) {
-      audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      // AudioContext initialized
-    }
-    if (audioCtxRef.current.state === 'suspended') {
-      audioCtxRef.current.resume();
-    }
-  }, []);
+  // Global visual overrides (e.g. blackout events)
+  const [globalOverride, setGlobalOverride] = useState<{
+    sun_visible?: boolean;
+    ambient_color?: string;
+    ambient_intensity?: number;
+    skybox_color?: string;
+  }>({
+    sun_visible: true,
+    ambient_intensity: 0.4,
+  });
 
   // Generative collision sound: sine+sawtooth oscillator pulse
   const playCollisionSound = useCallback((speed: number, distance: number) => {
@@ -263,39 +377,17 @@ export default function App() {
     osc2.stop(now + 0.15);
   }, [isMuted]);
 
-  const handleSave = async () => {
-    initAudio(); // ensure AudioContext is alive on any user click
-    try {
-      const res = await fetch('http://127.0.0.1:8080/save', { method: 'POST', mode: 'cors' });
-      if (res.ok) {
-        setSaveToast(true);
-        setTimeout(() => setSaveToast(false), 3000);
-      } else {
-        console.error('Save failed:', res.status);
-      }
-    } catch (err) {
-      console.error('Save request error:', err);
-    }
-  };
-
-  const handleClearWorld = async () => {
-    try {
-      await fetch('http://127.0.0.1:8080/clear', {
-        method: 'POST',
-        mode: 'cors',
-      });
-    } catch (err) {
-      console.error('Clear failed:', err);
-    }
-  };
 
   // Debounced Camera Zoom via scroll wheel
   useEffect(() => {
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
       setZoom(prev => {
-        const next = Math.max(0.5, Math.min(5.0, prev + e.deltaY * 0.001));
-        return next;
+        // Normal mode: 0.01 (dist=301, ultra-tight) → 10.0 (dist=1300, tactical view)
+        // Spectator/radar-focus mode: wider range allowed (0.01 to 25.0)
+        const isSpectator = spectatorTargetIdRef.current !== null;
+        const [minZ, maxZ] = isSpectator ? [0.01, 25.0] : [0.01, 10.0];
+        return Math.max(minZ, Math.min(maxZ, prev + e.deltaY * 0.002));
       });
     };
     window.addEventListener('wheel', handleWheel, { passive: false });
@@ -308,7 +400,7 @@ export default function App() {
     if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
     zoomDebounceRef.current = setTimeout(() => {
       lastSentZoomRef.current = zoom;
-      fetch('http://127.0.0.1:8080/state', {
+      fetch('http://localhost:8080/state', {
         method: 'POST',
         mode: 'cors',
         headers: { 'Content-Type': 'application/json' },
@@ -352,9 +444,52 @@ export default function App() {
           }
           if (data.is_game_over !== undefined) {
             setIsGameOver(data.is_game_over as boolean);
+            if (data.is_game_over) {
+              // ANY game over (enemy, asteroid, or BH) → auto-reset after 4s
+              // (matches Rust 3s countdown + 1s drama buffer)
+              if (gameOverResetTimerRef.current) clearTimeout(gameOverResetTimerRef.current);
+              gameOverResetTimerRef.current = setTimeout(() => {
+                handleFullReset();
+                gameOverResetTimerRef.current = null;
+              }, 4000);
+            } else {
+              // Game resumed — cancel any pending reset
+              if (gameOverResetTimerRef.current) {
+                clearTimeout(gameOverResetTimerRef.current);
+                gameOverResetTimerRef.current = null;
+              }
+              // Clear black hole death overlay only when transitioning OUT of a BH death
+              if (blackHoleDeathFiredRef.current) {
+                setBlackHoleDeath(false);
+                blackHoleDeathFiredRef.current = false;
+                setSpectatorTargetId(null);
+              }
+            }
+          }
+          if (data.black_hole_death === true && !blackHoleDeathFiredRef.current) {
+            blackHoleDeathFiredRef.current = true;
+            setBlackHoleDeath(true);
+            // Focus camera on the black hole — search current frame entities first (freshest), then cached ref
+            const frameEnts: any[] = Array.isArray(data.entities) ? data.entities : [];
+            const bhEnt = (frameEnts.find((e: any) => e.anomaly_type === 'black_hole') ??
+              Object.values(ecsEntitiesRef.current).find((e: any) => e.anomaly_type === 'black_hole')) as any;
+            if (bhEnt) setSpectatorTargetId(bhEnt.id);
+            // Zoom out dramatically
+            setZoom(prev => Math.min(prev + 8, 25));
+            // Auto-reset after 5 seconds
+            if (bhAutoResetTimerRef.current) clearTimeout(bhAutoResetTimerRef.current);
+            bhAutoResetTimerRef.current = setTimeout(() => { handleFullReset(); }, 5000);
           }
           if (data.objective !== undefined) {
             setObjective(data.objective as string);
+          }
+          if (data.radar_filters !== undefined) {
+            // radar_filters is handled via prop passing to HUD
+          }
+          if (data.audio_settings !== undefined) {
+            const settings = data.audio_settings;
+            if (settings.game_muted !== undefined) setIsMuted(settings.game_muted);
+            if (settings.ai_muted !== undefined) setIsRachelEnabled(!settings.ai_muted);
           }
           if (data.success_kill === true) {
             if (successFlashTimeoutRef.current) clearTimeout(successFlashTimeoutRef.current);
@@ -399,16 +534,15 @@ export default function App() {
             data.entities.forEach((ent: any) => {
               entitiesObj[ent.id] = ent;
             });
-
             (window as any)._loggedFirstFrame = true;
-            ecsEntitiesRef.current = entitiesObj;
-            setEcsEntities(entitiesObj);
           } else {
-            ecsEntitiesRef.current = data.entities;
-            setEcsEntities(data.entities);
+            entitiesObj = data.entities;
           }
 
-          // Boundary proximity — flash blue when within 2 000 u of the 32 000 u shell
+          // Always update the ref (60fps) — used by 3D scene via useFrame (no React re-render)
+          ecsEntitiesRef.current = entitiesObj;
+
+          // Boundary proximity — flash blue when within 4 000 u of the 64 000 u shell
           const playerEntBoundary = Array.isArray(data.entities)
             ? data.entities.find((e: any) => e.ent_type === 'player')
             : null;
@@ -416,7 +550,7 @@ export default function App() {
             const bx = playerEntBoundary.x || 0;
             const by = playerEntBoundary.y || 0;
             const bz = playerEntBoundary.z || 0;
-            if (Math.sqrt(bx * bx + by * by + bz * bz) > 30000) {
+            if (Math.sqrt(bx * bx + by * by + bz * bz) > 60000) {
               if (boundaryFlashTimeoutRef.current) clearTimeout(boundaryFlashTimeoutRef.current);
               setShowBoundaryFlash(true);
               boundaryFlashTimeoutRef.current = setTimeout(() => setShowBoundaryFlash(false), 800);
@@ -429,41 +563,56 @@ export default function App() {
           const newIds = new Set(newbornIds);
           const dropIds = new Set(dyingIds);
 
-          data.entities.forEach((ent: any) => {
-            if (ent.is_newborn && !newbornIds.has(ent.id)) {
-              newIds.add(ent.id);
-              hasNew = true;
-              // Remove the glow after the 1.2s animation finishes
-              setTimeout(() => {
-                setNewbornIds(prev => {
-                  const s = new Set(prev);
-                  s.delete(ent.id);
-                  return s;
-                });
-              }, 1200);
-            }
-            if (ent.is_dying && !dyingIds.has(ent.id)) {
-              dropIds.add(ent.id);
-              hasDying = true;
-              // Note: Rust removes the entity after 1.0s, so we don't need a rigorous timeout to clean this up,
-              // because the entity won't exist in the next tick anyway. But for safety:
-              setTimeout(() => {
-                setDyingIds(prev => {
-                  const s = new Set(prev);
-                  s.delete(ent.id);
-                  return s;
-                });
-              }, 1200);
-            }
-          });
+          if (Array.isArray(data.entities)) {
+            data.entities.forEach((ent: any) => {
+              if (ent.is_newborn && !newbornIds.has(ent.id)) {
+                newIds.add(ent.id);
+                hasNew = true;
+                setTimeout(() => {
+                  setNewbornIds(prev => {
+                    const s = new Set(prev);
+                    s.delete(ent.id);
+                    return s;
+                  });
+                }, 1200);
+              }
+              if (ent.is_dying && !dyingIds.has(ent.id)) {
+                dropIds.add(ent.id);
+                hasDying = true;
+                setTimeout(() => {
+                  setDyingIds(prev => {
+                    const s = new Set(prev);
+                    s.delete(ent.id);
+                    return s;
+                  });
+                }, 1200);
+              }
+            });
+          }
           if (hasNew) setNewbornIds(newIds);
           if (hasDying) setDyingIds(dropIds);
+
+          // Throttle React state updates to ~10fps to avoid 60fps re-renders.
+          // Spawn/despawn events always get an immediate update so meshes appear/disappear promptly.
+          ecsFrameCounterRef.current++;
+          if (hasNew || hasDying || ecsFrameCounterRef.current % 6 === 0) {
+            setEcsEntities(entitiesObj);
+          }
+        } else if (data.type === 'global_override') {
+          setGlobalOverride(prev => ({
+            ...prev,
+            sun_visible: data.sun_visible !== undefined ? data.sun_visible : prev.sun_visible,
+            ambient_color: data.ambient_color || prev.ambient_color,
+            ambient_intensity: data.ambient_intensity !== undefined ? data.ambient_intensity : prev.ambient_intensity,
+            skybox_color: data.skybox_color || prev.skybox_color,
+          }));
+          if (data.is_time_frozen !== undefined) setIsTimeFrozen(data.is_time_frozen);
         }
       } catch (err) {
         // ignore parsing errors for tick data
       }
     }
-  }, [ecsMessage, playCollisionSound]);
+  }, [ecsMessage, playCollisionSound, handleFullReset]);
 
   // Handle incoming WebSocket messages
   useEffect(() => {
@@ -489,6 +638,10 @@ export default function App() {
           // Legacy frame streaming (Phase 1 mock)
         } else if (data.type === 'world_state') {
           setWorldState(data.content);
+        } else if (data.type === 'texture_ready') {
+          setCustomTextureUrl(data.url);
+          setDirectorMessage("New AI texture applied.");
+          setAiState("idle");
         } else if (data.type === 'proactive_audio') {
           setDirectorMessage("Rachel looks on: " + data.text);
           setChatHistory(prev => [...prev, { sender: 'rachel', text: data.text, timestamp: new Date() }]);
@@ -506,10 +659,6 @@ export default function App() {
         } else if (data.type === 'generation_result') {
           if (data.world_state) {
             setWorldState(data.world_state);
-          }
-          if (data.engine_synced) {
-            setEngineSynced(true);
-            setTimeout(() => setEngineSynced(false), 3000); // Briefly flash the synced status
           }
           if (data.audio_b64 && isRachelEnabled) {
             try {
@@ -659,13 +808,6 @@ export default function App() {
     }, 200);
   };
 
-  const connectionStatus = {
-    [ReadyState.CONNECTING]: 'Connecting...',
-    [ReadyState.OPEN]: 'Connected to Director',
-    [ReadyState.CLOSING]: 'Closing...',
-    [ReadyState.CLOSED]: 'Disconnected. Reconnecting...',
-    [ReadyState.UNINSTANTIATED]: 'Uninstantiated',
-  }[readyState];
 
   return (
     <>
@@ -727,6 +869,20 @@ export default function App() {
           0%   { opacity: 1; }
           100% { opacity: 0; }
         }
+        @keyframes bh-warp {
+          0%   { opacity: 0; transform: scale(1.05); }
+          30%  { opacity: 1; transform: scale(1.0); }
+          100% { opacity: 1; transform: scale(1.0); }
+        }
+        @keyframes cinematic-shake {
+          0%,100% { transform: translate(0,0) rotate(0deg); }
+          15% { transform: translate(-6px, 4px) rotate(-1deg); }
+          30% { transform: translate(6px, -4px) rotate(1deg); }
+          45% { transform: translate(-4px, 6px) rotate(-0.5deg); }
+          60% { transform: translate(4px, -6px) rotate(0.5deg); }
+          75% { transform: translate(-2px, 2px) rotate(-0.3deg); }
+        }
+        .cinematic-shake { animation: cinematic-shake 0.6s ease-in-out; }
       `}</style>
 
       {/* Clears the error state explicitly */}
@@ -757,18 +913,36 @@ export default function App() {
           <Canvas gl={{ antialias: true, alpha: true }} shadows>
             <GameScene
               ecsEntities={ecsEntities}
+              ecsEntitiesRef={ecsEntitiesRef}
               particles={particles}
               zoom={zoom}
               newbornIds={newbornIds}
               dyingIds={dyingIds}
               realityOverride={worldState?.reality_override}
               playerSpaceship={worldState?.player_spaceship}
+              visualConfig={worldState?.visual_config}
               camYawRef={camYawRef}
               camPitchRef={camPitchRef}
               targetedEntityId={targetedEntityId}
+              spectatorTargetId={spectatorTargetId}
+              globalOverride={globalOverride}
+              customTextureUrl={customTextureUrl}
             />
           </Canvas>
         </div>
+
+        {/* Black Hole Death Overlay */}
+        {blackHoleDeath && (
+          <div className="absolute inset-0 z-[190] pointer-events-none flex items-center justify-center" style={{ animation: 'bh-warp 0.8s ease-in forwards' }}>
+            <div className="absolute inset-0" style={{ background: 'radial-gradient(ellipse at center, transparent 20%, rgba(0,0,0,0.6) 60%, rgba(0,0,0,0.97) 100%)' }} />
+            <div className="relative flex flex-col items-center gap-6 z-10">
+              <div className="text-red-500 text-[11px] font-mono font-black uppercase tracking-[0.6em] animate-pulse">Signal Lost</div>
+              <div className="text-white/90 text-4xl font-mono font-black uppercase tracking-[0.3em]" style={{ textShadow: '0 0 40px rgba(255,30,30,0.8)' }}>CONNECTION SEVERED</div>
+              <div className="text-neutral-500 text-[11px] font-mono uppercase tracking-[0.4em]">Consumed by Schwarzschild Radius</div>
+              <div className="mt-4 text-neutral-600 text-[10px] font-mono uppercase tracking-[0.3em] animate-pulse">Rebooting neural link...</div>
+            </div>
+          </div>
+        )}
 
         {/* Boundary Warning Flash */}
         {showBoundaryFlash && (
@@ -781,40 +955,7 @@ export default function App() {
           />
         )}
 
-        {/* ── Top-right control bar ──────────────────────────────────────── */}
-        <div className="fixed z-[150] flex items-center gap-2" style={{ top: '24px', right: '24px' }}>
-          {/* Director connection status */}
-          <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-black/40 backdrop-blur border border-white/10 rounded-lg">
-            <div className={`w-1.5 h-1.5 rounded-full ${readyState === ReadyState.OPEN ? 'bg-green-400' : 'bg-red-500 animate-pulse'}`} />
-            <span className="text-[9px] font-mono text-neutral-400 uppercase tracking-widest">
-              {readyState === ReadyState.OPEN ? 'Connected to Director' : 'Director Offline'}
-            </span>
-          </div>
-
-          {/* Rachel voice toggle */}
-          <button
-            onClick={() => setIsRachelEnabled(v => !v)}
-            className={`px-2.5 py-1.5 border rounded-lg text-[9px] font-mono font-bold uppercase tracking-widest transition-all ${isRachelEnabled
-                ? 'bg-purple-500/20 border-purple-500/50 text-purple-400 hover:bg-purple-500/30'
-                : 'bg-neutral-800/60 border-white/10 text-neutral-500 hover:text-neutral-300'
-              }`}
-            title="Toggle Rachel voice"
-          >
-            Rachel: {isRachelEnabled ? 'ON' : 'OFF'}
-          </button>
-
-
-          {/* Mute */}
-          <button
-            onClick={() => setIsMuted(v => !v)}
-            className="w-8 h-8 flex items-center justify-center bg-black/40 backdrop-blur border border-white/10 rounded-lg text-neutral-400 hover:text-white hover:bg-white/10 transition-all"
-            title={isMuted ? 'Unmute sounds' : 'Mute sounds'}
-          >
-            {isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-          </button>
-        </div>
-
-        {/* Tactical HUD Overlay */}
+        {/* Tactical HUD Overlay — Now handles all status icons and buttons */}
         <HUD
           playerHealth={playerHealth}
           score={score}
@@ -825,6 +966,25 @@ export default function App() {
           isGameOver={isGameOver}
           objective={objective}
           isChatVisible={isChatVisible}
+          radarFilters={worldState?.radar_filters}
+          audioSettings={worldState?.audio_settings}
+          readyState={readyState}
+          isRachelEnabled={isRachelEnabled}
+          setIsRachelEnabled={setIsRachelEnabled}
+          isMuted={worldState?.audio_settings?.ai_muted ?? isMuted}
+          setIsMuted={(muted: boolean) => {
+            setIsMuted(muted);
+            sendMessage(JSON.stringify({
+              type: 'update_audio_settings',
+              ai_muted: muted,
+              game_muted: muted
+            }));
+          }}
+          visualConfig={worldState?.visual_config}
+          spectatorTargetId={spectatorTargetId}
+          setSpectatorTargetId={setSpectatorTargetId}
+          onReset={handleFullReset}
+          onFocusModeChange={handleFocusModeChange}
         />
 
         {/* The Director's Console (Left Sidebar) */}
@@ -851,7 +1011,6 @@ export default function App() {
                 <ChatLog messages={chatHistory} onRetry={() => (window as any).clearFailedState && (window as any).clearFailedState()} />
               </div>
             </div>
-
             {/* Removed [Raw Engine State] JSON dump for cleaner UI v7.3 */}
           </div>
 
@@ -863,14 +1022,14 @@ export default function App() {
                 onMouseUp={aiState === 'idle' ? stopRecording : undefined}
                 disabled={aiState !== 'idle'}
                 className={`
-                    relative group flex items-center justify-center w-12 h-12 rounded-full
-                    transition-all duration-300 ease-out shadow-lg
-                    ${aiState !== 'idle' ? 'opacity-50 cursor-not-allowed bg-neutral-800 text-neutral-500 ring-1 ring-white/5' :
+                      relative group flex items-center justify-center w-12 h-12 rounded-full
+                      transition-all duration-300 ease-out shadow-lg
+                      ${aiState !== 'idle' ? 'opacity-50 cursor-not-allowed bg-neutral-800 text-neutral-500 ring-1 ring-white/5' :
                     isRecording
                       ? 'bg-red-500/20 text-red-500 ring-4 ring-red-500/30 scale-95'
                       : 'bg-neutral-800 hover:bg-purple-600 transition-colors text-neutral-300 hover:text-white ring-1 ring-white/20 hover:scale-105'
                   }
-                  `}
+                    `}
               >
                 {isRecording ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
                 {isRecording && <span className="absolute inset-0 rounded-full animate-ping bg-red-500/20 -z-10"></span>}
@@ -934,12 +1093,14 @@ export default function App() {
         {!isChatVisible && (
           <button
             onClick={() => setIsChatVisible(true)}
-            className="fixed left-6 top-6 z-50 w-10 h-10 bg-black/40 backdrop-blur-xl border border-white/10 rounded-xl flex items-center justify-center text-neutral-400 hover:text-white hover:bg-white/10 transition-all shadow-2xl group"
+            className="fixed left-8 bottom-8 z-50 w-12 h-12 bg-black/60 backdrop-blur-xl border border-white/20 rounded-xl flex items-center justify-center text-purple-400 hover:text-white hover:bg-purple-600/20 transition-all shadow-[0_0_30px_rgba(168,85,247,0.2)] group"
+            title="Open Director Console"
           >
-            <Server className="w-5 h-5 group-hover:scale-110 transition-transform" />
+            <Server className="w-6 h-6 group-hover:scale-110 transition-transform" />
           </button>
         )}
       </div>
+
     </>
   );
 }

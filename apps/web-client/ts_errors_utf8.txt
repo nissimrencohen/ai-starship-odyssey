@@ -1,0 +1,20 @@
+﻿src/App.tsx(13,10): error TS6133: 'directorMessage' is declared but its value is never read.
+src/components/ChatLog.tsx(1,8): error TS6133: 'React' is declared but its value is never read.
+src/components/EntityRenderer.tsx(27,39): error TS2339: Property 'clone' does not exist on type 'never'.
+src/components/EntityRenderer.tsx(180,140): error TS6133: 'fallbackColor' is declared but its value is never read.
+src/components/EntityRenderer.tsx(322,84): error TS6133: 'isTargeted' is declared but its value is never read.
+src/components/EntityRenderer.tsx(347,84): error TS6133: 'isTargeted' is declared but its value is never read.
+src/components/EntityRenderer.tsx(372,87): error TS6133: 'isTargeted' is declared but its value is never read.
+src/components/GameScene.tsx(317,14): error TS2304: Cannot find name 'player'.
+src/components/GameScene.tsx(325,39): error TS2304: Cannot find name 'player'.
+src/components/GameScene.tsx(326,40): error TS2304: Cannot find name 'player'.
+src/components/GameScene.tsx(327,40): error TS2304: Cannot find name 'player'.
+src/components/HUD.tsx(2,76): error TS6133: 'WifiOff' is declared but its value is never read.
+src/components/HUD.tsx(201,135): error TS6133: 'audioSettings' is declared but its value is never read.
+src/components/ParticleSystem.tsx(2,1): error TS6133: 'useFrame' is declared but its value is never read.
+src/components/SpaceGrid.tsx(1,25): error TS6133: 'useMemo' is declared but its value is never read.
+src/components/SpaceGrid.tsx(2,1): error TS6133: 'useFrame' is declared but its value is never read.
+src/components/SpaceGrid.tsx(21,17): error TS2322: Type '{ args: [number, number, string, string]; position: [number, number, number]; onBeforeCompile: (shader: any) => void; }' is not assignable to type 'GridHelperProps'.
+  Property 'onBeforeCompile' does not exist on type 'GridHelperProps'.
+src/components/SpaceGrid.tsx(21,35): error TS7006: Parameter 'shader' implicitly has an 'any' type.
+src/components/Starfield.tsx(42,15): error TS6133: 'state' is declared but its value is never read.

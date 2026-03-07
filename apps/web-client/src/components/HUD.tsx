@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { Save, FolderOpen, RotateCcw, FastForward, Volume2, VolumeX, Target, Wifi, WifiOff } from 'lucide-react';
 
 interface HUDProps {
   playerHealth: number;      // 0 – 100
@@ -10,9 +11,22 @@ interface HUDProps {
   isGameOver: boolean;
   objective: string;
   isChatVisible: boolean;
+  radarFilters?: Record<string, boolean>;
+  audioSettings?: { game_muted: boolean; ai_muted: boolean };
+  // Connection & Control Props from App
+  readyState: number;
+  isRachelEnabled: boolean;
+  setIsRachelEnabled: (val: boolean) => void;
+  isMuted: boolean;
+  setIsMuted: (val: boolean) => void;
+  visualConfig?: any;
+  spectatorTargetId?: number | null;
+  setSpectatorTargetId?: React.Dispatch<React.SetStateAction<number | null>>;
+  onReset?: () => void;
+  onFocusModeChange?: (isOpen: boolean) => void;
 }
 
-const WORLD_RADIUS = 32000.0;   // Matches MAX_WORLD_RADIUS in Rust
+const WORLD_RADIUS = 64000.0;
 
 // Mini-radar constants
 const RADAR_R = 70;
@@ -23,29 +37,26 @@ const CY = 80;
 const MAP_CANVAS = 680;
 const MAP_CX = MAP_CANVAS / 2;
 const MAP_CY = MAP_CANVAS / 2;
-const MAP_R = MAP_CANVAS / 2 - 24; // radius with padding
+const MAP_R = MAP_CANVAS / 2 - 24;
 
 function drawRadarFrame(
   ctx: CanvasRenderingContext2D,
   cx: number, cy: number, r: number,
   entities: Record<string, any>,
-  scale: number, // r / WORLD_RADIUS
+  scale: number,
   visibleTypes: Record<string, boolean>
 ) {
   const toRX = (wx: number) => cx + wx * scale;
   const toRY = (wz: number) => cy + wz * scale;
 
-  // Clip to circle
   ctx.save();
   ctx.beginPath();
   ctx.arc(cx, cy, r, 0, Math.PI * 2);
   ctx.clip();
 
-  // Background
   ctx.fillStyle = 'rgba(0, 8, 18, 0.92)';
   ctx.fillRect(cx - r - 2, cy - r - 2, (r + 2) * 2, (r + 2) * 2);
 
-  // Concentric range rings
   [0.25, 0.5, 0.75, 1.0].forEach(frac => {
     ctx.beginPath();
     ctx.arc(cx, cy, r * frac, 0, Math.PI * 2);
@@ -54,18 +65,14 @@ function drawRadarFrame(
     ctx.stroke();
   });
 
-  // Cross-hair lines
   ctx.strokeStyle = 'rgba(0, 255, 200, 0.06)';
   ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(cx - r, cy); ctx.lineTo(cx + r, cy); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r); ctx.stroke();
-
   ctx.restore();
 
   const entArray = Object.values(entities) as any[];
 
-  // 1. Asteroids — faint background noise
-  // 1. Asteroids — faint background noise
   if (visibleTypes['asteroid']) {
     entArray
       .filter(e => e.ent_type === 'asteroid' && !e.is_dying && !e.is_cloaked)
@@ -79,7 +86,6 @@ function drawRadarFrame(
       });
   }
 
-  // 2. Planets & Moons
   entArray
     .filter(e => {
       if (e.ent_type === 'planet') return visibleTypes['planet'];
@@ -101,27 +107,18 @@ function drawRadarFrame(
       ctx.fill();
     });
 
-  // 3. Enemies & Hostiles
   entArray
     .filter(e => (e.ent_type === 'enemy' || e.ent_type === 'alien_ship' || e.ent_type === 'companion') && !e.is_dying && !e.is_cloaked)
     .forEach(e => {
       const isAlly = e.ent_type === 'companion' || e.faction === 'federation';
       if (isAlly && !visibleTypes['federation']) return;
       if (!isAlly && !visibleTypes['enemy']) return;
-
       const rx = toRX(e.x);
       const ry = toRY(e.z || 0);
       const dotR = scale > 0.005 ? 3.5 : 2.2;
       ctx.beginPath();
       ctx.arc(rx, ry, dotR, 0, Math.PI * 2);
-
-      // All pirates/aliens are now Red
-      if (isAlly) {
-        ctx.fillStyle = 'rgba(14, 165, 233, 0.9)'; // Blue for allies
-      } else {
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.85)'; // Red for all hostiles
-      }
-
+      ctx.fillStyle = isAlly ? 'rgba(14, 165, 233, 0.9)' : 'rgba(239, 68, 68, 0.85)';
       ctx.fill();
       ctx.shadowBlur = 4;
       ctx.shadowColor = ctx.fillStyle as string;
@@ -129,23 +126,44 @@ function drawRadarFrame(
       ctx.shadowBlur = 0;
     });
 
-  // 4. Space Stations
   if (visibleTypes['station']) {
     entArray
-      .filter(e => e.ent_type === 'space_station' && !e.is_cloaked)
+      .filter(e => (e.ent_type === 'space_station' || e.ent_type === 'station') && !e.is_cloaked)
+      .forEach(e => {
+        const rx = toRX(e.x);
+        const ry = toRY(e.z || 0);
+        const sz = scale > 0.005 ? 6 : 4;
+        ctx.shadowBlur = 8;
+        ctx.shadowColor = '#10b981';
+        ctx.fillStyle = '#10b981';
+        ctx.fillRect(rx - sz / 2, ry - sz / 2, sz, sz);
+        ctx.strokeStyle = '#34d399';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(rx - sz / 2, ry - sz / 2, sz, sz);
+        ctx.shadowBlur = 0;
+      });
+  }
+
+  if (visibleTypes['anomaly']) {
+    entArray
+      .filter(e => e.ent_type === 'anomaly' && !e.is_cloaked)
       .forEach(e => {
         const rx = toRX(e.x);
         const ry = toRY(e.z || 0);
         const sz = scale > 0.005 ? 5 : 3;
-        ctx.fillStyle = '#10b981';
-        ctx.fillRect(rx - sz / 2, ry - sz / 2, sz, sz);
-        ctx.strokeStyle = '#34d399';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(rx - sz / 2, ry - sz / 2, sz, sz);
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = '#d946ef';
+        ctx.beginPath();
+        ctx.arc(rx, ry, sz, 0, Math.PI * 2);
+        ctx.fillStyle = '#d946ef';
+        ctx.fill();
+        ctx.strokeStyle = '#f0abfc';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
       });
   }
 
-  // 5. Sun
   if (visibleTypes['sun']) {
     const hasSun = entArray.some(e => e.ent_type === 'sun');
     if (hasSun) {
@@ -161,7 +179,6 @@ function drawRadarFrame(
     }
   }
 
-  // 6. Player — triangle pointing in direction of travel
   if (visibleTypes['you']) {
     const playerEnt = entArray.find(e => e.ent_type === 'player');
     if (playerEnt && !playerEnt.is_cloaked) {
@@ -169,7 +186,6 @@ function drawRadarFrame(
       const ry = toRY(playerEnt.z || 0);
       const rot: number = playerEnt.rotation ?? 0;
       const tipLen = scale > 0.005 ? 12 : 8;
-
       ctx.save();
       ctx.translate(rx, ry);
       ctx.rotate(rot + Math.PI / 2);
@@ -187,487 +203,354 @@ function drawRadarFrame(
       ctx.stroke();
       ctx.restore();
     } else {
-      // Fallback dot at center when player position unknown
-      ctx.beginPath();
-      ctx.arc(cx, cy, scale > 0.005 ? 4 : 2.5, 0, Math.PI * 2);
-      ctx.fillStyle = '#fff';
-      ctx.fill();
-      ctx.strokeStyle = 'cyan';
-      ctx.lineWidth = 1;
-      ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, scale > 0.005 ? 4 : 2.5, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = 'cyan'; ctx.lineWidth = 1; ctx.stroke();
     }
   }
-  // Outer border ring
-  ctx.beginPath();
-  ctx.arc(cx, cy, r, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(0, 255, 200, 0.25)';
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.strokeStyle = 'rgba(0, 255, 200, 0.25)'; ctx.lineWidth = 1.5; ctx.stroke();
 }
 
-export function HUD({ playerHealth, score, currentLevel, entities, showDamageFlash, showSuccessFlash, isGameOver, objective, isChatVisible }: HUDProps) {
+function ControlButton({ icon, label, color, onClick }: { icon: React.ReactNode, label: string, color: string, onClick: () => void }) {
+  const colors = {
+    cyan: 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/20',
+    green: 'bg-green-500/10 border-green-500/30 text-green-400 hover:bg-green-500/20',
+    red: 'bg-red-500/10 border-red-500/30 text-red-400 hover:bg-red-500/20',
+    amber: 'bg-amber-500/10 border-amber-500/30 text-amber-400 hover:bg-amber-500/20',
+    fuchsia: 'bg-fuchsia-500/10 border-fuchsia-500/30 text-fuchsia-400 hover:bg-fuchsia-500/20',
+  }[color as 'cyan' | 'green' | 'red' | 'amber' | 'fuchsia'];
+
+  return (
+    <button onClick={onClick} className={`group flex items-center gap-2 px-3 py-1.5 border rounded-lg text-[9px] font-mono uppercase tracking-[0.2em] transition-all ${colors}`}>
+      <span className="group-hover:scale-110 transition-transform">{icon}</span>
+      {label}
+    </button>
+  );
+}
+
+export function HUD({
+  playerHealth, score, currentLevel, entities, showDamageFlash, showSuccessFlash, isGameOver, objective, isChatVisible, radarFilters, audioSettings, readyState, isRachelEnabled, setIsRachelEnabled, isMuted, setIsMuted, visualConfig, spectatorTargetId, setSpectatorTargetId, onReset, onFocusModeChange
+}: HUDProps) {
   const radarRef = useRef<HTMLCanvasElement>(null);
   const mapCanvasRef = useRef<HTMLCanvasElement>(null);
-
   const [isExpanded, setIsExpanded] = useState(false);
-  const [visibilityFilters, setVisibilityFilters] = useState<Record<string, boolean>>({
-    sun: true,
-    planet: true,
-    moon: false,
-    federation: true,
-    enemy: true,
-    station: true,
-    asteroid: false,
-    you: true
-  });
+
+  const openMap = useCallback(() => { setIsExpanded(true); onFocusModeChange?.(true); }, [onFocusModeChange]);
+  const closeMap = useCallback(() => { setIsExpanded(false); onFocusModeChange?.(false); }, [onFocusModeChange]);
+  const [visibilityFilters, setVisibilityFilters] = useState<Record<string, boolean>>({ sun: true, planet: true, moon: true, federation: true, enemy: true, station: true, anomaly: true, asteroid: true, you: true });
+  const [hasConnectedOnce, setHasConnectedOnce] = useState(false);
+
+  useEffect(() => {
+    if (readyState === 1 && !hasConnectedOnce) {
+      setHasConnectedOnce(true);
+    }
+  }, [readyState, hasConnectedOnce]);
+
+  useEffect(() => { if (radarFilters) setVisibilityFilters(prev => ({ ...prev, ...radarFilters })); }, [radarFilters]);
+
+  // Escape key to exit spectator mode
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && setSpectatorTargetId) {
+        setSpectatorTargetId(null);
+      }
+    };
+    window.addEventListener('keydown', handleEsc);
+    return () => window.removeEventListener('keydown', handleEsc);
+  }, [setSpectatorTargetId]);
+
   const [hoveredEntity, setHoveredEntity] = useState<any | null>(null);
   const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null);
-
   const healthPct = Math.max(0, playerHealth) / 100;
-  const healthColor =
-    healthPct > 0.6 ? '#22c55e' :
-      healthPct > 0.3 ? '#eab308' :
-        '#ef4444';
+  const healthColor = healthPct > 0.6 ? '#22c55e' : healthPct > 0.3 ? '#eab308' : '#ef4444';
 
-  // ── Mini-radar repaint ─────────────────────────────────────────────────────
   useEffect(() => {
-    const canvas = radarRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    drawRadarFrame(ctx, CX, CY, RADAR_R, entities, RADAR_R / WORLD_RADIUS, visibilityFilters);
+    const canvas = radarRef.current; if (!canvas) return; const ctx = canvas.getContext('2d'); if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height); drawRadarFrame(ctx, CX, CY, RADAR_R, entities, RADAR_R / WORLD_RADIUS, visibilityFilters);
   }, [entities, visibilityFilters]);
 
-  // ── Tactical map repaint ───────────────────────────────────────────────────
   useEffect(() => {
-    if (!isExpanded) return;
-    const canvas = mapCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    drawRadarFrame(ctx, MAP_CX, MAP_CY, MAP_R, entities, MAP_R / WORLD_RADIUS, visibilityFilters);
+    if (!isExpanded) return; const canvas = mapCanvasRef.current; if (!canvas) return; const ctx = canvas.getContext('2d'); if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height); drawRadarFrame(ctx, MAP_CX, MAP_CY, MAP_R, entities, MAP_R / WORLD_RADIUS, visibilityFilters);
   }, [entities, isExpanded, visibilityFilters]);
 
-  // ── Hover detection on expanded map ───────────────────────────────────────
+  // ESC closes the tactical map
+  useEffect(() => {
+    if (!isExpanded) return;
+    const handleKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeMap(); };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [isExpanded, closeMap]);
+
   const handleMapMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = mapCanvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-
-    // Convert canvas pixels → world coords
-    const scale = MAP_R / WORLD_RADIUS;
-    const wx = (mx - MAP_CX) / scale;
-    const wz = (my - MAP_CY) / scale;
-
-    // Find nearest entity within a 2000-unit world-space threshold
-    const entArray = Object.values(entities) as any[];
-    let nearest: any = null;
-    let minDist = 2000 / scale; // pixel threshold
+    const canvas = mapCanvasRef.current; if (!canvas) return;
+    const rect = canvas.getBoundingClientRect(); const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const scale = MAP_R / WORLD_RADIUS; const entArray = Object.values(entities) as any[];
+    let nearest: any = null, minDist = 2000 / scale;
     for (const ent of entArray) {
-      const px = MAP_CX + ent.x * scale;
-      const py = MAP_CY + (ent.z || 0) * scale;
+      const px = MAP_CX + ent.x * scale, py = MAP_CY + (ent.z || 0) * scale;
       const d = Math.sqrt((mx - px) ** 2 + (my - py) ** 2);
-      if (d < minDist) {
-        minDist = d;
-        nearest = ent;
-      }
+      if (d < minDist) { minDist = d; nearest = ent; }
     }
-
-    setHoveredEntity(nearest ?? null);
-    setTooltipPos(nearest ? { x: e.clientX, y: e.clientY } : null);
+    setHoveredEntity(nearest ?? null); setTooltipPos(nearest ? { x: e.clientX, y: e.clientY } : null);
   }, [entities]);
 
-  const handleMapMouseLeave = useCallback(() => {
-    setHoveredEntity(null);
-    setTooltipPos(null);
-  }, []);
+  const handleMapMouseLeave = useCallback(() => { setHoveredEntity(null); setTooltipPos(null); }, []);
 
-  // Player position for coordinate readout
+  const handleMapClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (hoveredEntity && setSpectatorTargetId) {
+      setSpectatorTargetId(hoveredEntity.id);
+      closeMap();
+    }
+  }, [hoveredEntity, setSpectatorTargetId]);
+
   const playerEnt = Object.values(entities).find((e: any) => e.ent_type === 'player') as any;
+
+  const connectionStatusText = { [0]: 'Connecting...', [1]: 'Connected to Director', [2]: 'Closing...', [3]: 'Director Offline' }[readyState as 0 | 1 | 2 | 3] || 'Director Offline';
 
   return (
     <>
-      {/* ── Damage Flash Vignette ─────────────────────────────────────── */}
-      {showDamageFlash && (
-        <div
-          className="fixed inset-0 pointer-events-none z-[180]"
-          style={{
-            background:
-              'radial-gradient(ellipse at center, transparent 45%, rgba(220, 30, 30, 0.65) 100%)',
-            animation: 'damage-flash 0.55s ease-out forwards',
-          }}
-        />
-      )}
-
-      {/* ── Success Flash Overlay ────────────────────────────────────────── */}
-      {showSuccessFlash && (
-        <div
-          className="fixed inset-0 pointer-events-none z-[180]"
-          style={{
-            background:
-              'radial-gradient(ellipse at center, transparent 30%, rgba(255, 230, 100, 0.45) 100%)',
-            animation: 'damage-flash 0.4s ease-out forwards',
-          }}
-        />
-      )}
-
-      {/* ── Game Over Overlay ────────────────────────────────────────── */}
-      {isGameOver && (
-        <div className="fixed inset-0 pointer-events-none z-[190] flex items-center justify-center">
-          <div className="text-center select-none">
-            <div
-              className="text-7xl font-black tracking-[0.25em] uppercase"
-              style={{
-                color: '#ef4444',
-                textShadow: '0 0 40px rgba(239,68,68,0.8), 0 0 80px rgba(239,68,68,0.4)',
-                animation: 'signal-lost-pulse 0.8s ease-in-out infinite alternate',
-              }}
-            >
-              SIGNAL LOST
+      {/* ── Initial Splash ────────── */}
+      {!hasConnectedOnce && (
+        <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/80 backdrop-blur-2xl transition-opacity duration-1000">
+          <div className="flex flex-col items-center space-y-6 animate-pulse">
+            <div className="relative">
+              <div className="w-24 h-24 rounded-full bg-purple-500/10 border-2 border-purple-500/40 flex items-center justify-center shadow-[0_0_60px_rgba(168,85,247,0.4)]"><Wifi className="w-12 h-12 text-purple-400" /></div>
+              <div className="absolute inset-0 rounded-full border border-purple-500/20 animate-ping" />
             </div>
-            <div className="mt-3 text-neutral-400 text-xs font-mono tracking-[0.4em] uppercase">
-              Rebooting Neural Link...
+            <div className="text-center space-y-2">
+              <div className="text-2xl font-mono text-purple-400 tracking-[0.7em] uppercase font-black">Establishing Link</div>
+              <div className="text-[10px] font-mono text-neutral-500 tracking-[0.4em] uppercase">Void Stream Synchronization in progress...</div>
             </div>
           </div>
         </div>
       )}
 
-      {/* ── Commander Override Banner ────────────────────────────────────── */}
-      {objective?.includes("COMMANDER OVERRIDE") && (
-        <div className="fixed top-32 left-1/2 -translate-x-1/2 z-[200] pointer-events-none">
-          <div
-            className="px-8 py-3 bg-[#f59e0b]/20 border border-[#f59e0b]/60 rounded text-[#f59e0b] font-mono tracking-[0.4em] font-black text-lg uppercase shadow-[0_0_40px_rgba(245,158,11,0.6)]"
-            style={{ animation: 'attack-pulse 0.8s infinite alternate' }}
-          >
-            COMMANDER OVERRIDE ACTIVE
+      {/* ── Overlay Vignettes ────────── */}
+      {showDamageFlash && <div className="fixed inset-0 pointer-events-none z-[180] bg-[radial-gradient(ellipse_at_center,transparent_45%,rgba(220,30,30,0.65)_100%)] animate-[damage-flash_0.55s_ease-out_forwards]" />}
+      {showSuccessFlash && <div className="fixed inset-0 pointer-events-none z-[180] bg-[radial-gradient(ellipse_at_center,transparent_30%,rgba(255,230,100,0.45)_100%)] animate-[damage-flash_0.4s_ease-out_forwards]" />}
+
+      {/* ── Spectator Mode Overlay ────────── */}
+      {spectatorTargetId !== null && spectatorTargetId !== undefined && (
+        <div className="fixed top-8 left-1/2 -translate-x-1/2 z-[300] flex flex-col items-center gap-2 animate-in slide-in-from-top-4 duration-500">
+          <div className="bg-purple-900/40 border-2 border-purple-500 text-purple-200 px-8 py-3 rounded-full font-mono font-black uppercase tracking-[0.4em] backdrop-blur-md shadow-[0_0_30px_rgba(168,85,247,0.5)] flex items-center gap-6">
+            SPECTATOR MODE - TIME FROZEN
+            <button onClick={() => setSpectatorTargetId && setSpectatorTargetId(null)} className="flex items-center justify-center w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 transition-colors">✕</button>
           </div>
+          <div className="text-[10px] font-mono uppercase tracking-widest text-purple-400">Press ESC to return to Live Matrix</div>
         </div>
       )}
 
-      {/* ── Health Bar — top-left (past the Director sidebar) ────────── */}
+      {/* ── HUD Elements ────────── */}
       <div
-        className="fixed top-6 z-[150] pointer-events-none"
-        style={{
-          left: isChatVisible ? '470px' : '80px',
-          transition: 'left 0.3s ease-in-out'
-        }}
+        className="fixed top-8 z-[150] pointer-events-none flex flex-col gap-10 transition-all duration-700 cubic-bezier(0.4, 0, 0.2, 1)"
+        style={{ left: isChatVisible ? '480px' : '40px' }}
       >
-        <div className="text-[8px] uppercase tracking-[0.22em] text-neutral-500 mb-1 font-mono">
-          HULL INTEGRITY
-        </div>
-        <div className="flex items-center gap-2.5">
-          <div className="relative w-44 h-2.5 bg-neutral-900/80 rounded-full overflow-hidden border border-white/10">
-            <div
-              className="h-full rounded-full"
-              style={{
-                width: `${healthPct * 100}%`,
-                backgroundColor: healthColor,
-                boxShadow: `0 0 8px ${healthColor}99`,
-                transition: 'width 0.3s ease, background-color 0.4s ease',
-              }}
-            />
-            {[25, 50, 75].map(p => (
-              <div
-                key={p}
-                className="absolute top-0 h-full w-px bg-black/40"
-                style={{ left: `${p}%` }}
-              />
-            ))}
-          </div>
-          <span
-            className="text-[10px] font-mono font-bold tabular-nums w-8"
-            style={{ color: healthColor }}
-          >
-            {Math.ceil(playerHealth)}
-          </span>
-        </div>
-
-        {healthPct <= 0.3 && !isGameOver && (
-          <div
-            className="mt-1 text-[8px] font-mono tracking-widest uppercase"
-            style={{
-              color: '#ef4444',
-              animation: 'low-health-blink 0.6s step-end infinite',
-            }}
-          >
-            ⚠ CRITICAL
-          </div>
-        )}
-
-      </div>
-
-      {/* ── Level & Kill Score — top-right ────────────────────────────────────── */}
-      <div
-        className="fixed z-[150] pointer-events-auto text-right flex flex-col items-end"
-        style={{ top: '68px', right: '24px' }}
-      >
-        <div className="flex gap-6">
-          <div className="text-right">
-            <div className="text-[10px] uppercase tracking-[0.22em] text-white/50 mb-0.5 font-bold">
-              MISSION OBJECTIVE
+        <div className="flex flex-col gap-2">
+          <div className="text-[10px] uppercase tracking-[0.4em] text-neutral-500 font-mono font-bold">Hull Integrity</div>
+          <div className="flex items-center gap-4">
+            <div className="relative w-64 h-2 bg-black/60 rounded-full overflow-hidden border border-white/10 backdrop-blur-md">
+              <div className="h-full rounded-full transition-all duration-300" style={{ width: `${healthPct * 100}%`, backgroundColor: healthColor, boxShadow: `0 0 20px ${healthColor}a0` }} />
             </div>
-            <div
-              className="text-lg font-black font-mono tracking-wider"
-              style={
-                objective?.includes("COMMANDER OVERRIDE")
-                  ? { color: '#f59e0b', textShadow: '0 0 20px rgba(245,158,11,0.8)' }
-                  : { color: '#fbbf24', textShadow: '0 0 10px rgba(251,191,36,0.3)' }
-              }
-            >
-              {objective || "Infiltrating System..."}
-            </div>
-          </div>
-          <div className="text-right border-l border-white/10 pl-6 ml-2">
-            <div className="text-[8px] uppercase tracking-[0.22em] text-neutral-500 mb-0.5 font-mono">
-              LEVEL
-            </div>
-            <div
-              className="text-3xl font-black font-mono tabular-nums"
-              style={{
-                color: '#38bdf8',
-                textShadow: '0 0 12px rgba(56,189,248,0.5)',
-              }}
-            >
-              {currentLevel}
-            </div>
-          </div>
-          <div className="text-right">
-            <div className="text-[8px] uppercase tracking-[0.22em] text-neutral-500 mb-0.5 font-mono">
-              KILLS
-            </div>
-            <div
-              className="text-3xl font-black font-mono tabular-nums"
-              style={{
-                color: '#a855f7',
-                textShadow: '0 0 12px rgba(168,85,247,0.5)',
-              }}
-            >
-              {score}
-            </div>
+            <span className="text-xs font-mono font-black tabular-nums" style={{ color: healthColor }}>{Math.ceil(playerHealth)}%</span>
           </div>
         </div>
 
-        {/* Game Controls */}
-        <div className="mt-4 flex gap-2">
-          <button
-            onClick={async () => {
-              try {
-                const r = await fetch("http://127.0.0.1:8080/save", { method: "POST" });
-                const j = await r.json();
-                console.log("[HUD] Save:", j.status);
-              } catch (e) { console.error("Save failed", e); }
-            }}
-            className="px-3 py-1 bg-cyan-500/10 border border-cyan-500/40 text-[10px] font-mono text-cyan-400 hover:bg-cyan-500/20 transition-colors uppercase tracking-widest cursor-pointer"
-            title="Save current game state to disk"
-          >
-            💾 Save
-          </button>
-          <button
-            onClick={async () => {
-              try {
-                const r = await fetch("http://127.0.0.1:8080/load", { method: "POST" });
-                const j = await r.json();
-                console.log("[HUD] Load:", j);
-              } catch (e) { console.error("Load failed", e); }
-            }}
-            className="px-3 py-1 bg-green-500/10 border border-green-500/40 text-[10px] font-mono text-green-400 hover:bg-green-500/20 transition-colors uppercase tracking-widest cursor-pointer"
-            title="Load last saved game state"
-          >
-            📂 Load
-          </button>
-          <button
-            onClick={async () => {
-              try {
-                await fetch("http://127.0.0.1:8080/api/engine/reset", { method: "POST" });
-              } catch (e) { console.error("Reset failed", e); }
-            }}
-            className="px-3 py-1 bg-red-500/10 border border-red-500/40 text-[10px] font-mono text-red-400 hover:bg-red-500/20 transition-colors uppercase tracking-widest cursor-pointer"
-            title="Full restart: reset to level 1, respawn enemies"
-          >
-            ↺ Restart
-          </button>
-          {!isGameOver && (
-            <button
-              onClick={async () => {
-                try {
-                  await fetch("http://127.0.0.1:8080/api/engine/next-level", { method: "POST" });
-                } catch (e) { console.error("Level skip failed", e); }
-              }}
-              className="px-3 py-1 bg-amber-500/10 border border-amber-500/40 text-[10px] font-mono text-amber-500 hover:bg-amber-500/20 transition-colors uppercase tracking-widest cursor-pointer"
-            >
-              ⏭ Skip
-            </button>
-          )}
+        <div className="flex flex-col gap-6">
+          <div className="flex flex-col gap-2.5 max-w-sm">
+            <div className="text-[10px] uppercase tracking-[0.4em] text-neutral-400 font-mono font-bold flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-cyan-500 animate-pulse shadow-[0_0_8px_cyan]" />Current Objective</div>
+            <div className={`text-xs font-black font-mono tracking-widest uppercase py-3 px-5 border-l-4 rounded-r-2xl transition-all shadow-xl ${objective?.includes("COMMANDER OVERRIDE") ? 'border-[#f59e0b] text-[#f59e0b] bg-[#f59e0b]/10' : 'border-[#38bdf8] text-white bg-white/5'}`}>{objective || "Synchronizing Neural Stream..."}</div>
+          </div>
+          <div className="flex gap-12">
+            <div className="flex flex-col gap-1.5"><div className="text-[9px] uppercase tracking-[0.4em] text-neutral-500 font-mono font-bold">Level</div><div className="text-xl font-black font-mono tracking-tighter text-sky-400 drop-shadow-[0_0_15px_rgba(56,189,248,0.5)]">{currentLevel}</div></div>
+            <div className="flex flex-col gap-1.5 border-l border-white/10 pl-10"><div className="text-[9px] uppercase tracking-[0.4em] text-neutral-500 font-mono font-bold">Kills</div><div className="text-xl font-black font-mono tracking-tighter text-purple-400 drop-shadow-[0_0_15px_rgba(168,85,247,0.5)]">{score}</div></div>
+          </div>
         </div>
       </div>
 
-      {/* ── Mini Tactical Radar — bottom-right (clickable to expand) ─────── */}
-      <div
-        className="fixed z-[150] flex flex-col items-center"
-        style={{ bottom: '36px', right: '32px' }}
-      >
-        <div className="text-[8px] uppercase tracking-[0.22em] text-neutral-500 mb-1 font-mono text-center select-none">
-          TACTICAL RADAR
-          {playerEnt && (
-            <div className="text-cyan-500/80 mt-0.5">
-              [{playerEnt.x.toFixed(0)}, {(playerEnt.z || 0).toFixed(0)}]
-            </div>
-          )}
-        </div>
-        <div
-          className="relative cursor-pointer group"
-          onClick={() => setIsExpanded(true)}
-          title="Open Tactical Map"
-        >
-          <canvas
-            ref={radarRef}
-            width={160}
-            height={160}
-            style={{ display: 'block' }}
-          />
-          {/* Expand hint overlay */}
-          <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none">
-            <div className="bg-black/60 text-[9px] font-mono text-cyan-400 tracking-widest uppercase px-2 py-1 rounded border border-cyan-500/30">
-              EXPAND
-            </div>
-          </div>
-        </div>
-        {/* Legend */}
-        <div className="flex items-center justify-center gap-3 mt-1.5 flex-wrap max-w-[180px]">
-          {[
-            { key: 'sun', color: 'bg-yellow-400', label: 'SUN' },
-            { key: 'planet', color: 'bg-blue-400', label: 'PLANET' },
-            { key: 'federation', color: 'bg-[#0ea5e9]', label: 'FED' },
-            { key: 'enemy', color: 'bg-red-500', label: 'ENEMY' },
-            { key: 'station', color: 'bg-[#10b981]', label: 'STATION' },
-          ].map(item => (
-            <button
-              key={item.key}
-              onClick={() => setVisibilityFilters(prev => ({ ...prev, [item.key]: !prev[item.key] }))}
-              className={`flex items-center gap-1 text-[8px] font-mono transition-opacity hover:opacity-100 ${visibilityFilters[item.key] ? 'text-neutral-400' : 'text-neutral-700 opacity-40'}`}
-            >
-              <span className={`w-1.5 h-1.5 rounded-full inline-block ${item.color}`} />
-              {item.label}
-            </button>
-          ))}
-          <button
-            onClick={() => setVisibilityFilters(prev => ({ ...prev, you: !prev.you }))}
-            className={`flex items-center gap-1 text-[8px] font-mono transition-opacity hover:opacity-100 ${visibilityFilters.you ? 'text-neutral-400' : 'text-neutral-700 opacity-40'}`}
-          >
-            <span className="w-1.5 h-1.5 bg-white inline-block" style={{ clipPath: 'polygon(50% 0%, 0% 100%, 100% 100%)' }} />
-            YOU
-          </button>
-        </div>
-      </div>
+      {/* Atmospheric Insertion Warning */}
+      {(() => {
+        const getPlanetRadius = (name: string) => {
+          switch (name) {
+            case 'Mercury': return 120;
+            case 'Venus': return 255;
+            case 'Earth': return 300;
+            case 'Mars': return 180;
+            case 'Jupiter': return 750;
+            case 'Saturn': return 630;
+            case 'Uranus': return 420;
+            case 'Neptune': return 390;
+            default: return 150;
+          }
+        };
 
-      {/* ── Full-Screen Tactical Map Overlay ─────────────────────────────── */}
-      {isExpanded && (
-        <div
-          className="fixed inset-0 z-[500] flex items-center justify-center"
-          style={{ background: 'rgba(0, 4, 10, 0.92)', backdropFilter: 'blur(6px)' }}
-          onClick={(e) => { if (e.target === e.currentTarget) setIsExpanded(false); }}
-        >
-          <div className="relative flex flex-col items-center">
-            {/* Header */}
-            <div className="flex items-center justify-between w-full mb-3 px-1">
-              <div>
-                <div className="text-[10px] font-mono uppercase tracking-[0.3em] text-cyan-500">
-                  TACTICAL OVERVIEW — SECTOR MAP
-                </div>
-                {playerEnt && (
-                  <div className="text-[9px] font-mono text-neutral-500 mt-0.5">
-                    PLAYER COORDS &nbsp;
-                    <span className="text-cyan-400">
-                      X {playerEnt.x.toFixed(0)} &nbsp; Z {(playerEnt.z || 0).toFixed(0)}
-                    </span>
-                  </div>
-                )}
+        let nearestAltitude = Infinity;
+        if (playerEnt) {
+          const px = playerEnt.x || 0;
+          const py = playerEnt.y || 0;
+          const pz = playerEnt.z || 0;
+          Object.values(entities).forEach((ent: any) => {
+            if (ent.ent_type === 'planet' || ent.ent_type === 'moon') {
+              const dx = ent.x - px;
+              const dy = (ent.y || 0) - py;
+              const dz = (ent.z || 0) - pz;
+              const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+              // Use the exact same radius calculation as EntityRenderer
+              const r = ent.ent_type === 'planet' ? getPlanetRadius(ent.name) : (ent.radius || 30);
+
+              const vScale = visualConfig?.planet_scale_overrides?.[ent.name] ?? 1.0;
+              const scale = ent.scale || 1.0;
+              const surfaceDist = dist - (r * scale * vScale);
+              if (surfaceDist < nearestAltitude) nearestAltitude = surfaceDist;
+            }
+          });
+        }
+        if (nearestAltitude > 0 && nearestAltitude < 150) {
+          return (
+            <div className="fixed top-24 left-1/2 -translate-x-1/2 z-[200] animate-[attack-pulse_1s_infinite_alternate] pointer-events-none drop-shadow-[0_0_20px_rgba(239,68,68,0.8)]">
+              <div className="bg-red-500/20 border border-red-500 text-red-400 px-6 py-2 rounded-full font-mono font-black uppercase tracking-[0.3em] text-[12px] backdrop-blur-md">
+                LOW ORBIT - ATMOSPHERIC INSERTION AVAILABLE
               </div>
+            </div>
+          );
+        }
+        return null;
+      })()}
+
+      {/* ── Top-Right Block ────────── */}
+      <div className="fixed top-8 right-8 z-[150] flex flex-col items-end gap-4">
+        <div className="flex items-center gap-2 p-1.5 bg-black/50 backdrop-blur-2xl border border-white/5 rounded-2xl shadow-[0_0_50px_rgba(0,0,0,0.6)]">
+          <ControlButton icon={<Save className="w-4 h-4" />} label="Save" color="cyan" onClick={async () => { try { await fetch("http://127.0.0.1:8080/save", { method: "POST" }); } catch (e) { } }} />
+          <ControlButton icon={<FolderOpen className="w-4 h-4" />} label="Load" color="green" onClick={async () => { try { await fetch("http://127.0.0.1:8080/load", { method: "POST" }); } catch (e) { } }} />
+          <ControlButton icon={<RotateCcw className="w-4 h-4" />} label="Reset" color="red" onClick={onReset ?? (async () => { try { await fetch("http://127.0.0.1:8080/api/engine/reset", { method: "POST" }); } catch (e) { } })} />
+          {!isGameOver && <ControlButton icon={<FastForward className="w-4 h-4" />} label="Skip" color="amber" onClick={async () => { try { await fetch("http://127.0.0.1:8080/api/engine/next-level", { method: "POST" }); } catch (e) { } }} />}
+          {playerEnt && (
+            <ControlButton icon={<Target className="w-4 h-4" />} label="Spawn BH" color="fuchsia" onClick={async () => {
+              try {
+                await fetch("http://127.0.0.1:8080/spawn", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify([{
+                    ent_type: "anomaly",
+                    anomaly_type: "black_hole",
+                    x: playerEnt.x + 300,
+                    y: playerEnt.y,
+                    z: (playerEnt.z || 0) + 300,
+                    radius: 200.0,   // reduced from 400 — EH grows as BH consumes, not instant
+                    mass: 8000.0,    // reduced from 50000 — old EH (75k) > MAX_WORLD_RADIUS (64k)
+                    physics: "static"
+                  }])
+                });
+              } catch (e) { console.error(e); }
+            }} />
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          <div className={`flex items-center gap-2.5 px-4 py-2.5 bg-black/40 backdrop-blur-2xl border border-white/10 rounded-xl transition-all duration-1000 ${hasConnectedOnce ? 'opacity-100 translate-x-0' : 'opacity-0 translate-x-12'}`}>
+            <div className={`w-2 h-2 rounded-full ${readyState === 1 ? 'bg-green-400 shadow-[0_0_12px_#4ade80]' : 'bg-red-500 animate-pulse shadow-[0_0_12px_red]'}`} />
+            <span className="text-[10px] font-mono text-neutral-300 uppercase tracking-widest font-black leading-none">{connectionStatusText}</span>
+          </div>
+          <button onClick={() => setIsRachelEnabled(!isRachelEnabled)} className={`px-5 py-2.5 border rounded-xl text-[10px] font-mono font-black uppercase tracking-widest transition-all ${isRachelEnabled ? 'bg-purple-500/10 border-purple-500/40 text-purple-400 shadow-[0_0_25px_rgba(168,85,247,0.2)] hover:bg-purple-500/20' : 'bg-neutral-900/90 border-white/5 text-neutral-600 grayscale hover:grayscale-0'}`}>Rachel: {isRachelEnabled ? 'Up' : 'Muted'}</button>
+          <button onClick={() => setIsMuted(!(audioSettings?.ai_muted ?? isMuted))} className="w-11 h-11 flex items-center justify-center bg-black/50 backdrop-blur-2xl border border-white/10 rounded-xl text-neutral-400 hover:text-white hover:bg-white/5 transition-all group">{(audioSettings?.ai_muted ?? isMuted) ? <VolumeX className="w-5 h-5 text-red-500/80 group-hover:scale-110" /> : <Volume2 className="w-5 h-5 text-cyan-400/80 group-hover:scale-110" />}</button>
+        </div>
+      </div>
+
+      {/* ── Radar Block ────────── */}
+      <div className="fixed z-[150] flex flex-col items-center gap-4" style={{ bottom: '40px', right: '40px' }}>
+        <div className="flex flex-col items-center gap-1 font-mono select-none">
+          <div className="text-[11px] uppercase tracking-[0.5em] text-neutral-500 font-black">Tactical Sphere</div>
+          {playerEnt && <div className="text-cyan-500/50 text-[9px] tracking-[0.2em] font-bold">POS: {playerEnt.x.toFixed(0)}, {(playerEnt.z || 0).toFixed(0)}</div>}
+        </div>
+        <div className="relative cursor-pointer group rounded-full border border-cyan-500/20 p-2 transition-all hover:border-cyan-500/50 hover:shadow-[0_0_40px_rgba(0,255,200,0.2)]" onClick={openMap}>
+          <canvas ref={radarRef} width={160} height={160} className="rounded-full bg-black/70 backdrop-blur-sm" />
+          <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-300"><div className="bg-black/90 text-[10px] font-mono text-cyan-400 tracking-[0.4em] uppercase px-5 py-2.5 rounded-full border border-cyan-500/40 backdrop-blur-md shadow-2xl">Focus</div></div>
+        </div>
+        <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2 mt-1 max-w-[280px]">
+          {[
+            { key: 'sun', color: 'bg-yellow-400', label: 'Sun' },
+            { key: 'planet', color: 'bg-blue-400', label: 'Planets' },
+            { key: 'moon', color: 'bg-neutral-400', label: 'Moons' },
+            { key: 'enemy', color: 'bg-red-500', label: 'Hostiles' },
+            { key: 'station', color: 'bg-emerald-500', label: 'Stations' },
+            { key: 'anomaly', color: 'bg-fuchsia-500', label: 'Anomalies' },
+            { key: 'asteroid', color: 'bg-neutral-600', label: 'Asteroids' }
+          ].map(item => (
+            <div key={item.key} className="flex items-center gap-2">
               <button
-                onClick={() => setIsExpanded(false)}
-                className="ml-8 w-8 h-8 rounded-lg bg-neutral-800/80 border border-white/10 flex items-center justify-center text-neutral-400 hover:text-white hover:bg-neutral-700 transition-colors text-lg font-bold leading-none"
-                title="Close Tactical Map"
+                onClick={() => setVisibilityFilters(prev => ({ ...prev, [item.key]: !prev[item.key] }))}
+                className={`flex items-center gap-2 text-[9px] font-mono uppercase tracking-widest transition-opacity hover:opacity-100 ${visibilityFilters[item.key] ? 'text-neutral-400' : 'text-neutral-800 opacity-40'}`}
               >
-                ×
+                <div className={`w-2 h-2 rounded-full ${item.color} shadow-[0_0_8px_currentColor]`} />
+                {item.label}
               </button>
+              {visibilityFilters[item.key] && setSpectatorTargetId && (
+                <button
+                  onClick={() => {
+                    const ents = Object.values(entities);
+                    let target = ents.find((e: any) => e.name === 'Gateway Core' && e.ent_type === item.key);
+                    if (!target) {
+                      const player = ents.find((e: any) => e.ent_type === 'player') as any;
+                      const candidates = ents.filter((e: any) => e.ent_type === item.key);
+                      if (player && candidates.length > 0) {
+                        candidates.sort((a, b) => {
+                          const da = Math.pow(a.x - player.x, 2) + Math.pow((a.z || 0) - player.z, 2);
+                          const db = Math.pow(b.x - player.x, 2) + Math.pow((b.z || 0) - player.z, 2);
+                          return da - db;
+                        });
+                        target = candidates[0];
+                      } else if (candidates.length > 0) {
+                        target = candidates[0];
+                      }
+                    }
+                    if (target) setSpectatorTargetId(target.id);
+                  }}
+                  className="w-4 h-4 rounded-full border border-white/10 flex items-center justify-center text-[7px] text-neutral-500 hover:text-cyan-400 hover:border-cyan-500/50 transition-all bg-white/5"
+                  title={`Focus on ${item.label}`}
+                >
+                  <Target className="w-2 h-2" />
+                </button>
+              )}
             </div>
+          ))}
+        </div>
+      </div>
 
-            {/* Map canvas */}
-            <div
-              className="relative"
-              style={{
-                borderRadius: '50%',
-                boxShadow: '0 0 60px rgba(0,255,200,0.12), 0 0 120px rgba(0,0,0,0.8)',
-                overflow: 'hidden',
-              }}
-            >
-              <canvas
-                ref={mapCanvasRef}
-                width={MAP_CANVAS}
-                height={MAP_CANVAS}
-                style={{ display: 'block', cursor: 'crosshair' }}
-                onMouseMove={handleMapMouseMove}
-                onMouseLeave={handleMapMouseLeave}
-              />
+      {/* ── Expanded Map Overlay ────────── */}
+      {isExpanded && (
+        <div className="fixed inset-0 z-[500] flex items-center justify-center bg-black/95 backdrop-blur-3xl animate-in fade-in duration-500" onClick={(e) => e.target === e.currentTarget && closeMap()}>
+          <div className="relative flex flex-col items-center gap-8 animate-in zoom-in-95 duration-500">
+            <div className="flex items-center justify-between w-full px-6">
+              <div className="flex flex-col gap-1.5"><div className="text-2xl font-mono uppercase tracking-[0.5em] text-cyan-500 font-black">Tactical Sector Map</div>{playerEnt && <div className="text-[11px] font-mono text-neutral-500 uppercase tracking-widest font-bold">Unit Registry &nbsp;<span className="text-cyan-400 ml-4">X {playerEnt.x.toFixed(0)} &nbsp; Z {(playerEnt.z || 0).toFixed(0)}</span></div>}</div>
+              <button onClick={closeMap} className="w-14 h-14 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center text-white hover:bg-neutral-800 hover:border-red-500/50 transition-all text-3xl font-light">×</button>
             </div>
-
-            {/* Footer legend */}
-            <div className="flex items-center justify-center gap-5 mt-3">
+            <div className="relative rounded-full border border-white/5 p-6 shadow-[0_0_150px_rgba(34,211,238,0.15)]"><canvas ref={mapCanvasRef} width={MAP_CANVAS} height={MAP_CANVAS} className="cursor-crosshair rounded-full" onMouseMove={handleMapMouseMove} onMouseLeave={handleMapMouseLeave} onClick={handleMapClick} /></div>
+            <div className="flex flex-wrap items-center justify-center gap-8 p-6 bg-white/5 rounded-3xl backdrop-blur-2xl border border-white/5 shadow-2xl">
               {[
                 { key: 'sun', color: '#fde68a', label: 'SUN' },
-                { key: 'planet', color: '#60a5fa', label: 'PLANET' },
-                { key: 'moon', color: '#a8a8a8', label: 'MOON' },
+                { key: 'planet', color: '#60a5fa', label: 'PLANETS' },
+                { key: 'moon', color: '#a8a8a8', label: 'MOONS' },
                 { key: 'federation', color: '#0ea5e9', label: 'FEDERATION' },
-                { key: 'enemy', color: '#ef4444', label: 'ENEMY' },
-                { key: 'station', color: '#10b981', label: 'STATION' },
-                { key: 'asteroid', color: '#444', label: 'ASTEROID' },
-                { key: 'you', color: '#ffffff', label: 'YOU' },
+                { key: 'enemy', color: '#ef4444', label: 'HOSTILES' },
+                { key: 'station', color: '#10b981', label: 'STATIONS' },
+                { key: 'anomaly', color: '#d946ef', label: 'ANOMALIES' },
+                { key: 'asteroid', color: '#444444', label: 'ASTEROIDS' },
+                { key: 'you', color: '#ffffff', label: 'YOU' }
               ].map(({ key, color, label }) => (
-                <button
-                  key={key}
-                  onClick={() => setVisibilityFilters(prev => ({ ...prev, [key]: !prev[key] }))}
-                  className={`flex items-center gap-1.5 text-[9px] font-mono transition-opacity hover:opacity-100 ${visibilityFilters[key] ? 'text-neutral-300' : 'text-neutral-600 opacity-40'}`}
-                >
-                  <span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: color }} />
-                  {label}
+                <button key={key} onClick={() => setVisibilityFilters(prev => ({ ...prev, [key]: !prev[key] }))} className={`flex items-center gap-2.5 text-[10px] font-mono tracking-widest transition-opacity ${visibilityFilters[key] ? 'text-neutral-200' : 'text-neutral-600 opacity-40'}`}>
+                  <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: color, boxShadow: `0 0 15px ${color}` }} />{label}
                 </button>
               ))}
             </div>
           </div>
-
-          {/* Hover tooltip */}
           {hoveredEntity && tooltipPos && (
-            <div
-              className="fixed z-[510] pointer-events-none"
-              style={{ left: tooltipPos.x + 14, top: tooltipPos.y - 10 }}
-            >
-              <div className="bg-black/90 border border-cyan-500/40 rounded-lg px-3 py-2 text-[10px] font-mono shadow-2xl min-w-[140px]">
-                <div className="text-cyan-400 font-bold uppercase tracking-widest mb-1">
-                  {hoveredEntity.name || hoveredEntity.ent_type}
-                </div>
-                <div className="text-neutral-400 space-y-0.5">
-                  <div>TYPE &nbsp;<span className="text-neutral-200">{hoveredEntity.ent_type}</span></div>
-                  {hoveredEntity.faction && (
-                    <div>FACTION &nbsp;<span className="text-neutral-200">{hoveredEntity.faction}</span></div>
-                  )}
-                  <div>
-                    X <span className="text-neutral-200">{hoveredEntity.x.toFixed(0)}</span>
-                    &nbsp; Z <span className="text-neutral-200">{(hoveredEntity.z || 0).toFixed(0)}</span>
-                  </div>
+            <div className="fixed z-[510] pointer-events-none" style={{ left: tooltipPos.x + 30, top: tooltipPos.y - 50 }}>
+              <div className="bg-black/95 border border-cyan-500/40 rounded-2xl px-6 py-4 text-[12px] font-mono shadow-[0_0_50px_rgba(0,0,0,0.8)] backdrop-blur-3xl min-w-[240px] animate-in slide-in-from-left-2 duration-200">
+                <div className="text-cyan-400 font-black uppercase tracking-[0.3em] mb-3 border-b border-white/10 pb-3">{hoveredEntity.name || hoveredEntity.ent_type}</div>
+                <div className="space-y-2 text-neutral-400 uppercase tracking-widest text-[10px]">
+                  <div className="flex justify-between"><span>Registry</span> <span className="text-neutral-100">{hoveredEntity.ent_type}</span></div>
+                  {hoveredEntity.faction && <div className="flex justify-between"><span>Affiliation</span> <span className="text-neutral-100">{hoveredEntity.faction}</span></div>}
+                  <div className="flex justify-between"><span>Matrix</span> <span className="text-neutral-100">{hoveredEntity.x.toFixed(0)}, {(hoveredEntity.z || 0).toFixed(0)}</span></div>
                   {playerEnt && (
-                    <div>
-                      DIST &nbsp;
-                      <span className="text-yellow-400">
-                        {Math.sqrt(
-                          (hoveredEntity.x - playerEnt.x) ** 2 +
-                          ((hoveredEntity.z || 0) - (playerEnt.z || 0)) ** 2
-                        ).toFixed(0)} u
-                      </span>
-                    </div>
+                    <div className="flex justify-between pt-3 border-t border-white/5 text-cyan-400 font-black"><span>Proximity</span><span>{(Math.sqrt((hoveredEntity.x - playerEnt.x) ** 2 + ((hoveredEntity.z || 0) - (playerEnt.z || 0)) ** 2)).toFixed(0)} U</span></div>
                   )}
                 </div>
               </div>

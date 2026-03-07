@@ -12,3 +12,9 @@ httpx>=0.27.0
 faiss-cpu
 sentence-transformers
 langchain-google-genai
+langchain-anthropic
+tiktoken
+langchain-openai
+huggingface_hub
+Pillow
+psutil

@@ -1,5 +1,4 @@
-import React, { useRef, useMemo } from 'react';
-import { useFrame } from '@react-three/fiber';
+import React, { useRef } from 'react';
 import * as THREE from 'three';
 
 interface SpaceGridProps {
@@ -18,12 +17,6 @@ export const SpaceGrid: React.FC<SpaceGridProps> = ({ color = '#8b5cf6' }) => {
             <gridHelper
                 args={[size, divisions, color, color]}
                 position={[0, -5, 0]}
-                onBeforeCompile={(shader) => {
-                    shader.fragmentShader = shader.fragmentShader.replace(
-                        'gl_FragColor = vec4( color, opacity );',
-                        'gl_FragColor = vec4( color, opacity * 0.5 );'
-                    );
-                }}
             />
             {/* Glow Plane */}
             <mesh position={[0, -5.1, 0]}>

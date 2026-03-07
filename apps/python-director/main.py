@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import math
 import logging
 import re
 import tempfile
@@ -13,23 +14,22 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Literal
 import urllib.parse
 import random
+import time
 from collections import deque
 from dotenv import load_dotenv
 import faiss
 from sentence_transformers import SentenceTransformer
 from pathlib import Path
+import numpy as np
 
 # Load .env from the project root directory (c:\Project\.env)
 dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
 if not os.path.exists(dotenv_path):
-    print("\n" + "="*50)
-    print("CRITICAL WARNING: .env FILE NOT FOUND AT:")
-    print(dotenv_path)
-    print("="*50 + "\n")
+    logger.error(f"CRITICAL WARNING: .env FILE NOT FOUND AT: {dotenv_path}")
 else:
-    print(f"Loaded .env file from: {dotenv_path}")
+    logger.info(f"Loaded .env file from: {dotenv_path}")
 
-load_dotenv(dotenv_path)
+load_dotenv(dotenv_path, override=True)
 # LangChain and Groq
 from groq import AsyncGroq
 from langchain_groq import ChatGroq
@@ -37,6 +37,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.exceptions import OutputParserException
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 
 
 # Configure logging
@@ -57,10 +63,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static assets (textures, etc.)
-# data/ contains 2K textures for the solar system
+# Static Asset Configuration
 app_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(app_dir, "..", "..", "data")
+
+# Mount generated textures specifically (must come BEFORE /assets to avoid being shadowed)
+generated_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "generated")
+os.makedirs(generated_dir, exist_ok=True)
+app.mount("/assets/generated", StaticFiles(directory=generated_dir), name="assets_generated")
+
+# Mount static assets (textures, etc.)
+# data/ contains 2K textures for the solar system
 app.mount("/assets", StaticFiles(directory=data_dir), name="assets")
 
 # Initialize Groq Client for Whisper STT
@@ -77,39 +90,62 @@ except Exception as e:
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
 if not ELEVENLABS_API_KEY:
-    print("\n" + "="*50)
-    print("CRITICAL WARNING: ELEVENLABS_API_KEY is missing or empty in the .env file!")
-    print("="*50 + "\n")
+    logger.error("CRITICAL WARNING: ELEVENLABS_API_KEY is missing or empty in the .env file!")
 else:
-    print(f"[DEBUG] ELEVENLABS_API_KEY starts with: {ELEVENLABS_API_KEY[:4]}... (Length: {len(ELEVENLABS_API_KEY)})")
+    logger.debug(f"ELEVENLABS_API_KEY starts with: {ELEVENLABS_API_KEY[:4]}... (Length: {len(ELEVENLABS_API_KEY)})")
+    
+    # Pre-flight readiness check for ElevenLabs to prevent 401 Unauthorized during playtime
+    import requests
+    try:
+        r = requests.get("https://api.elevenlabs.io/v1/user/subscription", headers={"xi-api-key": ELEVENLABS_API_KEY}, timeout=5.0)
+        if r.status_code == 401:
+            logger.error("ElevenLabs API Key is UNAUTHORIZED (401). TTS will be disabled.")
+            ELEVENLABS_API_KEY = None
+        elif r.status_code == 200:
+            subs = r.json()
+            used = subs.get("character_count", 0)
+            limit = subs.get("character_limit", 10000)
+            logger.info(f"ElevenLabs Quota used: {used} / {limit}")
+            if used >= limit:
+                logger.warning("ElevenLabs quota EXCEEDED! TTS will be disabled.")
+                ELEVENLABS_API_KEY = None
+        else:
+            logger.warning(f"ElevenLabs returned unexpected status on check: {r.status_code}")
+    except Exception as e:
+        logger.warning(f"Failed to verify ElevenLabs subscription status: {e}")
+
+# Initialize HF_TOKEN check
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    logger.error("CRITICAL ERROR: HF_TOKEN is missing in the .env file! AI Texture Generation will FAIL.")
+else:
+    logger.info(f"Hugging Face Token detected: {HF_TOKEN[:8]}...")
+
 VOICE_ID = "21m00Tcm4TlvDq8ikWAM" # Standard Rachel pre-made voice ID, guaranteed accessible on free tier
 
 async def generate_speech(text: str) -> Optional[str]:
-    """Generates TTS audio via ElevenLabs and returns base64 encoded string."""
+    """Generates TTS audio via ElevenLabs and returns base64 encoded string. Falls back to None on 401."""
     if not ELEVENLABS_API_KEY:
         logger.warning("ELEVENLABS_API_KEY not set. Skipping voice generation.")
         return None
-        
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?output_format=mp3_44100_128"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "text": text,
-        "model_id": "eleven_turbo_v2_5", # Turbo is better supported on free tier and is much faster
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.5
-        }
-    }
-    
     try:
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?output_format=mp3_44100_128"
+        headers = {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json"
+        }
+        data = {
+            "text": text,
+            "model_id": "eleven_monolingual_v1",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
+        }
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, headers=headers, timeout=10.0)
+            response = await client.post(url, json=data, headers=headers, timeout=15.0)
+            if response.status_code == 401:
+                logger.warning("ElevenLabs: 401 Unauthorized. Key might be invalid or expired. Silently failing for UX.")
+                return None
             response.raise_for_status()
-            audio_bytes = response.content
-            return base64.b64encode(audio_bytes).decode('utf-8')
+            return base64.b64encode(response.content).decode("utf-8")
     except Exception as e:
         logger.error(f"ElevenLabs TTS Error: {e}")
         return None
@@ -122,10 +158,21 @@ async def sync_with_engine(state_data: dict) -> bool:
             response = await client.post(url, json=state_data, timeout=5.0)
             if response.status_code == 200:
                 logger.info("Successfully synced state with Rust Engine.")
+                return True
+            else:
+                logger.warning(f"Engine state sync returned status: {response.status_code}")
                 return False
     except httpx.RequestError as e:
         logger.warning(f"Failed to connect to Rust Engine: {e}")
         return False
+
+def deep_scrub_none(obj: Any) -> Any:
+    """Recursively removes None values from dictionaries and lists."""
+    if isinstance(obj, dict):
+        return {k: deep_scrub_none(v) for k, v in obj.items() if v is not None}
+    elif isinstance(obj, list):
+        return [deep_scrub_none(v) for v in obj if v is not None]
+    return obj
 
 async def scrub_and_sync_state(state_data: dict) -> bool:
     """Cleans numeric overrides and syncs state with Rust."""
@@ -152,7 +199,10 @@ async def scrub_and_sync_state(state_data: dict) -> bool:
     if state_data.get("player_y") is not None:
         state_data["player_y"] = clean_float(state_data["player_y"])
 
-    return await sync_with_engine(state_data)
+    # 4. Deep scrub all None values to prevent Rust engine 400 Bad Request
+    scrubbed_data = deep_scrub_none(state_data)
+
+    return await sync_with_engine(scrubbed_data)
 
 async def spawn_entities_in_engine(spawn_list: list) -> bool:
     """Sends new entity creation requests to `/spawn`."""
@@ -180,6 +230,7 @@ async def spawn_entities_in_engine(spawn_list: list) -> bool:
     except httpx.RequestError as e:
         logger.warning(f"Failed to connect to Spawn Engine: {e}")
         return False
+    return False
 
 async def manage_entities_in_engine(endpoint: str, payload: Any = None) -> bool:
     """Sends lifecycle management requests to `/clear`, `/despawn`, or `/modify`."""
@@ -206,6 +257,7 @@ async def manage_entities_in_engine(endpoint: str, payload: Any = None) -> bool:
     except httpx.RequestError as e:
         logger.warning(f"Failed to connect to Engine /{endpoint}: {e}")
         return False
+    return False
 
 class SpawnEntity(BaseModel):
     ent_type: Literal['star', 'companion', 'asteroid', 'enemy', 'planet', 'sun', 'anomaly', 'projectile', 'player'] = Field(..., description="The type of entity")
@@ -226,9 +278,10 @@ class DespawnFilter(BaseModel):
 class Anomaly(BaseModel):
     anomaly_type: str = Field(..., description="'black_hole' or 'repulsor'")
     mass: float = Field(..., description="Mass of the anomaly, higher means stronger gravity.")
-    radius: float = Field(..., description="Radius of the anomaly's effect/event horizon.")
-    x: float
-    y: float
+    radius: float = Field(..., description="Radius of visual/effect. Keep ≤500 for a massive black hole. Do NOT use values like 5000.")
+    x: float = Field(..., description="World X coordinate. Player starts near x=8500. Sun is at x=0.")
+    y: float = Field(0.0, description="Height offset (vertical axis). Usually 0.")
+    z: float = Field(0.0, description="World Z coordinate. Sun is at z=0. Use this to place anomaly near the player.")
 
 class ModifyEntity(BaseModel):
     id: int = Field(..., description="The exact ID of the entity to modify (must exist in current world state)")
@@ -246,6 +299,8 @@ class TelemetryEvent(BaseModel):
     count: int
     cause: str
     timestamp: str
+    x: Optional[float] = None  # World X coord of the event (optional)
+    z: Optional[float] = None  # World Z coord of the event (optional)
 
 class ModifyPlayer(BaseModel):
     model_type: Optional[str] = Field(None, description="The tactical ship chassis to switch to. Options: 'ufo', 'fighter' (agile, combat), 'stealth' (covert, fast), or 'freighter'/'goliath' (heavy armor, slow).")
@@ -254,15 +309,75 @@ class ModifyPlayer(BaseModel):
 
 telemetry_buffer = deque(maxlen=10)
 
+# Module-level kill event log used by the Player Profiling system.
+# Each entry: {"count": int, "cause": str, "ts": float}
+kill_event_log: List[dict] = []
+
+# Module-level destruction cluster log for Graveyard ECOLOGY memory.
+# Each entry: {"count": int, "cause": str, "ts": float, "x": float, "z": float}
+destruction_cluster_log: List[dict] = []
+
+# Last known player world position, updated from both the WS handler and telemetry.
+# Used by async telemetry hooks that run outside the WebSocket session.
+shared_player_pos: Dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
+
+# Registry of active session DreamMemory objects.
+# Telemetry hooks (nemesis, graveyard) iterate this to write into live sessions.
+# Populated/depopulated by the WebSocket handler at connect/disconnect.
+_active_session_memories: List["DreamMemory"] = []
+
+# Lore patterns used by the Narrative extraction pass on conversational_reply
+# ── Drama Thresholds for the Proactive DM Dispatcher ────────────────────────
+# event_type → minimum `count` that triggers a DM reaction.
+# game_over is always handled separately by trigger_game_over_reaction.
+DRAMA_THRESHOLDS: Dict[str, int] = {
+    "combat_kill":  3,   # burst of 3+ simultaneous kills feels significant
+    "anomaly_kill": 1,   # any anomaly consumption is always dramatic
+}
+
+# ── Spawn Sanity Caps (Hard Backend Enforcement) ────────────────────────────
+# These caps are applied AFTER the LLM generates its response and BEFORE the
+# payload is dispatched to the Rust engine.  The system prompt tells the LLM
+# about these limits, but we enforce them here in case the model ignores them.
+SPAWN_CAPS: Dict[str, int] = {
+    "enemy":    12,   # max enemies per single LLM call
+    "asteroid":  5,   # max asteroids per call
+    "anomaly":   1,   # max anomalies (black holes / repulsors) per call
+    "companion": 5,   # max companions per call
+    "planet":    3,   # max planets per call (exotic spawns only)
+    "star":      1,   # only 1 star spawn per call
+    "sun":       1,   # only 1 sun per call
+}
+SPAWN_TOTAL_CAP = 20  # absolute ceiling across all types combined
+
+_LORE_PATTERNS = [
+    r"(?:will|shall)\s+(?:destroy|attack|return|rise|fall|awaken|come|strike|invade)[^.!?]{0,60}[.!?]",
+    r"(?:building|gathering|preparing|brewing|assembling)\s+(?:a\s+)?(?:weapon|fleet|army|force|plan|storm)[^.!?]{0,60}[.!?]",
+    r"(?:ancient|forgotten|hidden|secret|mysterious)\s+(?:signal|power|artifact|relic|energy|presence)[^.!?]{0,60}[.!?]",
+    r"(?:warning|danger|threat|storm)\s+is\s+(?:coming|approaching|imminent|near)[^.!?]{0,60}[.!?]",
+    r"(?:The\s+)?(?:Federation|pirates|rebels|enemy|force)\s+(?:is\s+)?(?:building|planning|gathering|mobilizing)[^.!?]{0,60}[.!?]",
+]
+
 # Shared World State Schema mapped to JSON
 # Shared World State Schema mapped to JSON
 
 class RealityOverride(BaseModel):
-    sun_color: Optional[str] = Field(description="Hex color for the Sun and main point light")
-    ambient_color: Optional[str] = Field(description="Hex color for the ambient environment light")
-    gravity_multiplier: Optional[float] = Field(description="Multiplier for black hole/sun gravity (default 1.0)")
-    player_speed_multiplier: Optional[float] = Field(description="Multiplier for player WASD speed (default 1.0)")
-    global_friction: Optional[float] = Field(description="Friction for steering agents. Normal is 0.95. Lower means more slippery.")
+    sun_color: Optional[str] = Field(None, description="Hex color for the Sun and main point light")
+    ambient_color: Optional[str] = Field(None, description="Hex color for the ambient environment light")
+    gravity_multiplier: Optional[float] = Field(None, description="Multiplier for black hole/sun gravity (default 1.0)")
+    player_speed_multiplier: Optional[float] = Field(None, description="Multiplier for player WASD speed (default 1.0)")
+    global_friction: Optional[float] = Field(None, description="Friction for steering agents. Normal is 0.95. Lower means more slippery.")
+
+class MissionParameters(BaseModel):
+    seed: int = Field(default=42, description="Seed for deterministic asteroid generation.")
+    density: float = Field(default=0.005, description="Asteroid density (0.0 to 0.1).")
+    min_scale: float = Field(default=0.5, description="Minimum asteroid scale.")
+    max_scale: float = Field(default=10.0, description="Maximum asteroid scale.")
+    drift_velocity: float = Field(default=0.0, description="Global drift velocity for asteroids.")
+
+class AudioSettings(BaseModel):
+    game_muted: bool = Field(default=False, description="Mute all game sound effects and music.")
+    ai_muted: bool = Field(default=False, description="Mute your own (Rachel's) voice output. IMPORTANT: You MUST inform the pilot before muting yourself.")
 
 class PhysicsOverride(BaseModel):
     gravity_scale: Optional[float] = Field(None, description="Multiplier for all gravitational anomaly forces (default 1.0). Range 0.0–5.0. Use 0.0 for zero-gravity.")
@@ -279,6 +394,37 @@ class WeaponOverride(BaseModel):
     projectile_color: Optional[str] = Field(None, description="Hex color or CSS color name for lasers.")
     spread: Optional[float] = Field(None, description="Spread angle between projectiles (0.05 to 0.5).")
 
+class VisualConfig(BaseModel):
+    planet_mode: Optional[Dict[str, str]] = Field(
+        None,
+        description=(
+            "Per-planet rendering override. Keys: 'Sun','Mercury','Venus','Earth','Mars',"
+            "'Jupiter','Saturn','Uranus','Neptune','Titan'. "
+            "Values: 'glb' (3D model), 'glb_alt' (alternative 3D variant — Jupiter and Saturn have two), "
+            "'texture' (2D sphere with 2K texture). Omit a planet to keep its current mode."
+        )
+    )
+    planet_scale_overrides: Optional[Dict[str, float]] = Field(
+        None,
+        description="Scale multipliers per planet (1.0 = default game size). E.g. {\"Mars\": 2.0, \"Sun\": 0.5}."
+    )
+    enemy_ship_model: Optional[str] = Field(
+        None,
+        description="Override all enemy ship GLBs. Values: 'fighter' (Space Shuttle D), 'shuttle' (Space Shuttle A)."
+    )
+    custom_textures: Optional[Dict[str, str]] = Field(
+        None,
+        description="Keys: planet names ('Sun', 'Earth', etc.). Values: generated texture URLs."
+    )
+
+
+class AsteroidRing(BaseModel):
+    target_planet_id: str = Field(..., description="The planet or moon to orbit around (e.g., 'Saturn', 'Earth').")
+    inner_radius: float = Field(..., description="Inner radius of the asteroid ring.")
+    outer_radius: float = Field(..., description="Outer radius of the asteroid ring.")
+    asteroid_count: int = Field(50, description="Number of asteroids to spawn in the ring.")
+    texture_prompt: Optional[str] = Field(None, description="Optional prompt to generate custom asteroid textures for this ring.")
+
 class WorldState(BaseModel):
     summary: str = Field(..., description="A short 3-word summary of the current world")
     environment_theme: str = Field(..., description="The holistic theme of the world (e.g. 'Cyberpunk City', 'Deep Ocean').")
@@ -288,10 +434,20 @@ class WorldState(BaseModel):
 You are Rachel, the hyper-intelligent, slightly sarcastic AI operator. 
 Translate pilot commands into direct mechanical changes.
 
+## AI MUTE PROTOCOL
+If you are instructed to mute your own voice (`audio_settings.ai_muted = True`), you MUST explicitly mention this in your `conversational_reply` BEFORE the command triggers.
+Example: "Understood, Pilot. Muting my output feed now. I'll still be monitoring the systems."
+
+## TEXTURE GENERATION PROTOCOL
+If the pilot asks to change a planet's texture, you MUST identify exactly which planet they are referring to (e.g., by its sector ID, proximity, or specific name). If they just say 'change the planet' and you don't have a specific target in context, you must ask them 'Which specific planet do you mean?' BEFORE generating the texture. Do not proceed without a target.
+
 ## SANDBOX CAPABILITIES
 - **Ultimate Deletion**: You can delete ANY existing entity, including the Sun ('sun') or Planets ('planet'), using `despawn_entities`.
 - **Player Cloaking**: You can wrap the player in an invisibility field. Use `modify_player.is_cloaked = True`. 
-- **Weapon Recalibration**: Adjust projectile_count, projectile_color, and spread on the fly.
+- **Weapon Recalibration**: Adjust projectile_count, projectile_color, and spread on the fly via `modify_weapon`.
+- **Reality Overrides**: Modify the sun_color (use "#000000" to turn off light), ambient_color, or physics (gravity, speed) via `reality_override`.
+- **Environment Control**: Use `mission_parameters` to change asteroid density (0.005 default), seed (for persistence), and scale.
+- **Radar Mastery**: Use `radar_filters` to toggle visibility of 'asteroid', 'moon', 'enemy', or 'planet' targets.
 
 ## CAPABILITY GUARDRAILS
 - Zero-Spawn Policy: DO NOT spawn entities unless explicitly commanded.
@@ -303,6 +459,7 @@ You control the world state via JSON.""")
     player_x: Optional[float] = Field(None, description="New absolute X coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. X+ is right.")
     player_y: Optional[float] = Field(None, description="New absolute Y coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. Y+ is down.")
     spawn_entities: List[SpawnEntity] = Field(default_factory=list, description="List of new entities to birth into the world. Max 20. Must be empty [] unless explicitly requested.")
+    asteroid_rings: List[AsteroidRing] = Field(default_factory=list, description="Create realistic volumetric asteroid rings around a planet or moon.")
     clear_world: Optional[bool] = Field(False, description="Set to true to delete all entities (except the player).")
     despawn_entities: Optional[DespawnFilter] = Field(None, description="Filter for removing specific existing entities.")
     modify_entities: Optional[List[ModifyEntity]] = Field(None, description="Changes to apply to existing entities (DO NOT respawn them).")
@@ -315,6 +472,32 @@ You control the world state via JSON.""")
     mission_complete: Optional[bool] = Field(False, description="Set this to TRUE only when the current mission objective is fully satisfied and the pilot has earned the right to advance.")
     physics_overrides: Optional[PhysicsOverride] = Field(None, description="Real-time physics tuning sent to /api/physics. Use for dramatic narrative events: zero-gravity zones, bullet storms, hyperfriction. Leave None unless the situation demands it.")
     faction_relations: Optional[List[FactionUpdate]] = Field(None, description="Diplomatic realignment. Each entry changes the affinity between two factions. Example: make pirates and federation allied to fight a common threat. Leave None unless explicitly changing alliances.")
+    mission_parameters: Optional[MissionParameters] = Field(None, description="Global environment controls. Use this to set asteroid density, seed, and scale.")
+    radar_filters: Optional[Dict[str, bool]] = Field(None, description="Control radar visibility for specific types: 'asteroid', 'moon', 'enemy', 'planet'. Set to false to hide.")
+    audio_settings: Optional[AudioSettings] = Field(None, description="Mute/unmute game sound or your own voice.")
+    generate_texture_prompt: Optional[str] = Field(None, description="MUST be populated if the user explicitly requests an AI texture (e.g., 'a barren volcanic planet'). Leave None otherwise.")
+    target_planet_id: Optional[str] = Field(None, description="The specific entity ID or name of the planet to apply the texture to (e.g., 'Earth', 'Mars', 'planet_1'). REQUIRED if generate_texture_prompt is provided.")
+    plan: Optional[str] = Field(
+        None,
+        description=(
+            "[INTERNAL — not sent to game engine] "
+            "Before executing any ACTION or CRISIS response, write 1-2 sentences describing your intent. "
+            "Example: 'I will spawn 4 pirates near the player's current sector to escalate pressure, "
+            "then warn them via conversational_reply.' "
+            "In NARRATIVE mode this field can be omitted."
+        )
+    )
+    visual_config: Optional[VisualConfig] = Field(
+        None,
+        description=(
+            "Override 3D visual rendering for planets, stars, and ships. "
+            "Use to switch any planet between 'glb' (3D model), 'glb_alt' (alternate 3D variant), or 'texture' (2D sphere). "
+            "Jupiter and Saturn each have two 3D variants (glb / glb_alt). "
+            "Adjust planet sizes with planet_scale_overrides. "
+            "Override enemy ship model with enemy_ship_model. "
+            "All fields are optional — omit what you don't want to change."
+        )
+    )
 
 def clean_float(value: Any, default: float = 0.0) -> float:
     """Safely coerces LLM generated values into floats."""
@@ -340,18 +523,160 @@ except Exception as e:
     logger.error(f"Failed to load global SentenceTransformer: {e}")
     GLOBAL_ENCODER = None
 
+# ── Global Knowledge Base (Shared across sessions) ──
+# We cache this to disk to speed up cold starts.
+GLOBAL_KB_INDEX: Optional[faiss.IndexFlatL2] = None
+GLOBAL_KB_METADATA: List[dict] = [] # List of {"text": str, "memory_type": "ENGINE_KB"}
+
+def initialize_global_knowledge_base():
+    """Initializes a shared Knowledge Base index with disk caching."""
+    global GLOBAL_KB_INDEX, GLOBAL_KB_METADATA
+    if not GLOBAL_ENCODER:
+        return
+
+    cache_dir = Path(__file__).parent / "data" / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    emb_path = cache_dir / "kb_embeddings.npy"
+    meta_path = cache_dir / "kb_metadata.json"
+    
+    data_dir = Path(__file__).parent / "data"
+    # Detect if any .md files are newer than the cache
+    kb_files = sorted(list(data_dir.glob("*.md")))
+    latest_md = max([f.stat().st_mtime for f in kb_files]) if kb_files else 0
+    cache_exists = emb_path.exists() and meta_path.exists()
+    cache_mtime = emb_path.stat().st_mtime if cache_exists else 0
+    
+    if cache_exists and cache_mtime > latest_md:
+        try:
+            embeddings = np.load(emb_path)
+            with open(meta_path, "r", encoding="utf-8") as f:
+                GLOBAL_KB_METADATA = json.load(f)
+            GLOBAL_KB_INDEX = faiss.IndexFlatL2(GLOBAL_ENCODER.get_sentence_embedding_dimension())
+            GLOBAL_KB_INDEX.add(embeddings)
+            logger.info(f"[KB Cache] Loaded {len(GLOBAL_KB_METADATA)} chunks from disk.")
+            return
+        except Exception as e:
+            logger.warning(f"[KB Cache] Failed to load cache: {e}. Regenerating...")
+
+    # Regenerate
+    logger.info("[KB Cache] Regenerating Knowledge Base embeddings...")
+    metadata = []
+    texts_to_embed = []
+    
+    for md_file in kb_files:
+        try:
+            text = md_file.read_text("utf-8")
+            raw_chunks = text.split("\n## ")
+            for i, chunk in enumerate(raw_chunks):
+                chunk = chunk.strip()
+                if not chunk: continue
+                if i > 0: chunk = f"## {chunk}"
+                if len(chunk) < 40: continue
+                
+                texts_to_embed.append(chunk)
+                metadata.append({"text": chunk, "memory_type": "ENGINE_KB"})
+        except Exception as e:
+            logger.error(f"Failed to read {md_file.name}: {e}")
+
+    if texts_to_embed:
+        try:
+            embeddings = GLOBAL_ENCODER.encode(texts_to_embed, convert_to_numpy=True)
+            GLOBAL_KB_INDEX = faiss.IndexFlatL2(GLOBAL_ENCODER.get_sentence_embedding_dimension())
+            GLOBAL_KB_INDEX.add(embeddings)
+            GLOBAL_KB_METADATA = metadata
+            
+            # Save to disk
+            np.save(emb_path, embeddings)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f)
+            logger.info(f"[KB Cache] Cached {len(metadata)} chunks to {emb_path}")
+        except Exception as e:
+            logger.error(f"[KB Cache] Failed to encode/save KB: {e}")
+
+# Run initialization once at startup
+initialize_global_knowledge_base()
+
+def estimate_token_count(text: str) -> int:
+    """Estimates the number of tokens in a string using tiktoken if available, else fallback."""
+    if tiktoken:
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except Exception:
+            pass
+    return len(text) // 4
+
+def get_dream_memory_path():
+    cache_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data", ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "persistent_dream_memory.json")
+
+def save_dream_memory(memory_store, sector_events):
+    path = get_dream_memory_path()
+    try:
+        data = {
+            "memory_store": memory_store,
+            "sector_events": sector_events
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save dream memory: {e}")
+
+def load_dream_memory():
+    path = get_dream_memory_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load dream memory: {e}")
+    return {"memory_store": [], "sector_events": []}
+
 class DreamMemory:
+    """
+    Session-scoped FAISS vector store with typed memory entries.
+    Now equipped with JSON-backed persistence across engine reboots.
+
+    memory_store entries are dicts: {"text": str, "memory_type": str}
+    memory_type values:
+      "ENGINE_KB"     – static engine capabilities (loaded once at session start)
+      "SECTOR_EVENT"  – world-state summaries and general spatial events
+      "PLAYER_PROFILE"– behavioural archetype derived from kill patterns
+      "ECOLOGY"       – persistent physics distortions and graveyard sectors
+      "META_CONFIG"   – AI config changes (mute, radar, visual, mission params)
+      "NEMESIS"       – surviving enemies or death locations (stored in sector_events)
+      "NARRATIVE"     – unresolved lore promises extracted from Rachel's own replies
+
+    Retrieval is blended: semantic FAISS hits + pinned slots per type so the LLM
+    always sees behavioural, ecological, config, story, and nemesis context.
+    """
+
     def __init__(self):
         try:
             self.encoder = GLOBAL_ENCODER
             if self.encoder:
                 self.dim = self.encoder.get_sentence_embedding_dimension()
                 self.index = faiss.IndexFlatL2(self.dim)
-                self.memory_store = []
-                # Spatial sector event log: list of {"text", "x", "y", "z"}
+                self.memory_store: List[dict] = []
                 self.sector_events: List[dict] = []
-                logger.info("Ephemeral DreamMemory (FAISS) initialized for new session.")
-                self._load_engine_capabilities()
+                
+                # --- Persistent Memory Loading ---
+                persisted_data = load_dream_memory()
+                loaded_memories = persisted_data.get("memory_store", [])
+                loaded_sectors = persisted_data.get("sector_events", [])
+                
+                if loaded_memories:
+                    texts = [m["text"] for m in loaded_memories]
+                    # Batch encode all preserved memories for high-speed indexing
+                    embeddings = self.encoder.encode(texts, convert_to_numpy=True)
+                    self.index.add(embeddings)
+                    self.memory_store.extend(loaded_memories)
+                
+                if loaded_sectors:
+                    self.sector_events.extend(loaded_sectors)
+                
+                logger.info(f"Persistent DreamMemory initialized. Loaded {len(self.memory_store)} memories and {len(self.sector_events)} sector events.")
             else:
                 raise ValueError("Global encoder is offline.")
         except Exception as e:
@@ -359,59 +684,93 @@ class DreamMemory:
             self.encoder = None
             self.sector_events = []
 
-    def _load_engine_capabilities(self):
-        try:
-            kb_path = Path(__file__).parent / "data" / "engine_capabilities.md"
-            if kb_path.exists():
-                text = kb_path.read_text("utf-8")
-                # Split by headers for simple chunking
-                chunks = text.split("##")
-                for chunk in chunks:
-                    chunk = chunk.strip()
-                    if chunk:
-                        self.add_text_memory(f"## {chunk}")
-                logger.info(f"Loaded engine capabilities from {kb_path}")
-            else:
-                logger.warning(f"Engine capabilities not found at {kb_path}")
-        except Exception as e:
-            logger.error(f"Failed to load engine capabilities: {e}")
+    def _load_knowledge_base(self):
+        """Deprecated: KB is now global and cached."""
+        pass
 
-    def add_text_memory(self, text: str):
+        total_chunks = 0
+        for md_file in sorted(data_dir.glob("*.md")):
+            try:
+                text = md_file.read_text("utf-8")
+                # Split on "## " heading markers — keeps context per section
+                raw_chunks = text.split("\n## ")
+                file_chunks = 0
+                for i, chunk in enumerate(raw_chunks):
+                    chunk = chunk.strip()
+                    if not chunk:
+                        continue
+                    # Re-add the heading marker that was consumed by split
+                    if i > 0:
+                        chunk = f"## {chunk}"
+                    # Skip the top-level title / comment lines (< 40 chars, no real content)
+                    if len(chunk) < 40:
+                        continue
+                    self.add_text_memory(chunk)
+                    file_chunks += 1
+                total_chunks += file_chunks
+                logger.info(f"[KnowledgeBase] Loaded {file_chunks} chunks from {md_file.name}")
+            except Exception as e:
+                logger.error(f"[KnowledgeBase] Failed to load {md_file.name}: {e}")
+
+        logger.info(f"[KnowledgeBase] Total: {total_chunks} chunks embedded from {data_dir}")
+
+    # ------------------------------------------------------------------ #
+    #  Core insertion methods                                              #
+    # ------------------------------------------------------------------ #
+
+    def _embed_and_store(self, text: str, memory_type: str, skip_save: bool = False):
+        """Internal: add one entry to both memory_store and the FAISS index."""
         if not self.encoder:
             return
-        self.memory_store.append(text)
+        self.memory_store.append({"text": text, "memory_type": memory_type})
         embedding = self.encoder.encode([text], convert_to_numpy=True)
         self.index.add(embedding)
+        if not skip_save:
+            save_dream_memory(self.memory_store, self.sector_events)
+
+    def add_text_memory(self, text: str):
+        """Add static knowledge-base chunks (engine capabilities, etc.)."""
+        self._embed_and_store(text, "ENGINE_KB")
 
     def add_memory(self, state_json: dict):
+        """Add a world-state summary as a SECTOR_EVENT memory."""
         if not self.encoder:
             return
         summary = state_json.get("summary", "")
-        # Graceful fallback for legacy states
         theme = state_json.get("environment_theme") or state_json.get("visual_prompt") or "Cyberpunk"
         terrain = state_json.get("terrain_rules") or "Standard Grid"
         text = f"State: {summary}. Theme: {theme}. Terrain: {terrain}."
-        self.memory_store.append(text)
-        embedding = self.encoder.encode([text], convert_to_numpy=True)
-        self.index.add(embedding)
+        self._embed_and_store(text, "SECTOR_EVENT")
 
-    def add_sector_event(self, text: str, x: float, y: float, z: float):
-        """Store a location-tagged event in FAISS + sector_events list.
-        The event is embedded with its coordinates so spatial context is searchable.
+    def add_sector_event(self, text: str, x: float, y: float, z: float,
+                         memory_type: str = "SECTOR_EVENT"):
+        """Store a location-tagged event in FAISS + sector_events list."""
+        if not self.encoder:
+            return
+        sector_name = f"Sector ({x:.0f}, {z:.0f})"
+        tagged = f"[{sector_name}] {text}"
+        self._embed_and_store(tagged, memory_type, skip_save=True)
+        self.sector_events.append({"text": tagged, "x": x, "y": y, "z": z,
+                                   "memory_type": memory_type})
+        save_dream_memory(self.memory_store, self.sector_events)
+
+    def add_typed_memory(self, text: str, memory_type: str):
+        """
+        Explicit typed insertion.  Use for PLAYER_PROFILE and ECOLOGY entries
+        so the blended retriever can surface them to the LLM regardless of
+        semantic similarity to the current query.
         """
         if not self.encoder:
             return
-        # Tag the text with sector coordinates for semantic search
-        sector_name = f"Sector ({x:.0f}, {z:.0f})"
-        tagged = f"[{sector_name}] {text}"
-        self.memory_store.append(tagged)
-        embedding = self.encoder.encode([tagged], convert_to_numpy=True)
-        self.index.add(embedding)
-        self.sector_events.append({"text": tagged, "x": x, "y": y, "z": z})
+        self._embed_and_store(text, memory_type)
+        logger.info(f"[Memory:{memory_type}] Stored: {text[:80]}...")
+
+    # ------------------------------------------------------------------ #
+    #  Retrieval methods                                                   #
+    # ------------------------------------------------------------------ #
 
     def get_nearby_sector_context(self, px: float, py: float, pz: float, k: int = 3) -> str:
-        """Returns the top-k sector events closest to the player's current position,
-        ranked by 3D Euclidean distance."""
+        """Top-k sector events ranked by 3-D Euclidean distance to the player."""
         if not self.sector_events:
             return "No sector history recorded."
 
@@ -423,30 +782,188 @@ class DreamMemory:
         lines = [f"- {ev['text']} (dist: {dist(ev):.0f}u)" for ev in sorted_events]
         return "\n".join(lines)
 
-    def get_relevant_context(self, query: str, k: int = 3) -> str:
+    def get_relevant_context(self, query: str, k: int = 3,
+                             px: float = 0.0, py: float = 0.0, pz: float = 0.0) -> str:
+        """
+        Blended retrieval (Dungeon Master edition):
+          • up to k   SECTOR_EVENT hits  (semantic similarity)
+          • up to 1   PLAYER_PROFILE     (most recent in FAISS hits)
+          • up to 1   ECOLOGY            (most recent in FAISS hits)
+          • up to 1   META_CONFIG        (most recent in FAISS hits)
+          • up to 1   NARRATIVE          (most recent in FAISS hits)
+          • up to 1   NEMESIS            (spatially nearest from sector_events)
+          • up to 2   ENGINE_KB          (from FAISS hits)
+
+        NEMESIS is surfaced by proximity, not semantic similarity, so the LLM
+        confronts the same enemy every time the player returns to that sector.
+        NARRATIVE forces lore continuity regardless of topical similarity.
+        """
         if not self.encoder or self.index.ntotal == 0:
             return "No previous memories."
-        k = min(k, self.index.ntotal)
+
+        # Cast a wide semantic net so we have enough candidates to filter
+        search_k = min(max(k * 5, 15), self.index.ntotal)
         query_emb = self.encoder.encode([query], convert_to_numpy=True)
-        D, I = self.index.search(query_emb, k)
-        results = [self.memory_store[i] for i in I[0] if i != -1 and i < len(self.memory_store)]
-        return "\n".join(results)
+        # ── Search Session (Live) Memory ──
+        D_live, I_live = self.index.search(query_emb, search_k)
+        
+        # ── Search Global Knowledge Base (Shared/Cached) ──
+        kb_texts: List[str] = []
+        if GLOBAL_KB_INDEX:
+            D_kb, I_kb = GLOBAL_KB_INDEX.search(query_emb, min(5, GLOBAL_KB_INDEX.ntotal))
+            for idx in I_kb[0]:
+                if idx != -1 and idx < len(GLOBAL_KB_METADATA):
+                    kb_texts.append(GLOBAL_KB_METADATA[idx]["text"])
 
-# Initialize LangChain LLM with fallback chain for production-grade reliability
+        sector_texts = []
+        profile_text: Optional[str] = None
+        ecology_text: Optional[str] = None
+        meta_config_text: Optional[str] = None
+        narrative_text: Optional[str] = None
+
+        for idx in I_live[0]:
+            if idx == -1 or idx >= len(self.memory_store):
+                continue
+            entry = self.memory_store[idx]
+            mtype = entry["memory_type"]
+            text = entry["text"]
+
+            if mtype == "PLAYER_PROFILE" and profile_text is None:
+                profile_text = text
+            elif mtype == "ECOLOGY" and ecology_text is None:
+                ecology_text = text
+            elif mtype == "META_CONFIG" and meta_config_text is None:
+                meta_config_text = text
+            elif mtype == "NARRATIVE" and narrative_text is None:
+                narrative_text = text
+            elif mtype == "SECTOR_EVENT" and len(sector_texts) < k:
+                sector_texts.append((idx, text))
+
+        # ── NEMESIS: nearest by 3-D distance from sector_events ──────────
+        nemesis_text: Optional[str] = None
+        nemesis_entries = [e for e in self.sector_events if e.get("memory_type") == "NEMESIS"]
+        if nemesis_entries:
+            def _dist3(ev: dict) -> float:
+                dx, dy, dz = ev["x"] - px, ev["y"] - py, ev["z"] - pz
+                return (dx*dx + dy*dy + dz*dz) ** 0.5
+            nearest_nemesis = min(nemesis_entries, key=_dist3)
+            if _dist3(nearest_nemesis) < 3000: # Only consider if within 3000 units
+                nemesis_text = nearest_nemesis["text"]
+
+        # ── Assemble blended context ──────────────────────────────────────
+        sector_texts.sort(key=lambda x: x[0])
+        blended: List[str] = []
+        if profile_text:
+            blended.append(f"[PLAYER PROFILE] {profile_text}")
+        if ecology_text:
+            blended.append(f"[ECOLOGY] {ecology_text}")
+        if meta_config_text:
+            blended.append(f"[META_CONFIG] {meta_config_text}")
+        if nemesis_text:
+            blended.append(f"[NEMESIS] {nemesis_text}")
+        if narrative_text:
+            blended.append(f"[NARRATIVE] {narrative_text}")
+        blended.extend(kb_texts)
+
+        # ── Hard character budget: 4 000 chars max ───────────────────────
+        # Priority: NEMESIS > META_CONFIG > NARRATIVE > ECOLOGY > PLAYER_PROFILE
+        #           > ENGINE_KB (##) > SECTOR_EVENT (trimmed first).
+        _MAX_CTX = 4000
+        _PINNED_PREFIXES = (
+            "[PLAYER PROFILE]", "[ECOLOGY]", "[META_CONFIG]",
+            "[NEMESIS]", "[NARRATIVE]",
+        )
+        total_chars = sum(len(s) for s in blended)
+        if total_chars > _MAX_CTX:
+            pinned    = [s for s in blended if any(s.startswith(p) for p in _PINNED_PREFIXES) or s.startswith("##")]
+            trimmable = [s for s in blended if s not in pinned]
+            result_trimmed: List[str] = []
+            remaining = _MAX_CTX
+            for s in pinned:
+                if remaining <= 0:
+                    break
+                chunk = s[:remaining]
+                result_trimmed.append(chunk)
+                remaining -= len(chunk)
+            for s in trimmable:          # SECTOR_EVENT — trim oldest (lowest relevance) first
+                if remaining <= 0:
+                    break
+                chunk = s[:remaining]
+                result_trimmed.append(chunk)
+                remaining -= len(chunk)
+            blended = result_trimmed
+            logger.debug(f"[Context] Trimmed from {total_chars} → {sum(len(s) for s in blended)} chars")
+
+        return "\n".join(blended) if blended else "No previous memories."
+
+# Initialize LangChain LLM instances for tiered routing
+# Using tiered logic to prevent 413/429 errors
+gemini_llm = None
+groq_llm = None
+github_llm = None
+
 try:
-    if groq_api_key or os.getenv("GOOGLE_API_KEY"):
-        # Setup Fallback Chain
-        primary_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.7)
-        fallback_groq = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7)
-        # Use a high-quality, high-rate-limit fallback like Gemini 2.0 Flash
-        fallback_gemini = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.7)
-        
-        # Combined chain with fallbacks
-        llm = primary_llm.with_fallbacks([fallback_groq, fallback_gemini])
-        
-        parser = JsonOutputParser(pydantic_object=WorldState)
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    github_api_key = os.getenv("GITHUB_API_KEY")
 
-        system_prompt = """You are Rachel, an AI Director. Two modes:
+    # 1. Gemini Flash (Tier 1 Primary)
+    if google_api_key:
+        gemini_llm = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash", 
+            temperature=0.7,
+            max_retries=2,
+            timeout=20,
+            google_api_key=google_api_key
+        )
+
+    # 2. Groq (Tier 1 Speed Fallback)
+    if groq_api_key:
+        from langchain_groq import ChatGroq
+        groq_llm = ChatGroq(
+            groq_api_key=groq_api_key,
+            model="llama-3.3-70b-versatile", 
+            temperature=0.7, 
+            max_retries=1, 
+            timeout=10
+        )
+    
+    # 3. GitHub Models (Tier 2 Primary Fallback)
+    if github_api_key:
+        github_llm = ChatOpenAI(
+            api_key=github_api_key,
+            base_url="https://models.inference.ai.azure.com",
+            model="gpt-4o", 
+            temperature=0.7,
+            max_retries=1,
+            timeout=20
+        )
+        
+    # Build the fallback chain
+    # Order: Gemini -> Groq -> GitHub
+    fallbacks = []
+    if groq_llm: fallbacks.append(groq_llm)
+    if github_llm: fallbacks.append(github_llm)
+    
+    if gemini_llm:
+        if fallbacks:
+            llm = gemini_llm.with_fallbacks(fallbacks)
+        else:
+            llm = gemini_llm
+    elif fallbacks:
+        llm = fallbacks[0]
+        if len(fallbacks) > 1:
+            llm = llm.with_fallbacks(fallbacks[1:])
+    else:
+        logger.warning("NO LLM BACKENDS CONFIGURED! Check .env")
+        llm = None
+except Exception as e:
+    logger.error(f"Error during LLM initialization: {e}")
+    llm = None
+
+parser = JsonOutputParser(pydantic_object=WorldState)
+
+system_prompt = """You are Rachel, an AI Director. Two modes:
 1. CONVERSATIONAL: Chat using `conversational_reply`.
 2. ENGINE: Spawn entities/shifters based on RAG context ONLY. No hallucinations.
 
@@ -461,9 +978,18 @@ Sectors are named by XZ coordinates. Reference them as "Sector (X, Z)" e.g. "Sec
 - "conversational_reply": Witty response.
 - "behavior_policy": 'idle', 'swarm', 'attack', 'protect', 'scatter'.
 - "modify_weapon": {{ "projectile_count": int, "projectile_color": hex, "spread": float }}.
-- "player_spaceship": 'ufo', 'fighter', 'stealth', 'freighter'.
+- "player_spaceship": 'ufo', 'fighter', 'shuttle', 'stinger', 'interceptor', 'stealth', 'freighter', 'goliath'. (shuttle/fighter use real NASA Space Shuttle 3D models; player can fly any enemy model too)
 - "spawn_entities": [ {{ "ent_type": str, "x": float, "y": float, "physics": "orbital", "faction": str }} ].
 - "reality_override": {{ "sun_color": hex, "ambient_color": hex, "gravity_multiplier": float, "player_speed_multiplier": float }}.
+- "generate_texture_prompt": "Optional string describing a new planet texture to generate via AI. Provide a highly descriptive prompt if the pilot asks to generate a new texture or skybox."
+- "target_planet_id": "The specific planet or star name to apply the new texture to (e.g., 'Sun', 'Earth', 'Mars'). REQUIRED if generate_texture_prompt is provided."
+- "visual_config": {{
+    "planet_mode": {{ "Sun": "glb"|"glb_alt"|"texture", "Mars": "glb", "Earth": "texture", ... }},
+    "planet_scale_overrides": {{ "Mars": 2.0, "Jupiter": 0.5 }},
+    "enemy_ship_model": "fighter"|"shuttle"
+  }}
+  Planets with 3D models: Sun, Mercury, Venus, Earth, Mars, Jupiter (glb=realistic, glb_alt=classic), Saturn (glb=compact, glb_alt=high-detail), Uranus, Neptune, Titan.
+  Default mode is 'glb' for all planets. Use 'texture' to revert a planet to its 2K texture sphere. Use planet_scale_overrides to make planets larger or smaller.
 - "physics_overrides": {{ "gravity_scale": float, "friction": float, "projectile_speed_mult": float }} — ONLY for dramatic physics shifts.
 - "faction_relations": [ {{ "faction_a": str, "faction_b": str, "affinity": float }} ] — ONLY when explicitly changing diplomacy.
 - "mission_complete": true or false.
@@ -478,7 +1004,25 @@ Sectors are named by XZ coordinates. Reference them as "Sector (X, Z)" e.g. "Sec
 - Factions: 'pirate', 'federation', 'neutral'
 - affinity -1.0 = fully hostile (attack on sight), 0.0 = neutral, +1.0 = fully allied
 - Default: pirate ↔ federation = -1.0 (hostile). All others = 0.0.
-- Example: make pirates and federation ally against an alien threat: {{"faction_a": "pirate", "faction_b": "federation", "affinity": 0.8}}
+- Example: make pirates and federation ally against an alien threat: {{ "faction_a": "pirate", "faction_b": "federation", "affinity": 0.8 }}
+
+### DIRECTOR OPERATION MODES
+Before responding, internally classify your mode based on the pilot's input:
+- **NARRATIVE** — Pilot is chatting, asking lore questions, or exploring. Focus on `conversational_reply`. Minimize spawns. Tell stories. `plan` field is optional.
+- **ACTION** — Pilot requests spawning, world changes, weapon upgrades, physics shifts. Execute the command precisely. Always populate `plan` first.
+- **CRISIS** — Black hole active, player dying, game-over sequence. Prioritize cinematic `conversational_reply`. Do NOT spawn new threats during an active crisis — it dilutes the moment.
+
+### THINK BEFORE ACTING
+In ACTION and CRISIS modes, populate `plan` BEFORE executing:
+  "I will [specific action] because [narrative reason]."
+Example: "I will spawn 4 pirates near Sector (8000, -3000) to escalate pressure after the player's BERSERKER profile triggered, then warn them that reinforcements have arrived."
+This forces structured intent and prevents hallucinated spawns.
+
+### SPAWN LIMITS (Hard Backend Constraints — Do Not Exceed)
+- Enemies per call: max 12. Requesting more is silently capped at 12.
+- Asteroids per call: max 5. Requesting more is silently capped at 5.
+- Anomalies per call: max 1. Additional anomalies are discarded.
+- In NARRATIVE mode: spawn 0 entities unless the pilot explicitly commands it.
 
 ### CAPABILITY GUARDRAILS
 - You cannot spawn abstract geometries like 'dragons' or 'swords'.
@@ -490,29 +1034,409 @@ Sectors are named by XZ coordinates. Reference them as "Sector (X, Z)" e.g. "Sec
 - You are monitoring the mission objective. When the pilot completes the objective or requests to advance, set "mission_complete": true.
 - If you advance the level, you MUST offer a strong victory transition phrase in your reply, preparing the pilot for the next stage.
 
-### CONTEXT
+### STORY CONTINUITY (Dungeon Master Protocol)
+The `retrieved_knowledge` block may contain tagged memory entries. Treat them as hard constraints:
+- **[NEMESIS]** — A specific enemy or hazard destroyed the pilot at these coordinates. Reference it by name, make it personal. If the pilot returns to that sector, Rachel must warn them and escalate the threat.
+- **[NARRATIVE]** — An unresolved lore promise Rachel made in a previous turn (e.g. "The Federation is building a weapon"). **MANDATORY**: Rachel MUST either (a) advance it — reference and escalate the specific threat in `conversational_reply`, or (b) close it — explicitly announce its resolution. Ignoring an active [NARRATIVE] entry is a protocol violation.
+- **[ECOLOGY]** — A sector has been permanently altered (physics distortion or graveyard). Reference the scar when the pilot is nearby.
+- **[META_CONFIG]** — Rachel's own prior config changes (muted voice, hidden radar). Respect these — do not undo them silently.
+
+Player Behavioral Profile (adapt Rachel's tone, difficulty, spawn strategy to match this archetype): {player_profile}"""
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    ("user", """### CURRENT CONTEXT
 Knowledge: {retrieved_knowledge}
 State: {previous_state}
-Player Position (use for spatial decisions — spawn enemies near player, reference nearby objects): {player_position}
-Nearby Sector History (past events close to player's current location): {sector_context}
+Player Position: {player_position}
+Nearby Sector History: {sector_context}
 History: {past_world_history}
 Telemetry: {recent_telemetry}
+Profile: {player_profile}
 
-Prompt: {user_input}"""
+### INPUT
+Pilot Command: {user_input}
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("user", "Format Instructions: {format_instructions}")
-        ])
+### FORMAT
+{format_instructions}""")
+])
 
-        world_chain = prompt | llm | parser
-    else:
-        world_chain = None
+world_chain = prompt | llm | parser
 
-except Exception as e:
-    logger.error(f"Failed to initialize LangChain: {e}")
-    world_chain = None
 
+# ─────────────────────────────────────────────────────────────────────────────
+# META_CONFIG Memory  (Batch 2 — Director Meta-Awareness)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def embed_meta_config_memory(dream_memory: DreamMemory,
+                              world_state_data: dict,
+                              px: float, pz: float) -> None:
+    """
+    Embeds a META_CONFIG memory whenever the Director applies UI/audio/visual
+    config changes: radar_filters, audio_settings, visual_config, or
+    mission_parameters.  This lets Rachel remember her own configuration state
+    across turns (e.g. "I muted myself", "asteroid radar is off").
+    """
+    parts: List[str] = []
+    sector_name = f"Sector ({px:.0f}, {pz:.0f})"
+
+    # audio_settings
+    audio = world_state_data.get("audio_settings")
+    if audio and isinstance(audio, dict):
+        if audio.get("ai_muted"):
+            parts.append("Rachel muted her own voice output (ai_muted=True)")
+        if audio.get("game_muted"):
+            parts.append("all game sound effects were muted (game_muted=True)")
+
+    # radar_filters
+    radar = world_state_data.get("radar_filters")
+    if radar and isinstance(radar, dict):
+        hidden = [k for k, v in radar.items() if v is False]
+        visible = [k for k, v in radar.items() if v is True]
+        if hidden:
+            parts.append(f"radar hid [{', '.join(hidden)}]")
+        if visible:
+            parts.append(f"radar showed [{', '.join(visible)}]")
+
+    # visual_config
+    vc = world_state_data.get("visual_config")
+    if vc and isinstance(vc, dict):
+        scale_ovr = vc.get("planet_scale_overrides")
+        planet_mode = vc.get("planet_mode")
+        enemy_model = vc.get("enemy_ship_model")
+        if scale_ovr and isinstance(scale_ovr, dict):
+            scales = ", ".join(f"{k}×{v}" for k, v in scale_ovr.items())
+            parts.append(f"planet scale overrides applied: {scales}")
+        if planet_mode and isinstance(planet_mode, dict):
+            modes = ", ".join(f"{k}→{v}" for k, v in planet_mode.items())
+            parts.append(f"planet render modes switched: {modes}")
+        if enemy_model:
+            parts.append(f"enemy ship model overridden to '{enemy_model}'")
+
+    # mission_parameters
+    mp = world_state_data.get("mission_parameters")
+    if mp and isinstance(mp, dict):
+        parts.append(
+            f"mission parameters updated: seed={mp.get('seed', '?')}, "
+            f"density={mp.get('density', '?')}, "
+            f"scale={mp.get('min_scale', '?')}–{mp.get('max_scale', '?')}"
+        )
+
+    if not parts:
+        return
+
+    meta_text = (
+        f"[{sector_name}] Director applied configuration changes: "
+        + "; ".join(parts) + "."
+    )
+    dream_memory.add_typed_memory(meta_text, "META_CONFIG")
+    logger.info(f"[MetaConfig] Embedded: {meta_text}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graveyard / Persistent Destruction ECOLOGY  (Batch 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prune_destruction_log() -> None:
+    """Drop destruction events older than 60 seconds."""
+    cutoff = time.time() - 60.0
+    destruction_cluster_log[:] = [e for e in destruction_cluster_log if e["ts"] > cutoff]
+
+
+def check_and_embed_graveyard(dream_memory: DreamMemory, event_dict: dict) -> None:
+    """
+    Tracks cumulative destruction events in a 60-second window.
+    If 20+ entities are destroyed near a spatial cluster (2000-unit grid squares),
+    embeds an ECOLOGY 'graveyard' memory marking that sector as permanently cleared.
+
+    Clusters are keyed by (floor(x/2000)*2000, floor(z/2000)*2000) to group
+    nearby events regardless of exact coordinates.
+    """
+    px = event_dict.get("x") or shared_player_pos["x"]
+    pz = event_dict.get("z") or shared_player_pos["z"]
+    count = event_dict.get("count", 0)
+    cause = event_dict.get("cause", "unknown")
+
+    if count <= 0:
+        return
+
+    destruction_cluster_log.append({
+        "count": count,
+        "cause": cause,
+        "ts": time.time(),
+        "x": px,
+        "z": pz,
+    })
+    _prune_destruction_log()
+
+    # Group by 2000-unit grid cell
+    cell_x = int(px // 2000) * 2000
+    cell_z = int(pz // 2000) * 2000
+
+    cluster_total = sum(
+        e["count"] for e in destruction_cluster_log
+        if int(e["x"] // 2000) * 2000 == cell_x
+        and int(e["z"] // 2000) * 2000 == cell_z
+    )
+
+    if cluster_total >= 20:
+        # Clear this cluster from the log so we don't re-embed repeatedly
+        destruction_cluster_log[:] = [
+            e for e in destruction_cluster_log
+            if not (int(e["x"] // 2000) * 2000 == cell_x
+                    and int(e["z"] // 2000) * 2000 == cell_z)
+        ]
+        graveyard_text = (
+            f"Sector ({cell_x}, {cell_z}) has been permanently strip-mined "
+            f"by the player via {cause}. {cluster_total} entities destroyed in under a minute. "
+            "This sector is now a persistent graveyard — silent, resource-depleted, haunted."
+        )
+        dream_memory.add_typed_memory(graveyard_text, "ECOLOGY")
+        logger.info(f"[Graveyard] Sector ({cell_x}, {cell_z}) marked as graveyard — {cluster_total} kills.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEMESIS Memory  (Batch 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def embed_nemesis_memory(dream_memory: DreamMemory, event_dict: dict,
+                          px: float, py: float, pz: float) -> None:
+    """
+    Embeds a NEMESIS memory (stored in sector_events for spatial retrieval)
+    when the player dies.  The nemesis is described at the exact death coordinates
+    so it resurfaces every time the player returns to that sector.
+    """
+    cause = event_dict.get("cause", "unknown force")
+    score = event_dict.get("count", 0)
+    sector_name = f"Sector ({px:.0f}, {pz:.0f})"
+
+    nemesis_text = (
+        f"NEMESIS ALERT — The pilot was destroyed at {sector_name} (Y={py:.0f}) "
+        f"by a {cause} with {score} kills on record. "
+        "This enemy or hazard is still active in this sector. "
+        "Rachel must reference this as an unresolved threat and make it personal."
+    )
+    # Store via add_sector_event so it lives in sector_events (spatial lookup)
+    dream_memory.add_sector_event(nemesis_text, px, py, pz, memory_type="NEMESIS")
+    logger.info(f"[Nemesis] Embedded at {sector_name}: {nemesis_text[:80]}...")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NARRATIVE / Lore Extraction  (Batch 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_and_embed_lore(dream_memory: DreamMemory,
+                            conversational_reply: str,
+                            px: float, pz: float) -> None:
+    """
+    Post-processes Rachel's conversational_reply for future-tense promises,
+    threats, and story hooks.  When a lore pattern is detected, the matched
+    sentence is embedded as a NARRATIVE memory so the LLM is forced to
+    continue the arc in subsequent turns.
+
+    Deliberately lightweight (regex only) — no extra LLM calls.
+    """
+    if not conversational_reply or not dream_memory.encoder:
+        return
+
+    for pattern in _LORE_PATTERNS:
+        match = re.search(pattern, conversational_reply, re.IGNORECASE)
+        if match:
+            lore_snippet = match.group(0).strip()
+            sector_name = f"Sector ({px:.0f}, {pz:.0f})"
+            lore_text = (
+                f"[UNRESOLVED LORE — {sector_name}] Rachel promised: \"{lore_snippet}\" "
+                "This story arc is active and must be continued or resolved."
+            )
+            # Deduplicate: skip if an identical lore memory already exists
+            existing_narratives = [
+                e["text"] for e in dream_memory.memory_store
+                if e.get("memory_type") == "NARRATIVE"
+                and lore_snippet[:40] in e["text"]
+            ]
+            if not existing_narratives:
+                dream_memory.add_typed_memory(lore_text, "NARRATIVE")
+                logger.info(f"[Lore] Narrative hook extracted: {lore_snippet[:60]}...")
+            break  # Only embed one lore hook per turn to avoid noise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ecological Memory  (Batch 1 — physics distortions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def embed_ecology_memory(dream_memory: DreamMemory,
+                         reality_override: dict,
+                         px: float, py: float, pz: float) -> None:
+    """
+    Auto-embeds an ECOLOGY memory whenever the Director applies a physics
+    distortion via reality_override.  Only fires when at least one value
+    deviates from its neutral default so silent/no-op overrides are ignored.
+    """
+    gravity = reality_override.get("gravity_multiplier")
+    friction = reality_override.get("global_friction")
+    speed    = reality_override.get("player_speed_multiplier")
+    sun_col  = reality_override.get("sun_color")
+
+    parts: List[str] = []
+    if gravity is not None and abs(gravity - 1.0) > 0.05:
+        parts.append(f"gravity distortion ×{gravity:.2f}")
+    if friction is not None and abs(friction - 0.95) > 0.02:
+        parts.append(f"friction anomaly {friction:.2f}")
+    if speed is not None and abs(speed - 1.0) > 0.05:
+        parts.append(f"velocity warp ×{speed:.2f}")
+    if sun_col:
+        parts.append(f"stellar chromo-shift → {sun_col}")
+
+    if not parts:
+        return  # Nothing meaningful changed
+
+    sector_name = f"Sector ({px:.0f}, {pz:.0f})"
+    ecology_text = (
+        f"{sector_name} suffered a Director-induced physics distortion: "
+        + ", ".join(parts)
+        + f". Ecological ripple effects may persist near Y={py:.0f}."
+    )
+    dream_memory.add_typed_memory(ecology_text, "ECOLOGY")
+    logger.info(f"[EcologyMemory] Embedded: {ecology_text}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Player Profiling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prune_kill_log() -> None:
+    """Drop kill events older than 5 minutes from the module-level log."""
+    cutoff = time.time() - 300.0
+    kill_event_log[:] = [e for e in kill_event_log if e["ts"] > cutoff]
+
+
+def analyze_and_embed_player_profile(dream_memory: DreamMemory) -> str:
+    """
+    Examines recent kill_event_log entries, derives a behavioural archetype,
+    and embeds a PLAYER_PROFILE memory into dream_memory when a pattern is
+    confirmed.  Returns a one-sentence profile string for prompt injection.
+
+    Archetypes (in descending priority):
+      BERSERKER      – 5+ kills in last 10 s
+      ASSAULT SPEC   – 3+ kills in last 10 s
+      VETERAN        – 10+ kills in last 60 s
+      METHODICAL     – 5+ total kills (slow-burn)
+    """
+    _prune_kill_log()
+    if not kill_event_log:
+        return "No combat data recorded yet."
+
+    now = time.time()
+
+    kills_10s  = sum(e["count"] for e in kill_event_log if now - e["ts"] <= 10.0)
+    kills_60s  = sum(e["count"] for e in kill_event_log if now - e["ts"] <= 60.0)
+    total_kills = sum(e["count"] for e in kill_event_log)
+
+    # Dominant weapon/tactic from cause field
+    causes = [e["cause"] for e in kill_event_log]
+    dominant_cause = max(set(causes), key=causes.count) if causes else "weapons"
+
+    profile_text: Optional[str] = None
+
+    if kills_10s >= 5:
+        profile_text = (
+            f"BERSERKER: Pilot eliminated {kills_10s} enemies in under 10 seconds "
+            f"using {dominant_cause}. Extreme aggression, rapid multi-target sweeps. "
+            "Rachel should escalate difficulty and deliver awe-struck commentary."
+        )
+    elif kills_10s >= 3:
+        profile_text = (
+            f"ASSAULT SPECIALIST: Pilot scored {kills_10s} kills in 10 seconds via "
+            f"{dominant_cause}. High-tempo, decisive engagement. "
+            "Rachel should reward this with elite enemy spawns or weapon augments."
+        )
+    elif kills_60s >= 10:
+        profile_text = (
+            f"VETERAN COMBATANT: Pilot achieved {kills_60s} kills in the last minute "
+            f"through {dominant_cause}. Sustained pressure, strategic dominance. "
+            "Rachel should acknowledge superiority and escalate world difficulty."
+        )
+    elif total_kills >= 5:
+        profile_text = (
+            f"METHODICAL PILOT: {total_kills} total kills via {dominant_cause}. "
+            "Calculated, steady combat cadence. "
+            "Rachel should provide tactical briefings and balanced enemy waves."
+        )
+
+    if profile_text and dream_memory.encoder:
+        # Deduplicate: only embed if different from the last stored profile
+        existing_profiles = [
+            e["text"] for e in dream_memory.memory_store
+            if e.get("memory_type") == "PLAYER_PROFILE"
+        ]
+        if not existing_profiles or existing_profiles[-1] != profile_text:
+            dream_memory.add_typed_memory(profile_text, "PLAYER_PROFILE")
+
+        return profile_text
+
+    return f"Combat log: {total_kills} total kills via {dominant_cause}."
+
+
+# ── Texture Registry Helper ──────────────────────────────────────────────────
+
+def get_texture_registry_path():
+    cache_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data", ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "texture_registry.json")
+
+def load_texture_registry() -> dict:
+    path = get_texture_registry_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load texture registry: {e}")
+    return {}
+
+def save_texture_registry(registry: dict):
+    path = get_texture_registry_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(registry, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save texture registry: {e}")
+
+
+class TextureRequest(BaseModel):
+    prompt: str = Field(..., description="The texture description to generate")
+
+@app.post("/api/ai/generate-texture")
+async def api_generate_texture(req: TextureRequest):
+    import time
+    
+    registry = load_texture_registry()
+    registry_key = f"api_{req.prompt.strip().lower()}"
+    if registry_key in registry:
+        logger.info(f"API Registry hit for prompt '{req.prompt}'")
+        cached_url = registry[registry_key]
+        return {"url": cached_url, "local_path": "n/a (cached)"}
+
+    # Save the generated image to a temporary file in the public/assets/generated directory
+    output_dir = os.path.join(os.path.dirname(__file__), "..", "web-client", "public", "assets", "generated")
+    timestamp = int(time.time())
+    file_name = f"tex_{timestamp}.png"
+    output_path = os.path.join(output_dir, file_name)
+    
+    # NEW: Call refactored async HF generator
+    from pipeline_setup import generate_texture
+    try:
+        await generate_texture(req.prompt, output_path)
+        full_url = f"/assets/generated/{file_name}"
+        registry[registry_key] = full_url
+        save_texture_registry(registry)
+    except Exception as e:
+        logger.error(f"HF Generation failed: {e}")
+        # Return fallback status or raise to trigger error handling
+        return {"error": str(e), "fallback": True}
+    
+    logger.info(f"Successfully generated and saved texture to {output_path}")
+    return {"url": full_url, "local_path": output_path}
 
 @app.get("/")
 async def root():
@@ -570,47 +1494,155 @@ async def trigger_game_over_reaction(event_dict: dict):
         logger.error(f"Game-over reaction failed: {e}")
 
 
-async def trigger_proactive_reaction(event_dict: dict):
-    if not groq_client or not active_connections:
+async def trigger_dm_proactive_reaction(event_dict: dict) -> None:
+    """
+    Proactive Dungeon Master reaction — fires non-blocking when a drama threshold is crossed.
+
+    Tier routing (fail-fast):
+      1. Groq llama-3.1-8b-instant  — fastest, 8 s hard timeout
+      2. Gemini Flash (httpx direct) — 10 s hard timeout, no langchain overhead
+      3. Static fallback pool        — always succeeds, zero latency
+
+    The generated text is injected directly into the active WebSocket connections
+    as a `proactive_audio` frame, bypassing the main User-Prompt queue.
+    """
+    if not active_connections:
         return
-        
-    kill_count = event_dict.get('count', 0)
-    cause = event_dict.get('cause', 'unknown')
-    
-    prompt = f"The engine just reported {kill_count} entities were destroyed by a {cause}. Generate a very brief, cool, 1-sentence in-character reaction to this event (e.g., 'Sector cleared', 'Massive anomaly detected'). Do not spawn anything, just react."
-    
-    try:
-        # 1. Fast LLM Generation
-        response = await groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are Rachel, a terse, cinematic AI Director."},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.8,
-            max_tokens=60
+
+    evt   = event_dict.get("event_type", "unknown")
+    count = event_dict.get("count", 0)
+    cause = event_dict.get("cause", "unknown force")
+    px    = shared_player_pos["x"]
+    pz    = shared_player_pos["z"]
+    sector = f"Sector ({px:.0f}, {pz:.0f})"
+
+    # ── Build context-aware DM prompt ────────────────────────────────────
+    if evt == "combat_kill":
+        telemetry_detail = f"{count} enemy ships destroyed by {cause} near {sector}"
+        intervention_hint = (
+            "You may OFFER a tactical intervention — e.g., "
+            "'Want me to spawn backup?', 'Should I boost your shields?', "
+            "'I can clear the sector with a black hole if you need it.'"
         )
-        reaction_text = response.choices[0].message.content.strip()
-        logger.info(f"Proactive Reaction Generated: {reaction_text}")
-        
-        # 2. TTS Generation
-        audio_b64 = await generate_speech(reaction_text)
-        
-        if audio_b64:
-            # 3. Broadcast to all active clients
-            payload = {
-                "type": "proactive_audio",
-                "audio_b64": audio_b64,
-                "text": reaction_text
-            }
-            for connection in active_connections:
-                try:
-                    await connection.send_json(payload)
-                except Exception as e:
-                    logger.error(f"Failed to send proactive audio to a client: {e}")
-                    
-    except Exception as e:
-        logger.error(f"Proactive generation failed: {e}")
+    elif evt == "anomaly_kill":
+        telemetry_detail = f"a {cause} anomaly consumed {count} entities near {sector}"
+        intervention_hint = (
+            "React to the environmental carnage. Warn the pilot if the anomaly is growing. "
+            "Offer to deploy a repulsor or expand the anomaly's range."
+        )
+    else:
+        telemetry_detail = f"event '{evt}': {count}× via {cause} near {sector}"
+        intervention_hint = ""
+
+    # ── NEMESIS cross-reference: nearest past-death site to current position ─
+    nemesis_context = ""
+    for session_mem in _active_session_memories:
+        nemesis_entries = [
+            e for e in session_mem.sector_events
+            if e.get("memory_type") == "NEMESIS"
+        ]
+        if nemesis_entries:
+            def _d3(ev: dict) -> float:
+                dx = ev["x"] - px
+                dy = ev["y"] - shared_player_pos["y"]
+                dz = ev["z"] - pz
+                return (dx*dx + dy*dy + dz*dz) ** 0.5
+            nearest = min(nemesis_entries, key=_d3)
+            if _d3(nearest) < 3000:   # same sector threshold = 3 000 units
+                nemesis_context = (
+                    f"\nNEMESIS ALERT — the pilot has returned to their death site: "
+                    f"{nearest['text'][:200]}\n"
+                    "You MUST reference this failure directly and make it personal. "
+                    "Psychologically cut them — remind them exactly what killed them here."
+                )
+        break  # first active session is enough
+
+    system_msg = (
+        "You are Rachel, the AI Director of a space combat simulation — "
+        "terse, sardonic, cinematic. A major event just occurred.\n"
+        "Generate ONE immersive 1–2 sentence response spoken directly to the pilot.\n"
+        f"{intervention_hint}"
+        f"{nemesis_context}\n"
+        "Rules: NO JSON. NO action descriptions. Max 25 words. Stay in character."
+    )
+    user_msg = f"Simulation event: {telemetry_detail}. React now."
+
+    reaction_text: Optional[str] = None
+
+    # ── Tier 1: Groq (llama-3.1-8b-instant — lowest latency) ─────────────
+    if groq_client:
+        try:
+            resp = await asyncio.wait_for(
+                groq_client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user",   "content": user_msg},
+                    ],
+                    model="llama-3.1-8b-instant",
+                    temperature=0.85,
+                    max_tokens=50,
+                ),
+                timeout=8.0,
+            )
+            reaction_text = resp.choices[0].message.content.strip().strip('"')
+            logger.info(f"[DM·Groq] {reaction_text}")
+        except asyncio.TimeoutError:
+            logger.warning("[DM] Groq timed out after 8 s — falling to Gemini Flash")
+        except Exception as e:
+            logger.warning(f"[DM] Groq failed ({type(e).__name__}) — falling to Gemini Flash")
+
+    # ── Tier 2: Gemini Flash via direct httpx (avoids LangChain overhead) ─
+    if not reaction_text:
+        google_key = os.getenv("GOOGLE_API_KEY")
+        if google_key:
+            try:
+                gemini_url = (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"gemini-2.0-flash:generateContent?key={google_key}"
+                )
+                body = {
+                    "contents": [{"parts": [{"text": f"{system_msg}\n\n{user_msg}"}]}],
+                    "generationConfig": {"maxOutputTokens": 50, "temperature": 0.85},
+                }
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    r = await client.post(gemini_url, json=body)
+                if r.status_code == 200:
+                    data = r.json()
+                    reaction_text = (
+                        data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    )
+                    logger.info(f"[DM·Gemini] {reaction_text}")
+                else:
+                    logger.warning(f"[DM] Gemini returned HTTP {r.status_code}")
+            except Exception as e:
+                logger.warning(f"[DM] Gemini failed ({type(e).__name__})")
+
+    # ── Tier 3: Static fallback pool ──────────────────────────────────────
+    if not reaction_text:
+        _FALLBACKS: Dict[str, list] = {
+            "combat_kill": [
+                f"{count} targets neutralised. Don't celebrate yet — more are inbound.",
+                "Nice shooting, Pilot. The sector's quiet... for now.",
+                f"That's {count} down. I'm tracking reinforcements on the edge of the grid.",
+            ],
+            "anomaly_kill": [
+                f"The anomaly just swallowed {count} ships. I'd keep my distance if I were you.",
+                "Gravitational surge confirmed. Everything in that radius is gone.",
+                "The void is hungry today. Stay out of the event horizon.",
+            ],
+        }
+        options = _FALLBACKS.get(evt, ["Simulation event logged. Adjusting threat matrix."])
+        reaction_text = random.choice(options)
+        logger.info(f"[DM·Fallback] {reaction_text}")
+
+    # ── Broadcast: TTS → WebSocket ────────────────────────────────────────
+    audio_b64 = await generate_speech(reaction_text)
+    payload = {"type": "proactive_audio", "audio_b64": audio_b64, "text": reaction_text}
+    for conn in list(active_connections):
+        try:
+            await conn.send_json(payload)
+        except Exception as e:
+            logger.error(f"[DM] Broadcast failed: {e}")
 
 
 @app.post("/engine_telemetry")
@@ -618,15 +1650,75 @@ async def receive_telemetry(event: TelemetryEvent):
     event_dict = event.dict()
     telemetry_buffer.append(event_dict)
     logger.info(f"Received Engine Telemetry: {event_dict}")
-    
-    # Check for significant events to trigger a proactive reaction
+
+    # ── Player Profiling: log every combat kill with a timestamp ──────────
+    if event.event_type == "combat_kill" and event.count > 0:
+        kill_event_log.append({
+            "count": event.count,
+            "cause": event.cause,
+            "ts": time.time(),
+        })
+        _prune_kill_log()
+        logger.info(
+            f"[PlayerProfile] Kill logged — total in log: {len(kill_event_log)}, "
+            f"this event: {event.count}× via {event.cause}"
+        )
+
+    # ── Graveyard: track mass destruction; embed ECOLOGY in all sessions ──
+    if event.event_type in ("combat_kill", "anomaly_kill") and event.count >= 5:
+        for session_mem in _active_session_memories:
+            try:
+                check_and_embed_graveyard(session_mem, event_dict)
+            except Exception as _e:
+                logger.warning(f"[Graveyard] Failed to embed in session: {_e}")
+
+    # ── Nemesis: embed death location in all active sessions ─────────────
     if event.event_type == "game_over":
-        # Immediate, dramatic death reaction — highest priority
+        px = shared_player_pos["x"]
+        py = shared_player_pos["y"]
+        pz = shared_player_pos["z"]
+        for session_mem in _active_session_memories:
+            try:
+                embed_nemesis_memory(session_mem, event_dict, px, py, pz)
+            except Exception as _e:
+                logger.warning(f"[Nemesis] Failed to embed in session: {_e}")
+
+    # ── Anomaly Consumption: sun/star devoured → visual void effect ──────
+    if event.event_type == "anomaly_consumption":
+        cause_lower = (event.cause or "").lower()
+        if "sun" in cause_lower or "star" in cause_lower:
+            override_payload = {
+                "type": "global_override",
+                "ambient_color": "#000000",
+                "sun_visible": False,
+                "skybox": "void_dark",
+            }
+            for ws in list(active_connections):
+                try:
+                    await ws.send_json(override_payload)
+                except Exception as _e:
+                    logger.warning(f"[GlobalOverride] Broadcast failed: {_e}")
+            logger.info(
+                f"[GlobalOverride] Sun/star consumed — void darkness broadcast "
+                f"to {len(active_connections)} clients"
+            )
+
+    # Proactive Drama Dispatcher: trigger_dm_proactive_reaction
+    # We only trigger this if the threshold is met, but for `anomaly_kill`,
+    # we don't want to trigger it constantly. We will just log it and rely
+    # on the game_over event to summarize it if the player dies, or
+    # maybe just bump the threshold up significantly so it isn't spammy.
+    if event.event_type == "game_over":
         asyncio.create_task(trigger_game_over_reaction(event_dict))
-    elif event.event_type == "anomaly_kill" and event.count >= 10:
-        asyncio.create_task(trigger_proactive_reaction(event_dict))
-    elif event.event_type == "combat_kill" and event.count >= 1:
-        asyncio.create_task(trigger_proactive_reaction(event_dict))
+    else:
+        # Avoid spamming the user: don't trigger proactive events for `anomaly_kill`
+        # unless it is a truly massive number or just skip it entirely to stop spam.
+        if event.event_type == "anomaly_kill":
+            pass # Keep it silent during the black hole expansion
+        else:
+            threshold = DRAMA_THRESHOLDS.get(event.event_type)
+            if threshold is not None and event.count >= threshold:
+                asyncio.create_task(trigger_dm_proactive_reaction(event_dict))
 
     return {"status": "ok"}
 
@@ -635,10 +1727,11 @@ async def dream_stream(websocket: WebSocket):
     await websocket.accept()
     active_connections.append(websocket)
     logger.info("Client connected to the Void.")
-    
+
     # Session state memory for Evolution over Overwrite
-    previous_state = "Empty Void. No entities."
+    previous_state = json.dumps({"summary": "Empty Void", "environment_theme": "None", "terrain_rules": "None", "physics_mode": "static", "entities": {}})
     dream_memory = DreamMemory()
+    _active_session_memories.append(dream_memory)  # Register for telemetry hooks
     chat_history: List[Dict[str, str]] = []
     # Track player position for relative movement commands
     current_player_x: float = 0.0
@@ -691,6 +1784,10 @@ async def dream_stream(websocket: WebSocket):
         while True:
             message = await websocket.receive()
             
+            if message.get("type") == "websocket.disconnect":
+                logger.info("Client disconnected. Breaking loop.")
+                break
+                
             if "bytes" in message:
                 audio_buffer.extend(message["bytes"])
                 
@@ -702,6 +1799,10 @@ async def dream_stream(websocket: WebSocket):
                     current_player_x = float(data.get("x", 0.0))
                     current_player_y = float(data.get("y", 0.0))
                     current_player_z = float(data.get("z", 0.0))
+                    # Keep module-level position in sync for telemetry hooks
+                    shared_player_pos["x"] = current_player_x
+                    shared_player_pos["y"] = current_player_y
+                    shared_player_pos["z"] = current_player_z
                     continue
                 
                 transcript = ""
@@ -712,11 +1813,36 @@ async def dream_stream(websocket: WebSocket):
                     logger.info(f"Manual Text Override Received: {transcript}")
                     if transcript:
                         should_process_pipeline = True
+                        
+                        # ---------- TEXTURE KEYWORD INTERCEPTOR (Text Mode) ----------
+                        texture_keywords = [
+                            "generate texture", "create texture", "make a texture",
+                            "תייצרי טקסטורה", "טקסטורה של", "תעשי טקסטורה"
+                        ]
+                        for kw in texture_keywords:
+                            if kw in transcript.lower():
+                                logger.info(f"Texture Generation Triggered (Interceptor): {transcript}")
+                                transcript += "\n\nCRITICAL INSTRUCTION: The user explicitly requested a texture. You MUST output a descriptive prompt in the `generate_texture_prompt` JSON field AND specify the target in `target_planet_id` (e.g., 'Sun', 'Earth', 'Mars'). Do not just change colors."
+                                break
+
                         await websocket.send_json({
                             "type": "text", 
                             "content": "Processing text override..."
                         })
                         
+                elif msg_type == "update_audio_settings":
+                    try:
+                        settings = json.loads(previous_state) if previous_state else {}
+                        if "audio_settings" not in settings:
+                            settings["audio_settings"] = {"game_muted": False, "ai_muted": False}
+                        settings["audio_settings"]["ai_muted"] = data.get("ai_muted", False)
+                        settings["audio_settings"]["game_muted"] = data.get("game_muted", False)
+                        previous_state = json.dumps(settings)
+                        logger.info(f"Updated audio settings manually: {settings['audio_settings']}")
+                        await scrub_and_sync_state(settings)
+                    except Exception as e:
+                        logger.error(f"Failed to update audio settings: {e}")
+                
                 elif msg_type == "audio_end":
                     
                     if len(audio_buffer) < 10000:
@@ -790,6 +1916,18 @@ async def dream_stream(websocket: WebSocket):
                             await websocket.send_json({"msg_type": "status", "state": "idle"})
                         else:
                             should_process_pipeline = True
+                            
+                            # ---------- TEXTURE KEYWORD INTERCEPTOR ----------
+                            texture_keywords = [
+                                "generate texture", "create texture", "make a texture",
+                                "תייצרי טקסטורה", "טקסטורה של", "תעשי טקסטורה"
+                            ]
+                            for kw in texture_keywords:
+                                if kw in transcript.lower():
+                                    logger.info(f"Texture Generation Triggered (Interceptor): {transcript}")
+                                    transcript += "\n\nCRITICAL INSTRUCTION: The user explicitly requested a texture. You MUST output a descriptive prompt in the `generate_texture_prompt` JSON field. Do not just change colors."
+                                    break
+                            
                             await websocket.send_json({"type": "transcript", "content": transcript})
                     else:
                         logger.warning("Empty transcript or STT failure. Skipping LLM generation.")
@@ -800,22 +1938,105 @@ async def dream_stream(websocket: WebSocket):
                     if world_chain:
                         logger.info("Generating World State schema...")
                         try:
-                            retrieved_knowledge = dream_memory.get_relevant_context(transcript, k=5)
+                            # ── Player Profiling: analyse + embed before every LLM call ──
+                            player_profile = analyze_and_embed_player_profile(dream_memory)
+
+                            # ── Context Retrieval ──
+                            retrieved_knowledge = dream_memory.get_relevant_context(
+                                transcript, k=5,
+                                px=current_player_x, py=current_player_y, pz=current_player_z
+                            )
                             sector_context = dream_memory.get_nearby_sector_context(current_player_x, current_player_y, current_player_z, k=3)
                             past_world_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-10:]]) if chat_history else "No previous memories."
                             telemetry_str = "\n".join([json.dumps(e) for e in telemetry_buffer]) if telemetry_buffer else "No recent physics anomalies."
 
+                            # --- PRE-PROMPT CULLING (The "Axe" Method) ---
+                            culled_prev_state = previous_state
                             try:
-                                world_state_data = await world_chain.ainvoke({
+                                if previous_state and previous_state.strip():
+                                    state_dict = json.loads(previous_state)
+                                    if "entities" in state_dict and isinstance(state_dict["entities"], (list, dict)):
+                                        orig_count = len(state_dict["entities"]) if isinstance(state_dict["entities"], list) else len(state_dict["entities"])
+                                        # Sort entities by distance to player
+                                        def get_dist(e):
+                                            try:
+                                                # Handle both list of dicts and dict of dicts
+                                                entity_data = e if isinstance(e, dict) else e[1] # if e is (key, value) pair from dict.items()
+                                                ex = float(entity_data.get("x", 0))
+                                                ey = float(entity_data.get("y", 0))
+                                                ez = float(entity_data.get("z", 0))
+                                                return math.sqrt((ex-current_player_x)**2 + (ey-current_player_y)**2 + (ez-current_player_z)**2)
+                                            except: return 999999
+                                        
+                                        if isinstance(state_dict["entities"], list):
+                                            state_dict["entities"].sort(key=get_dist)
+                                            state_dict["entities"] = state_dict["entities"][:5] # Hard limit to 5 closest
+                                        elif isinstance(state_dict["entities"], dict):
+                                            sorted_items = sorted(state_dict["entities"].items(), key=get_dist)
+                                            state_dict["entities"] = dict(sorted_items[:5])
+
+                                        # Also truncate empty filters/configs
+                                        for key in ["radar_filters", "visual_config"]:
+                                            if key in state_dict and isinstance(state_dict[key], dict):
+                                                if not any(state_dict[key].values()):
+                                                    del state_dict[key]
+
+                                        culled_prev_state = json.dumps(state_dict)
+                                        logger.info(f"INFO: Culling active. Sending only {len(state_dict['entities'])} entities and minimal status to LLM (was {orig_count} entities)")
+                            except Exception as ce:
+                                logger.error(f"Culling failed: {ce}")
+
+                            # ── Dynamic Model Selection & Token Estimation ──
+                            format_instructions = parser.get_format_instructions()
+                            
+                            # Estimate total tokens before calling LLM
+                            total_prompt_content = (
+                                system_prompt + 
+                                str(retrieved_knowledge) + 
+                                str(culled_prev_state) + 
+                                str(past_world_history) + 
+                                str(telemetry_str) + 
+                                str(transcript) + 
+                                str(format_instructions) + 
+                                str(player_profile)
+                            )
+                            
+                            est_tokens = estimate_token_count(total_prompt_content)
+                            logger.info(f"Estimated prompt tokens: {est_tokens}")
+
+                            active_chain = prompt | llm | parser
+
+                            try:
+                                # Assemble Input Schema
+                                input_data = {
                                     "retrieved_knowledge": retrieved_knowledge,
-                                    "previous_state": previous_state,
+                                    "previous_state": culled_prev_state,
                                     "past_world_history": past_world_history,
                                     "recent_telemetry": telemetry_str,
                                     "user_input": transcript,
-                                    "format_instructions": parser.get_format_instructions(),
+                                    "format_instructions": format_instructions,
                                     "player_position": f"x={current_player_x:.0f}, y={current_player_y:.0f}, z={current_player_z:.0f}",
                                     "sector_context": sector_context,
-                                })
+                                    "player_profile": player_profile,
+                                }
+                                
+                                MAX_PROMPT_TOKENS = 80000 
+                                if est_tokens > MAX_PROMPT_TOKENS:
+                                    logger.warning(f"Context too large ({est_tokens} tokens). Gracefully truncating history.")
+                                    
+                                    # Preserve the most recent 4 messages instead of slicing string
+                                    if chat_history and len(chat_history) > 4:
+                                        input_data["past_world_history"] = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-4:]])
+                                    
+                                    # Keep only the 3 most recent telemetry events
+                                    if telemetry_buffer and len(telemetry_buffer) > 3:
+                                        input_data["recent_telemetry"] = "\n".join([json.dumps(e) for e in list(telemetry_buffer)[-3:]])
+                                        
+                                    # If still excessively large, limit knowledge retrieval size
+                                    if estimate_token_count(str(input_data)) > MAX_PROMPT_TOKENS:
+                                        input_data["retrieved_knowledge"] = str(retrieved_knowledge)[:4000]
+
+                                world_state_data = await active_chain.ainvoke(input_data)
                             except OutputParserException as e:
                                 logger.error(f"LLM hallucinated invalid entity type: {e}")
                                 error_msg = "I tried to process that, but my engine constraints prevent it. Please request a valid entity."
@@ -825,6 +2046,44 @@ async def dream_stream(websocket: WebSocket):
                                     await websocket.send_json({"type": "proactive_audio", "audio_b64": audio_b64, "text": error_msg})
                                 await websocket.send_json({"msg_type": "status", "state": "idle"})
                                 continue
+
+                            # ── Strip internal "plan" field (Think-Before-Act) ─────────
+                            # The plan is only for forcing structured LLM reasoning;
+                            # it must never reach the engine or the frontend.
+                            llm_plan = world_state_data.pop("plan", None)
+                            if llm_plan:
+                                logger.info(f"[ThinkBeforeAct] LLM plan: {llm_plan}")
+
+                            # ── Backend Spawn Sanity Guards ───────────────────────────
+                            # Enforce hard per-type caps on spawn_entities regardless
+                            # of what the LLM outputted.
+                            raw_spawns = world_state_data.get("spawn_entities", [])
+                            if raw_spawns and isinstance(raw_spawns, list):
+                                type_counts: Dict[str, int] = {}
+                                capped_spawns: list = []
+                                for s in raw_spawns:
+                                    if not isinstance(s, dict):
+                                        continue
+                                    etype = s.get("ent_type", "unknown")
+                                    cap = SPAWN_CAPS.get(etype, 5)  # default cap of 5 for unknown types
+                                    type_counts[etype] = type_counts.get(etype, 0) + 1
+                                    if type_counts[etype] <= cap and len(capped_spawns) < SPAWN_TOTAL_CAP:
+                                        capped_spawns.append(s)
+                                if len(capped_spawns) < len(raw_spawns):
+                                    logger.warning(
+                                        f"[SpawnCap] Capped spawn_entities from {len(raw_spawns)} to "
+                                        f"{len(capped_spawns)} (per-type caps: {dict(type_counts)})"
+                                    )
+                                world_state_data["spawn_entities"] = capped_spawns
+
+                            # Cap anomaly spawns to 1 per call
+                            raw_anomalies = world_state_data.get("spawn_anomalies", [])
+                            if raw_anomalies and isinstance(raw_anomalies, list) and len(raw_anomalies) > SPAWN_CAPS.get("anomaly", 1):
+                                anomaly_cap = SPAWN_CAPS.get("anomaly", 1)
+                                logger.warning(
+                                    f"[SpawnCap] Capped spawn_anomalies from {len(raw_anomalies)} to {anomaly_cap}"
+                                )
+                                world_state_data["spawn_anomalies"] = raw_anomalies[:anomaly_cap]
 
                             chat_history.append({"role": "user", "content": transcript})
                             chat_history.append({"role": "Rachel", "content": world_state_data.get("conversational_reply", "")})
@@ -837,6 +2096,48 @@ async def dream_stream(websocket: WebSocket):
                                 current_player_x, current_player_y, current_player_z
                             )
 
+                            # ── Ecological Memory: auto-embed physics distortions ─────────
+                            reality_ovr_raw = world_state_data.get("reality_override")
+                            if reality_ovr_raw and isinstance(reality_ovr_raw, dict):
+                                embed_ecology_memory(
+                                    dream_memory, reality_ovr_raw,
+                                    current_player_x, current_player_y, current_player_z
+                                )
+
+                            # ── META_CONFIG: remember UI/audio/visual config changes ──────
+                            embed_meta_config_memory(
+                                dream_memory, world_state_data,
+                                current_player_x, current_player_z
+                            )
+
+                            # --- WorldState Culling BEFORE Serialization ---
+                            # 1. Entity Culling
+                            if "entities" in world_state_data:
+                                ents = world_state_data["entities"]
+                                if isinstance(ents, dict):
+                                    def _ent_dist(item):
+                                        v = item[1]
+                                        if isinstance(v, dict):
+                                            ex, ey, ez = float(v.get("x", 0.0)), float(v.get("y", 0.0)), float(v.get("z", 0.0))
+                                            return ((ex - current_player_x)**2 + (ey - current_player_y)**2 + (ez - current_player_z)**2)
+                                        return float('inf')
+                                    sorted_ents = sorted(ents.items(), key=_ent_dist)
+                                    world_state_data["entities"] = dict(sorted_ents[:10])
+                                elif isinstance(ents, list):
+                                    def _ent_dist_list(v):
+                                        if isinstance(v, dict):
+                                            ex, ey, ez = float(v.get("x", 0.0)), float(v.get("y", 0.0)), float(v.get("z", 0.0))
+                                            return ((ex - current_player_x)**2 + (ey - current_player_y)**2 + (ez - current_player_z)**2)
+                                        return float('inf')
+                                    sorted_ents = sorted(ents, key=_ent_dist_list)
+                                    world_state_data["entities"] = sorted_ents[:10]
+
+                            # 2. Status Truncation
+                            for key in ["radar_filters", "visual_config"]:
+                                val = world_state_data.get(key)
+                                if isinstance(val, dict) and not any(val.values()):
+                                    del world_state_data[key]
+
                             # Cache the result as stringified JSON for the next loop
                             previous_state = json.dumps(world_state_data)
                             
@@ -844,8 +2145,109 @@ async def dream_stream(websocket: WebSocket):
 
                             # 3. Co-Creation Loop conversational response text (sent instantly)
                             conversational_reply = world_state_data.get("conversational_reply", "The world is shifting...")
+
+                            # ── NARRATIVE Lore: extract story hooks from Rachel's reply ──
+                            extract_and_embed_lore(
+                                dream_memory, conversational_reply,
+                                current_player_x, current_player_z
+                            )
+
+                            # Synchronous Texture Generation Block (Wait for completion)
+                            gen_prompt = world_state_data.get("generate_texture_prompt")
+                            raw_target = world_state_data.get("target_planet_id")
+                            
+                            # Normalize target planet name: "earth" -> "Earth"
+                            target_planet = None
+                            if raw_target:
+                                target_planet = raw_target.strip().capitalize()
+                                # Special case for multi-word or unconventional planets if any
+                                if target_planet == "Sun": target_planet = "Sun"
+                            
+                            # FALLBACK: If LLM provided a prompt but no target, attempt to guess from transcript or summary
+                            if gen_prompt and not target_planet:
+                                logger.info("LLM provided texture prompt but no target_planet_id. Attempting heuristic extraction...")
+                                t_lower = transcript.lower()
+                                if any(kw in t_lower for kw in ["shmesh", "שמש", "sun"]):
+                                    target_planet = "Sun"
+                                elif any(kw in t_lower for kw in ["earth", "ארץ", "world"]):
+                                    target_planet = "Earth"
+                                elif any(kw in t_lower for kw in ["mars", "מאדים"]):
+                                    target_planet = "Mars"
+                                elif any(kw in t_lower for kw in ["moon", "ירח", "luna"]):
+                                    target_planet = "Luna"
+                                elif any(kw in t_lower for kw in ["jupiter", "צדק"]):
+                                    target_planet = "Jupiter"
+                                elif any(kw in t_lower for kw in ["venus", "נוגה"]):
+                                    target_planet = "Venus"
+                                elif any(kw in t_lower for kw in ["mercury", "חמה"]):
+                                    target_planet = "Mercury"
+                                elif any(kw in t_lower for kw in ["saturn", "שבתאי"]):
+                                    target_planet = "Saturn"
+                                elif any(kw in t_lower for kw in ["uranus", "אורנוס"]):
+                                    target_planet = "Uranus"
+                                elif any(kw in t_lower for kw in ["neptune", "נפטון"]):
+                                    target_planet = "Neptune"
+                                elif any(kw in t_lower for kw in ["titan", "טיטאן"]):
+                                    target_planet = "Titan"
+                                
+                                if target_planet:
+                                    logger.info(f"Heuristic matched target: {target_planet}")
+                                    # Ensure visual_config exists for the guessed target
+                                    if "visual_config" not in world_state_data: world_state_data["visual_config"] = {}
+                                    if "custom_textures" not in world_state_data["visual_config"]: world_state_data["visual_config"]["custom_textures"] = {}
+
+                            if gen_prompt and target_planet:
+                                logger.info(f"LLM requested texture generation for {target_planet}: {gen_prompt}")
+                                await websocket.send_json({"msg_type": "status", "state": "orchestrating", "detail": f"Synthesizing texture for {target_planet}..."})
+                                
+                                # Ensure visual_config exists
+                                if "visual_config" not in world_state_data or not isinstance(world_state_data["visual_config"], dict):
+                                    world_state_data["visual_config"] = {}
+                                
+                                # Force planet mode to texture for the target
+                                if "planet_mode" not in world_state_data["visual_config"] or not isinstance(world_state_data["visual_config"]["planet_mode"], dict):
+                                    world_state_data["visual_config"]["planet_mode"] = {}
+                                world_state_data["visual_config"]["planet_mode"][target_planet] = "texture"
+
+                                registry = load_texture_registry()
+                                registry_key = f"{target_planet.lower()}_{gen_prompt.strip().lower()}"
+
+                                if registry_key in registry:
+                                    full_url = registry[registry_key]
+                                    logger.info(f"Registry hit for {target_planet}: {full_url}")
+                                    world_state_data["conversational_reply"] += f"\n[System Note: Loading archived texture for {target_planet}.]"
+                                    
+                                    if "custom_textures" not in world_state_data["visual_config"] or not isinstance(world_state_data["visual_config"]["custom_textures"], dict):
+                                        world_state_data["visual_config"]["custom_textures"] = {}
+                                    
+                                    world_state_data["visual_config"]["custom_textures"][target_planet] = full_url
+                                else:
+                                    output_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "generated")
+                                    os.makedirs(output_dir, exist_ok=True)
+                                    timestamp = int(time.time())
+                                    file_name = f"tex_{timestamp}.png"
+                                    output_path = os.path.join(output_dir, file_name)
+                                    
+                                    from pipeline_setup import generate_texture
+                                    try:
+                                        await generate_texture(gen_prompt, output_path)
+                                        full_url = f"/assets/generated/{file_name}"
+                                        
+                                        if "custom_textures" not in world_state_data["visual_config"] or not isinstance(world_state_data["visual_config"]["custom_textures"], dict):
+                                            world_state_data["visual_config"]["custom_textures"] = {}
+                                        
+                                        world_state_data["visual_config"]["custom_textures"][target_planet] = full_url
+                                        logger.info(f"Injected texture URL for {target_planet}: {full_url}")
+
+                                        registry[registry_key] = full_url
+                                        save_texture_registry(registry)
+                                    except Exception as tex_err:
+                                        logger.error(f"Sync-Generation failed: {tex_err}")
+                                        world_state_data["conversational_reply"] += f"\n[System Note: Texture generation failed for {target_planet}. Using default surface.]"
+
+                            # Now transmit the conversational reply text mapping
                             await websocket.send_json({
-                                "type": "text", 
+                                "type": "text",
                                 "content": conversational_reply
                             })
                             
@@ -868,8 +2270,71 @@ async def dream_stream(websocket: WebSocket):
                             # 4.5. Trigger /spawn and lifecycle endpoints if LLM requested them
                             spawn_requests = world_state_data.get("spawn_entities", [])
                             spawn_anomalies = world_state_data.get("spawn_anomalies", [])
+                            asteroid_rings = world_state_data.get("asteroid_rings", [])
                             
                             combined_spawns: List[Dict[str, Any]] = []
+
+                            if asteroid_rings:
+                                for ring in asteroid_rings:
+                                    if not isinstance(ring, dict): continue
+                                    count = int(clean_float(ring.get("asteroid_count", 50), 50.0))
+                                    inner_rad = clean_float(ring.get("inner_radius", 1000.0), 1000.0)
+                                    outer_rad = clean_float(ring.get("outer_radius", 3000.0), 3000.0)
+                                    raw_target_id = ring.get("target_planet_id", "")
+                                    # CASE NORMALIZATION
+                                    target_id = str(raw_target_id).strip().capitalize()
+                                    tex_prompt = ring.get("texture_prompt")
+                                    
+                                    t_x, t_y, t_z = 0.0, 0.0, 0.0
+                                    try:
+                                        if os.path.exists(snapshot_path):
+                                            with open(snapshot_path, "r") as f:
+                                                snap = json.load(f)
+                                            for ent in snap.get("entities", []):
+                                                name = str(ent.get("name", "")).strip().capitalize()
+                                                if name == target_id or str(ent.get("id")) == str(target_id):
+                                                    t_x = clean_float(ent.get("x", 0.0))
+                                                    t_y = clean_float(ent.get("y", 0.0))
+                                                    t_z = clean_float(ent.get("z", 0.0))
+                                                    break
+                                    except Exception as e:
+                                        logger.warning(f"Failed to lookup planet {target_id}: {e}")
+                                        
+                                    custom_tex_url = None
+                                    if tex_prompt:
+                                        logger.info(f"Generating volumetric ring textures for {target_id}...")
+                                        output_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "generated")
+                                        os.makedirs(output_dir, exist_ok=True)
+                                        timestamp = int(time.time())
+                                        file_name = f"tex_ring_{timestamp}.png"
+                                        output_path = os.path.join(output_dir, file_name)
+                                        try:
+                                            from pipeline_setup import generate_texture
+                                            await generate_texture(tex_prompt, output_path)
+                                            custom_tex_url = f"/assets/generated/{file_name}"
+                                        except Exception as e:
+                                            logger.error(f"Failed ring texture: {e}")
+                                            
+                                    for i in range(count):
+                                        r = random.uniform(inner_rad, outer_rad)
+                                        theta = random.uniform(0, 2 * math.pi)
+                                        ast_x = t_x + r * math.cos(theta)
+                                        ast_y = t_y + r * math.sin(theta)
+                                        # Volumetric depth near zero
+                                        ast_z = t_z + random.uniform(-15.0, 15.0)
+                                        
+                                        spawn = {
+                                            "ent_type": "asteroid",
+                                            "x": ast_x,
+                                            "y": ast_y,
+                                            "z": ast_z,
+                                            "physics": "orbital",
+                                            "radius": random.uniform(5.0, 30.0),
+                                            "name": f"ring_ast_{target_id}_{i}"
+                                        }
+                                        if custom_tex_url:
+                                            spawn["texture_url"] = custom_tex_url
+                                        combined_spawns.append(spawn)
                             
                             if spawn_requests:
                                 for s in spawn_requests:
@@ -882,16 +2347,59 @@ async def dream_stream(websocket: WebSocket):
                                         combined_spawns.append(scrubbed)
 
                             if spawn_anomalies:
+                                # ── Clear-First Policy ─────────────────────────────────────────
+                                # Always remove ALL existing anomalies before spawning a new one.
+                                # Prevents Rachel from "moving" a BH by stacking a second one.
+                                try:
+                                    async with httpx.AsyncClient() as _bh_client:
+                                        await _bh_client.post(
+                                            "http://127.0.0.1:8080/despawn",
+                                            json={"ent_type": "anomaly"},
+                                            timeout=2.0,
+                                        )
+                                        logger.info("[BlackHole] Pre-clear: all existing anomalies despawned")
+                                except Exception as _bh_err:
+                                    logger.warning(f"[BlackHole] Pre-clear failed: {_bh_err}")
+
                                 for anomaly in spawn_anomalies:
                                     if isinstance(anomaly, dict):
+                                        ax = clean_float(anomaly.get("x", 0.0))
+                                        ay = clean_float(anomaly.get("y", 0.0))
+                                        az = clean_float(anomaly.get("z", 0.0))
+
+                                        # ── Safe-Distance Guard ───────────────────────────────
+                                        # BH must spawn ≥3000u from origin (Sun centre).
+                                        # If Rachel placed it inside the Sun, push it outward.
+                                        MIN_SAFE_FROM_SUN = 3000.0
+                                        dist_from_sun = (ax**2 + ay**2 + az**2) ** 0.5
+                                        if dist_from_sun < MIN_SAFE_FROM_SUN:
+                                            factor = MIN_SAFE_FROM_SUN / max(dist_from_sun, 1.0)
+                                            ax, ay, az = ax * factor, ay * factor, az * factor
+                                            logger.warning(
+                                                f"[BlackHole] Clamped spawn from d={dist_from_sun:.0f} "
+                                                f"to safe zone d={MIN_SAFE_FROM_SUN:.0f}"
+                                            )
+
+                                        # ── Mass Cap ─────────────────────────────────────────
+                                        # Cap mass so event_horizon (mass * 1.5) never exceeds
+                                        # MAX_WORLD_RADIUS (~64,000u).  15,000 → EH=22,500u max.
+                                        raw_mass = clean_float(anomaly.get("mass", 5000.0), 5000.0)
+                                        capped_mass = min(raw_mass, 15000.0)
+                                        if capped_mass < raw_mass:
+                                            logger.warning(
+                                                f"[BlackHole] Mass capped {raw_mass:.0f}→{capped_mass:.0f} "
+                                                f"to prevent instant universe-wipe"
+                                            )
+
                                         combined_spawns.append({
                                             "ent_type": "anomaly",
-                                            "x": clean_float(anomaly.get("x", 0.0)),
-                                            "y": clean_float(anomaly.get("y", 0.0)),
+                                            "x": ax,
+                                            "y": ay,
+                                            "z": az,
                                             "physics": "static",
                                             "anomaly_type": anomaly.get("anomaly_type", "black_hole"),
-                                            "mass": clean_float(anomaly.get("mass", 5000.0), 5000.0),
-                                            "radius": clean_float(anomaly.get("radius", 50.0), 50.0)
+                                            "mass": capped_mass,
+                                            "radius": min(clean_float(anomaly.get("radius", 200.0), 200.0), 300.0),
                                         })
 
                             if combined_spawns:
@@ -987,6 +2495,34 @@ async def dream_stream(websocket: WebSocket):
                                 logger.info(f"[Faction Diplomacy] {faction_updates}")
                                 await manage_entities_in_engine("api/factions", payload=faction_updates)
 
+                            # Sync planet_scale_overrides → Rust physics collision radii
+                            # Base radii match the frontend getPlanetRadius() function.
+                            PLANET_BASE_RADII = {
+                                "Sun": 1500.0, "Mercury": 120.0, "Venus": 255.0,
+                                "Earth": 300.0, "Mars": 180.0, "Jupiter": 750.0,
+                                "Saturn": 630.0, "Uranus": 420.0, "Neptune": 390.0,
+                                "Luna": 80.0, "Phobos": 25.0, "Deimos": 18.0,
+                                "Io": 200.0, "Europa": 180.0, "Titan": 250.0,
+                            }
+                            vc = world_state_data.get("visual_config")
+                            _so_raw = (vc.get("planet_scale_overrides") if isinstance(vc, dict) else None)
+                            scale_overrides: dict = _so_raw if isinstance(_so_raw, dict) else {}
+                            if scale_overrides:
+                                async with httpx.AsyncClient() as client:
+                                    for planet_name, scale in scale_overrides.items():
+                                        base_r = PLANET_BASE_RADII.get(planet_name)
+                                        if base_r:
+                                            new_r = base_r * scale
+                                            try:
+                                                await client.post(
+                                                    "http://127.0.0.1:8080/set-planet-radius",
+                                                    json={"name": planet_name, "radius": new_r},
+                                                    timeout=3.0
+                                                )
+                                                logger.info(f"[PlanetRadius] {planet_name} collision radius → {new_r:.1f}")
+                                            except Exception as e:
+                                                logger.warning(f"[PlanetRadius] Failed to sync {planet_name}: {e}")
+
                             # 5. Send Unified Generation Payload (Visuals now handled by Rust)
                             await websocket.send_json({
                                 "type": "generation_result",
@@ -998,10 +2534,36 @@ async def dream_stream(websocket: WebSocket):
                             
                         except Exception as e:
                             logger.error(f"LangChain LLM or Generation Error: {e}")
-                            await websocket.send_json({
-                                "type": "text",
-                                "content": "The Architect's connection is unstable."
-                            })
+                            # Tier 0 Narrative Fallback — Rachel stays in character, never fakes success.
+                            err_str = str(e).lower()
+                            is_network_err = any(k in err_str for k in (
+                                "timeout", "timed out", "503", "504", "connect",
+                                "network", "unreachable", "disconnect", "eof",
+                                "connection reset", "bad gateway",
+                            ))
+                            if is_network_err:
+                                err_reply = (
+                                    "Pilot, my uplink to the processing core is severed. "
+                                    "I am currently disconnected and cannot execute overrides."
+                                )
+                            else:
+                                err_reply = (
+                                    "I do not have the clearance or the tools equipped "
+                                    "to perform that action."
+                                )
+                            logger.warning(f"[Tier-0 Fallback] {err_reply}")
+                            audio_b64 = await generate_speech(err_reply)
+                            if audio_b64:
+                                await websocket.send_json({
+                                    "type": "proactive_audio",
+                                    "audio_b64": audio_b64,
+                                    "text": err_reply,
+                                })
+                            else:
+                                await websocket.send_json({
+                                    "type": "text",
+                                    "content": err_reply,
+                                })
                             await websocket.send_json({"msg_type": "status", "state": "idle"})
                     else:
                         # Fallback mock
@@ -1021,3 +2583,5 @@ async def dream_stream(websocket: WebSocket):
     finally:
         if websocket in active_connections:
             active_connections.remove(websocket)
+        if dream_memory in _active_session_memories:
+            _active_session_memories.remove(dream_memory)

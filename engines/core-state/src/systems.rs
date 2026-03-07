@@ -1,5 +1,5 @@
-use bevy_ecs::prelude::*;
 use crate::components::*;
+use bevy_ecs::prelude::*;
 
 #[derive(Resource)]
 pub struct RealityModifiersRes {
@@ -10,7 +10,7 @@ pub struct RealityModifiersRes {
 #[derive(Resource)]
 pub struct DeltaTime(pub f64);
 
-pub const MAX_WORLD_RADIUS: f64 = 32000.0;
+pub const MAX_WORLD_RADIUS: f64 = 64000.0;
 
 pub fn environmental_physics_system(
     res: Option<Res<RealityModifiersRes>>,
@@ -25,7 +25,7 @@ pub fn environmental_physics_system(
     if let Some(pc) = phys_const {
         g_constant *= pc.gravity_scale;
     }
-    
+
     for (anomaly, a_transform) in anomaly_query.iter() {
         for (mut agent, transform) in agent_query.iter_mut() {
             let dx = a_transform.x - transform.x;
@@ -33,13 +33,13 @@ pub fn environmental_physics_system(
             let dz = a_transform.z - transform.z;
             let dist_sq = dx * dx + dy * dy + dz * dz;
             let dist = dist_sq.sqrt().max(1.0);
-            
+
             // F = G * (m1*m2)/d^2.  m2 = 1.0 for agents.
             let force_mag = g_constant * anomaly.mass / dist_sq.max(100.0);
             let dir_x = dx / dist;
             let dir_y = dy / dist;
             let dir_z = dz / dist;
-            
+
             // Apply Newtonian Force to velocity
             if anomaly.anomaly_type == "repulsor" {
                 agent.velocity.0 -= dir_x * force_mag * 0.016;
@@ -49,7 +49,7 @@ pub fn environmental_physics_system(
                 agent.velocity.0 += dir_x * force_mag * 0.016;
                 agent.velocity.1 += dir_y * force_mag * 0.016;
                 agent.velocity.2 += dir_z * force_mag * 0.016;
-                
+
                 // Event Horizon Overpowering!
                 if dist < anomaly.radius * 1.5 {
                     // Completely overpower behaviors by forcing "idle" state
@@ -71,7 +71,7 @@ pub fn particle_physics_system(
     for (mut particle, mut transform) in query.iter_mut() {
         // Decrease lifespan using real elapsed time
         particle.lifespan -= dt;
-        
+
         let mut ax = 0.0;
         let mut ay = 0.0;
         let mut az = 0.0;
@@ -84,7 +84,7 @@ pub fn particle_physics_system(
                 let dz = a_transform.z - transform.z;
                 let dist_sq = dx * dx + dy * dy + dz * dz;
                 let dist = dist_sq.sqrt().max(1.0);
-                
+
                 let force_mag = g_constant * anomaly.mass / dist_sq.max(100.0);
                 ax += (dx / dist) * force_mag * 0.016;
                 ay += (dy / dist) * force_mag * 0.016;
@@ -106,11 +106,18 @@ pub fn steering_system(
     res: Option<Res<RealityModifiersRes>>,
     phys_const: Option<Res<PhysicsConstants>>,
     faction_rel: Option<Res<FactionRelations>>,
-    mut query: Query<(Entity, &mut SteeringAgent, &mut Transform, Option<&crate::components::Faction>, Option<&BirthAge>)>,
-    player_query: Query<(&Transform, &EntityType), Without<SteeringAgent>>
+    mut query: Query<(
+        Entity,
+        &mut SteeringAgent,
+        &mut Transform,
+        Option<&crate::components::Faction>,
+        Option<&BirthAge>,
+    )>,
+    player_query: Query<(&Transform, &EntityType), Without<SteeringAgent>>,
 ) {
     // PhysicsConstants.friction takes priority; fall back to RealityModifiers, then 0.95
-    let friction = phys_const.as_deref()
+    let friction = phys_const
+        .as_deref()
         .map(|pc| pc.friction)
         .unwrap_or_else(|| res.map_or(0.95, |r| r.friction));
 
@@ -119,7 +126,7 @@ pub fn steering_system(
     let mut py = 0.0;
     let mut pz = 0.0;
     let mut _player_entity_id = None;
-    
+
     for (t, et) in player_query.iter() {
         if et.0 == "player" {
             px = t.x;
@@ -133,7 +140,7 @@ pub fn steering_system(
     // 1b. Boundary Containment: Hard Clamp if player is too far (X-Z Plane)
     let p_dist = (px * px + pz * pz).sqrt();
     let mut _boundary_adjust = (0.0, 0.0, 0.0);
-    
+
     if p_dist > MAX_WORLD_RADIUS {
         // Hard position clamp on X-Z plane
         let factor = MAX_WORLD_RADIUS / p_dist;
@@ -162,9 +169,9 @@ pub fn steering_system(
             continue;
         }
 
-        let mut desired_vx = 0.0;
-        let mut desired_vy = 0.0;
-        let mut desired_vz = 0.0;
+        let mut desired_vx;
+        let mut desired_vy;
+        let mut desired_vz;
 
         // Find the best target: nearest hostile entity, or fallback to player
         let (target_x, target_y, target_z) = {
@@ -172,8 +179,10 @@ pub fn steering_system(
             let mut best_dist_sq = f64::MAX;
 
             for (i, (ax, ay, az, ref af)) in agent_positions.iter().enumerate() {
-                if i == idx { continue; } // don't target self
-                // Check hostility via FactionRelations resource; hardcoded fallback
+                if i == idx {
+                    continue;
+                } // don't target self
+                  // Check hostility via FactionRelations resource; hardcoded fallback
                 let hostile = if let Some(ref fr) = faction_rel {
                     fr.are_hostile(my_faction, af.as_str())
                 } else {
@@ -183,7 +192,9 @@ pub fn steering_system(
                         _ => false,
                     }
                 };
-                if !hostile { continue; }
+                if !hostile {
+                    continue;
+                }
                 let dx = ax - transform.x;
                 let dz = az - transform.z;
                 let dist_sq = dx * dx + dz * dz;
@@ -225,7 +236,7 @@ pub fn steering_system(
                 } else if dist < 900.0 {
                     // Good firing range — strafe perpendicular in XZ plane
                     let perp_x = -dz / dist;
-                    let perp_z =  dx / dist;
+                    let perp_z = dx / dist;
                     desired_vx = perp_x * agent.max_speed;
                     desired_vy = -(dy / dist.max(1.0)) * agent.max_speed * 0.3;
                     desired_vz = perp_z * agent.max_speed;
@@ -247,19 +258,25 @@ pub fn steering_system(
                 let cur_dx = transform.x - px;
                 let cur_dy = transform.y - py;
                 let cur_dz = transform.z - pz;
-                
-                let cur_dist = (cur_dx * cur_dx + cur_dy * cur_dy + cur_dz * cur_dz).sqrt().max(0.1);
-                
+
+                let cur_dist = (cur_dx * cur_dx + cur_dy * cur_dy + cur_dz * cur_dz)
+                    .sqrt()
+                    .max(0.1);
+
                 let target_x = px + (cur_dx / cur_dist) * 100.0;
                 let target_y = py + (cur_dy / cur_dist) * 100.0;
                 let target_z = pz + (cur_dz / cur_dist) * 100.0;
-                
+
                 let tdx = target_x - transform.x;
                 let tdy = target_y - transform.y;
                 let tdz = target_z - transform.z;
                 let tdist = (tdx * tdx + tdy * tdy + tdz * tdz).sqrt().max(0.1);
-                
-                let speed = if tdist < 50.0 { agent.max_speed * (tdist / 50.0) } else { agent.max_speed };
+
+                let speed = if tdist < 50.0 {
+                    agent.max_speed * (tdist / 50.0)
+                } else {
+                    agent.max_speed
+                };
                 desired_vx = (tdx / tdist) * speed;
                 desired_vy = (tdy / tdist) * speed;
                 desired_vz = (tdz / tdist) * speed;
@@ -300,11 +317,13 @@ pub fn steering_system(
                     sep_y /= count as f64;
                     sep_z /= count as f64;
                     // Normalize and scale separation
-                    let sep_mag = (sep_x * sep_x + sep_y * sep_y + sep_z * sep_z).sqrt().max(0.1);
+                    let sep_mag = (sep_x * sep_x + sep_y * sep_y + sep_z * sep_z)
+                        .sqrt()
+                        .max(0.1);
                     sep_x = (sep_x / sep_mag) * agent.max_speed * 1.5; // Stronger separation
                     sep_y = (sep_y / sep_mag) * agent.max_speed * 1.5;
                     sep_z = (sep_z / sep_mag) * agent.max_speed * 1.5;
-                    
+
                     desired_vx += sep_x;
                     desired_vy += sep_y;
                     desired_vz += sep_z;
@@ -320,13 +339,12 @@ pub fn steering_system(
                 desired_vz = (age * 0.4 + id * 0.7).sin() * agent.max_speed;
             }
         }
-        
+
         // Z-Bounds removed for Phase 9 full-3D deep space.
 
-        // Celestial Repulsion (Solid Walls)
-        // Note: agents are mostly on X-Z plane but we check 3D distance
-        // Simplified check: we assume planets are near Y=0
-        for (ox, oy, oz, oradius) in &[(0.0, 0.0, 0.0, 1000.0)] { // Include Sun at center
+        // Celestial Repulsion (Solid Walls / Danger Zone Avoidance)
+        for (ox, oy, oz, oradius) in &[(0.0, 0.0, 0.0, 1500.0)] {
+            // AI tries to stay 1500 units away from Sun
             let dx = transform.x - ox;
             let dy = transform.y - oy;
             let dz = transform.z - oz;
@@ -344,12 +362,12 @@ pub fn steering_system(
         let steer_x = desired_vx - agent.velocity.0;
         let steer_y = desired_vy - agent.velocity.1;
         let steer_z = desired_vz - agent.velocity.2;
-        
+
         let steer_mag = (steer_x * steer_x + steer_y * steer_y + steer_z * steer_z).sqrt();
         let mut final_steer_x = steer_x;
         let mut final_steer_y = steer_y;
         let mut final_steer_z = steer_z;
-        
+
         if steer_mag > agent.max_force {
             final_steer_x = (steer_x / steer_mag) * agent.max_force;
             final_steer_y = (steer_y / steer_mag) * agent.max_force;
@@ -361,19 +379,21 @@ pub fn steering_system(
         agent.velocity.2 += final_steer_z;
 
         // --- PHASE 8.9: HARD NORMALIZATION CLAMP ---
-        let cur_dist = (transform.x * transform.x + transform.y * transform.y + transform.z * transform.z).sqrt();
+        let cur_dist =
+            (transform.x * transform.x + transform.y * transform.y + transform.z * transform.z)
+                .sqrt();
         if cur_dist > MAX_WORLD_RADIUS {
             // Apply hard normalization clamp
             let factor = MAX_WORLD_RADIUS / cur_dist;
             transform.x *= factor;
             transform.y *= factor;
             transform.z *= factor;
-            
+
             // Zero out outward velocity component
             let nx = transform.x / MAX_WORLD_RADIUS;
             let ny = transform.y / MAX_WORLD_RADIUS;
             let nz = transform.z / MAX_WORLD_RADIUS;
-            
+
             let dot = agent.velocity.0 * nx + agent.velocity.1 * ny + agent.velocity.2 * nz;
             if dot > 0.0 {
                 agent.velocity.0 -= dot * nx;
@@ -382,17 +402,20 @@ pub fn steering_system(
             }
         }
 
-        // Requirements specifically ask to constrain the 'World'. 
+        // Requirements specifically ask to constrain the 'World'.
         // We apply it to all SteeringAgents to keep the sector clean.
-        
+
         // Limit speed
-        let speed = (agent.velocity.0 * agent.velocity.0 + agent.velocity.1 * agent.velocity.1 + agent.velocity.2 * agent.velocity.2).sqrt();
+        let speed = (agent.velocity.0 * agent.velocity.0
+            + agent.velocity.1 * agent.velocity.1
+            + agent.velocity.2 * agent.velocity.2)
+            .sqrt();
         if speed > agent.max_speed {
             agent.velocity.0 = (agent.velocity.0 / speed) * agent.max_speed;
             agent.velocity.1 = (agent.velocity.1 / speed) * agent.max_speed;
             agent.velocity.2 = (agent.velocity.2 / speed) * agent.max_speed;
         }
-        
+
         idx += 1;
     }
 }
@@ -402,11 +425,21 @@ pub fn steering_system(
 pub fn generative_physics_system(
     mut commands: Commands,
     phys_const: Option<Res<PhysicsConstants>>,
-    mut query: Query<(Entity, &mut Transform, &mut PhysicsType, Option<&BirthAge>, Option<&DeathAge>, Option<&SteeringAgent>, Option<&TargetLock>, Option<&EntityType>)>,
+    mut query: Query<(
+        Entity,
+        &mut Transform,
+        &mut PhysicsType,
+        Option<&BirthAge>,
+        Option<&DeathAge>,
+        Option<&SteeringAgent>,
+        Option<&EntityType>,
+        Option<&Parent>,
+    )>,
     player_query: Query<(&Transform, &EntityType), Without<PhysicsType>>,
-    all_entities_query: Query<(Entity, &Transform), Without<PhysicsType>>,
 ) {
-    let proj_speed_mult = phys_const.as_deref().map_or(1.0, |pc| pc.projectile_speed_mult);
+    let proj_speed_mult = phys_const
+        .as_deref()
+        .map_or(1.0, |pc| pc.projectile_speed_mult);
     // First pass: find the player's position (no longer used for centering, but kept for future proximity logic)
     let mut _px: f64 = 0.0;
     let mut _pz: f64 = 0.0;
@@ -419,7 +452,9 @@ pub fn generative_physics_system(
     }
 
     // Second pass: update all non-static entities relative to the Sun (0,0,0)
-    for (entity, mut transform, mut phys, birth_age, death_age, steering, target_lock_opt, ent_type) in query.iter_mut() {
+    for (entity, mut transform, mut phys, birth_age, death_age, steering, ent_type, parent_opt) in
+        query.iter_mut()
+    {
         let birth_factor = birth_age.map_or(1.0, |b| (b.0 / 2.0).min(1.0));
 
         // Death Implosion effect (pull towards center 0,0,0)
@@ -431,7 +466,11 @@ pub fn generative_physics_system(
         }
 
         match *phys {
-            PhysicsType::Velocity { ref mut vx, ref mut vy, ref mut vz } => {
+            PhysicsType::Velocity {
+                ref mut vx,
+                ref mut vy,
+                ref mut vz,
+            } => {
                 // Skip player movement here — it is handled with special cinematic/collision logic in main.rs
                 let is_player = ent_type.map_or(false, |et| et.0 == "player");
 
@@ -447,12 +486,15 @@ pub fn generative_physics_system(
                 }
             }
             PhysicsType::Static => {}
-            PhysicsType::Orbital { radius, speed, ref mut angle } => {
+            PhysicsType::Orbital {
+                radius,
+                speed,
+                ref mut angle,
+            } => {
                 *angle += speed * birth_factor * 0.016;
-                // Heliocentric Orbit on X-Z Plane
                 let target_x = angle.cos() * radius;
                 let target_z = angle.sin() * radius;
-                
+
                 if let Some(agent) = steering.as_ref() {
                     if agent.behavior != "idle" {
                         transform.x += agent.velocity.0 * 0.016 * 60.0;
@@ -461,15 +503,25 @@ pub fn generative_physics_system(
                         continue;
                     }
                 }
-                // Lerp back to orbit if returning from steering
-                transform.x += (target_x - transform.x) * 0.1;
-                transform.z += (target_z - transform.z) * 0.1;
-                // removed: transform.y *= 0.9; // Flatten Y to plane (Preserve 3D inclination)
+                if parent_opt.is_some() {
+                    // Child body (moon): store RELATIVE offset from parent.
+                    // main.rs fixup will add the parent planet's world position.
+                    transform.x = target_x;
+                    transform.z = target_z;
+                } else {
+                    // Top-level body (planet): heliocentric LERP
+                    transform.x += (target_x - transform.x) * 0.1;
+                    transform.z += (target_z - transform.z) * 0.1;
+                }
             }
-            PhysicsType::Sinusoidal { amplitude, frequency, ref mut time } => {
+            PhysicsType::Sinusoidal {
+                amplitude,
+                frequency,
+                ref mut time,
+            } => {
                 *time += 0.016;
                 let target_z = (*time * frequency).sin() * amplitude * birth_factor;
-                
+
                 if let Some(agent) = steering.as_ref() {
                     if agent.behavior != "idle" {
                         transform.x += agent.velocity.0 * 0.016 * 60.0;
@@ -478,9 +530,11 @@ pub fn generative_physics_system(
                         continue;
                     }
                 }
-                
+
                 transform.x += 25.0 * birth_factor * 0.016;
-                if transform.x > 1000.0 { transform.x = -1000.0; }
+                if transform.x > 1000.0 {
+                    transform.x = -1000.0;
+                }
                 transform.z += (target_z - transform.z) * 0.1;
             }
             PhysicsType::Projectile { speed, pitch_angle } => {
@@ -492,7 +546,9 @@ pub fn generative_physics_system(
                 transform.z += transform.rotation.sin() * cos_pitch * eff_speed;
 
                 // Despawn if hitting Sun (Solid Wall)
-                let dist_sq = transform.x * transform.x + transform.y * transform.y + transform.z * transform.z;
+                let dist_sq = transform.x * transform.x
+                    + transform.y * transform.y
+                    + transform.z * transform.z;
                 if dist_sq < 1000.0 * 1000.0 {
                     commands.entity(entity).insert(DeathAge(0.0));
                 }
@@ -500,4 +556,3 @@ pub fn generative_physics_system(
         }
     }
 }
-
