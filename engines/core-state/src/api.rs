@@ -391,7 +391,7 @@ pub async fn start_api_server(engine_state: EngineState) {
 
     // Apply CORS to State API (port 8080) - allow frontend origin
     let state_cors = warp::cors()
-        .allow_origin("http://localhost:5173")
+        .allow_any_origin()
         .allow_methods(vec!["GET", "POST", "OPTIONS"])
         .allow_headers(vec!["Content-Type"]);
 
@@ -1035,13 +1035,13 @@ pub async fn start_api_server(engine_state: EngineState) {
         .with(state_cors);
     // Serve state updates + save on 8080
     tokio::spawn(async {
-        println!("State API listening on http://127.0.0.1:8080 (endpoints: /state, /save, /api/engine/next-level)");
-        warp::serve(routes).run(([127, 0, 0, 1], 8080)).await;
+        println!("State API listening on http://0.0.0.0:8080 (endpoints: /state, /save, /api/engine/next-level)");
+        warp::serve(routes).run(([0, 0, 0, 0], 8080)).await;
     });
 
     // Serve Websockets on 8081
     tokio::spawn(async {
-        println!("WebSocket Broadcast listening on ws://127.0.0.1:8081/ws");
+        println!("WebSocket Broadcast listening on ws://0.0.0.0:8081/ws");
         let cors = warp::cors()
             .allow_any_origin()
             .allow_headers(vec![
@@ -1060,7 +1060,7 @@ pub async fn start_api_server(engine_state: EngineState) {
             ])
             .allow_methods(vec!["GET", "POST", "DELETE", "OPTIONS", "PUT", "PATCH"]);
         warp::serve(ws_route.with(cors))
-            .run(([127, 0, 0, 1], 8081))
+            .run(([0, 0, 0, 0], 8081))
             .await;
     });
 }

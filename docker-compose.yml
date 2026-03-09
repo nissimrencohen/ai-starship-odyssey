@@ -1,0 +1,44 @@
+services:
+  # ── Rust ECS Game Engine ──────────────────────────────────────────────────
+  rust-engine:
+    build:
+      context: ./engines/core-state
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    environment:
+      - PYTHON_DIRECTOR_URL=http://python-director:8000
+    depends_on:
+      - redis-memory
+    restart: unless-stopped
+
+  # ── Python AI Director ────────────────────────────────────────────────────
+  python-director:
+    build:
+      context: ./apps/python-director
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/python-director/data:/app/data
+    environment:
+      - RUST_ENGINE_URL=http://rust-engine:8080
+      - REDIS_URL=redis://redis-memory:6379
+      - SELF_URL=http://python-director:8000
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - HF_TOKEN=${HF_TOKEN}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - GITHUB_API_KEY=${GITHUB_API_KEY}
+    depends_on:
+      - redis-memory
+      - rust-engine
+    restart: unless-stopped
+
+  # ── Redis Vector DB (simulating AWS ElastiCache) ──────────────────────────
+  redis-memory:
+    image: redis/redis-stack-server:latest
+    ports:
+      - "6379:6379"
+    restart: unless-stopped

@@ -38,6 +38,12 @@ pub async fn run(engine_state: EngineState) {
         systems::steering_system,
     ));
 
+    let python_director_url: &'static str = Box::leak(
+        std::env::var("PYTHON_DIRECTOR_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
+            .into_boxed_str(),
+    );
+
     let mut current_level: u32 = 1;
     let mut kills_at_level_start: u32 = 0;
     let mut enemy_kills_at_level_start: u32 = 0;
@@ -672,7 +678,7 @@ pub async fn run(engine_state: EngineState) {
                         "timestamp": format!("{}", ts)
                     });
                     let _ = client
-                        .post("http://127.0.0.1:8000/engine_telemetry")
+                        .post(&format!("{}/engine_telemetry", python_director_url))
                         .json(&payload)
                         .send()
                         .await;
@@ -842,7 +848,7 @@ pub async fn run(engine_state: EngineState) {
                         "timestamp": format!("{}", ts)
                     });
                     let _ = client
-                        .post("http://127.0.0.1:8000/engine_telemetry")
+                        .post(&format!("{}/engine_telemetry", python_director_url))
                         .json(&payload)
                         .send()
                         .await;
@@ -862,7 +868,7 @@ pub async fn run(engine_state: EngineState) {
                             "timestamp": format!("{}", ts)
                         });
                         let _ = client
-                            .post("http://127.0.0.1:8000/engine_telemetry")
+                            .post(&format!("{}/engine_telemetry", python_director_url))
                             .json(&consumption_payload)
                             .send()
                             .await;
@@ -1059,7 +1065,7 @@ pub async fn run(engine_state: EngineState) {
                                         "timestamp": format!("{}", ts)
                                     });
                                     let _ = client
-                                        .post("http://127.0.0.1:8000/engine_telemetry")
+                                        .post(&format!("{}/engine_telemetry", python_director_url))
                                         .json(&payload)
                                         .send()
                                         .await;
@@ -1476,7 +1482,7 @@ pub async fn run(engine_state: EngineState) {
                         "timestamp": format!("{}", ts)
                     });
                     let _ = client
-                        .post("http://127.0.0.1:8000/engine_telemetry")
+                        .post(&format!("{}/engine_telemetry", python_director_url))
                         .json(&payload)
                         .send()
                         .await;

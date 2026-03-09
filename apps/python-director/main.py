@@ -33,10 +33,14 @@ import random
 import time
 from collections import deque
 from dotenv import load_dotenv
-import faiss
-from sentence_transformers import SentenceTransformer
+import redis
+import redis.commands.search.field as RedisField
+import redis.commands.search.query as RedisQuery
+from redis.commands.search.indexDefinition import IndexDefinition, IndexType
 from pathlib import Path
 import numpy as np
+import hashlib
+import struct
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -274,7 +278,7 @@ class TTSManager:
             logger.info(f"Piper TTS: Generated {audio_filename} ({len(text)} chars)")
 
             # Return absolute URL pointing to the Python FastAPI server (port 8000)
-            return f"http://127.0.0.1:8000/assets/audio/{audio_filename}"
+            return f"{SELF_URL}/assets/audio/{audio_filename}"
         except Exception as e:
             logger.error(f"Piper TTS Error: {e}")
             return None
@@ -297,7 +301,7 @@ class TTSManager:
             await communicate.save(audio_path)
 
             logger.info(f"Edge-TTS: Generated {audio_filename} ({len(text)} chars)")
-            return f"http://127.0.0.1:8000/assets/audio/{audio_filename}"
+            return f"{SELF_URL}/assets/audio/{audio_filename}"
         except Exception as e:
             logger.error(f"Edge-TTS Error: {e}")
             return None
@@ -365,7 +369,7 @@ async def generate_speech(text: str) -> Optional[str]:
 async def sync_with_engine(state_data: dict) -> bool:
     """Pushes the new WorldState to the Rust Core Engine non-blockingly."""
     try:
-        url = "http://127.0.0.1:8080/state"
+        url = f"{RUST_ENGINE_URL}/state"
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=state_data, timeout=5.0)
             if response.status_code == 200:
@@ -430,7 +434,7 @@ async def spawn_entities_in_engine(spawn_list: list) -> bool:
         if "faction" not in s: s["faction"] = "neutral"
 
     try:
-        url = "http://127.0.0.1:8080/spawn"
+        url = f"{RUST_ENGINE_URL}/spawn"
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=spawn_list, timeout=5.0)
             if response.status_code == 200:
@@ -453,7 +457,7 @@ async def manage_entities_in_engine(endpoint: str, payload: Any = None) -> bool:
             return True
             
     try:
-        url = f"http://127.0.0.1:8080/{endpoint}"
+        url = f"{RUST_ENGINE_URL}/{endpoint}"
         async with httpx.AsyncClient() as client:
             if payload is not None:
                 response = await client.post(url, json=payload, timeout=5.0)
@@ -752,85 +756,147 @@ def clean_float(value: Any, default: float = 0.0) -> float:
         logger.warning(f"Failed to parse float from LLM value '{value}', defaulting to {default}")
         return default
 
-# Pre-load the SentenceTransformer globally so it doesn't stutter on every connection
-try:
-    GLOBAL_ENCODER = SentenceTransformer('all-MiniLM-L6-v2')
-    logger.info("Global SentenceTransformer loaded successfully.")
-except Exception as e:
-    logger.error(f"Failed to load global SentenceTransformer: {e}")
-    GLOBAL_ENCODER = None
+# ── Redis Vector DB Connection ──────────────────────────────────────────────
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+RUST_ENGINE_URL = os.getenv("RUST_ENGINE_URL", "http://127.0.0.1:8080")
+SELF_URL = os.getenv("SELF_URL", "http://127.0.0.1:8000")
+REDIS_CLIENT: Optional[redis.Redis] = None
+EMBEDDING_DIM = 768  # Google text-embedding-004 dimension
 
-# ── Global Knowledge Base (Shared across sessions) ──
-# We cache this to disk to speed up cold starts.
-GLOBAL_KB_INDEX: Optional[faiss.IndexFlatL2] = None
-GLOBAL_KB_METADATA: List[dict] = [] # List of {"text": str, "memory_type": "ENGINE_KB"}
+def get_redis() -> Optional[redis.Redis]:
+    """Get or create Redis connection."""
+    global REDIS_CLIENT
+    if REDIS_CLIENT is None:
+        try:
+            REDIS_CLIENT = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+            REDIS_CLIENT.ping()
+            logger.info(f"[Redis] Connected to {REDIS_URL}")
+        except Exception as e:
+            logger.error(f"[Redis] Failed to connect: {e}")
+            REDIS_CLIENT = None
+    return REDIS_CLIENT
+
+
+async def generate_embedding(text: str) -> Optional[List[float]]:
+    """Generate embedding using Google's text-embedding API (768-dim)."""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        logger.error("[Embedding] GOOGLE_API_KEY not set")
+        return None
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}",
+                json={"model": "models/text-embedding-004", "content": {"parts": [{"text": text}]}},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            values = resp.json()["embedding"]["values"]
+            return values
+    except Exception as e:
+        logger.error(f"[Embedding] API call failed: {e}")
+        return None
+
+
+def generate_embedding_sync(text: str) -> Optional[List[float]]:
+    """Synchronous embedding for startup use."""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+    try:
+        import urllib.request
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}"
+        data = json.dumps({"model": "models/text-embedding-004", "content": {"parts": [{"text": text}]}}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+            return result["embedding"]["values"]
+    except Exception as e:
+        logger.error(f"[Embedding Sync] Failed: {e}")
+        return None
+
+
+def _float_list_to_bytes(vec: List[float]) -> bytes:
+    """Convert float list to bytes for Redis VECTOR field."""
+    return struct.pack(f"<{len(vec)}f", *vec)
+
+
+def _ensure_redis_index(r: redis.Redis, index_name: str, prefix: str):
+    """Create a RediSearch index if it doesn't exist."""
+    try:
+        r.ft(index_name).info()
+        logger.info(f"[Redis] Index '{index_name}' already exists.")
+    except Exception:
+        schema = (
+            RedisField.TextField("text"),
+            RedisField.TagField("memory_type"),
+            RedisField.NumericField("x", sortable=True),
+            RedisField.NumericField("y", sortable=True),
+            RedisField.NumericField("z", sortable=True),
+            RedisField.VectorField(
+                "embedding", "FLAT",
+                {"TYPE": "FLOAT32", "DIM": EMBEDDING_DIM, "DISTANCE_METRIC": "COSINE"}
+            ),
+        )
+        definition = IndexDefinition(prefix=[prefix], index_type=IndexType.HASH)
+        r.ft(index_name).create_index(fields=schema, definition=definition)
+        logger.info(f"[Redis] Created index '{index_name}' with prefix '{prefix}'")
+
 
 def initialize_global_knowledge_base():
-    """Initializes a shared Knowledge Base index with disk caching."""
-    global GLOBAL_KB_INDEX, GLOBAL_KB_METADATA
-    if not GLOBAL_ENCODER:
+    """Ingest data/*.md files into Redis vector index if not already present."""
+    r = get_redis()
+    if not r:
+        logger.warning("[KB] Redis unavailable — skipping KB initialization.")
         return
 
-    cache_dir = Path(__file__).parent / "data" / ".cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    emb_path = cache_dir / "kb_embeddings.npy"
-    meta_path = cache_dir / "kb_metadata.json"
-    
-    data_dir = Path(__file__).parent / "data"
-    # Detect if any .md files are newer than the cache
-    kb_files = sorted(list(data_dir.glob("*.md")))
-    latest_md = max([f.stat().st_mtime for f in kb_files]) if kb_files else 0
-    cache_exists = emb_path.exists() and meta_path.exists()
-    cache_mtime = emb_path.stat().st_mtime if cache_exists else 0
-    
-    if cache_exists and cache_mtime > latest_md:
-        try:
-            embeddings = np.load(emb_path)
-            with open(meta_path, "r", encoding="utf-8") as f:
-                GLOBAL_KB_METADATA = json.load(f)
-            GLOBAL_KB_INDEX = faiss.IndexFlatL2(GLOBAL_ENCODER.get_sentence_embedding_dimension())
-            GLOBAL_KB_INDEX.add(embeddings)
-            logger.info(f"[KB Cache] Loaded {len(GLOBAL_KB_METADATA)} chunks from disk.")
-            return
-        except Exception as e:
-            logger.warning(f"[KB Cache] Failed to load cache: {e}. Regenerating...")
+    _ensure_redis_index(r, "idx:kb", "kb:")
 
-    # Regenerate
-    logger.info("[KB Cache] Regenerating Knowledge Base embeddings...")
-    metadata = []
-    texts_to_embed = []
-    
+    # Check if KB is already populated
+    try:
+        info = r.ft("idx:kb").info()
+        num_docs = int(info.get("num_docs", info.get("num_docs", 0)))
+        if num_docs > 0:
+            logger.info(f"[KB] Redis already has {num_docs} KB documents. Skipping ingestion.")
+            return
+    except Exception:
+        pass
+
+    data_dir = Path(__file__).parent / "data"
+    kb_files = sorted(list(data_dir.glob("*.md")))
+    total = 0
+
     for md_file in kb_files:
         try:
             text = md_file.read_text("utf-8")
             raw_chunks = text.split("\n## ")
             for i, chunk in enumerate(raw_chunks):
                 chunk = chunk.strip()
-                if not chunk: continue
-                if i > 0: chunk = f"## {chunk}"
-                if len(chunk) < 40: continue
-                
-                texts_to_embed.append(chunk)
-                metadata.append({"text": chunk, "memory_type": "ENGINE_KB"})
-        except Exception as e:
-            logger.error(f"Failed to read {md_file.name}: {e}")
+                if not chunk:
+                    continue
+                if i > 0:
+                    chunk = f"## {chunk}"
+                if len(chunk) < 40:
+                    continue
 
-    if texts_to_embed:
-        try:
-            embeddings = GLOBAL_ENCODER.encode(texts_to_embed, convert_to_numpy=True)
-            GLOBAL_KB_INDEX = faiss.IndexFlatL2(GLOBAL_ENCODER.get_sentence_embedding_dimension())
-            GLOBAL_KB_INDEX.add(embeddings)
-            GLOBAL_KB_METADATA = metadata
-            
-            # Save to disk
-            np.save(emb_path, embeddings)
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(metadata, f)
-            logger.info(f"[KB Cache] Cached {len(metadata)} chunks to {emb_path}")
-        except Exception as e:
-            logger.error(f"[KB Cache] Failed to encode/save KB: {e}")
+                embedding = generate_embedding_sync(chunk)
+                if not embedding:
+                    continue
 
-# Run initialization once at startup
+                doc_id = f"kb:{hashlib.md5(chunk[:200].encode()).hexdigest()}"
+                r.hset(doc_id, mapping={
+                    "text": chunk,
+                    "memory_type": "ENGINE_KB",
+                    "x": 0.0, "y": 0.0, "z": 0.0,
+                    "embedding": _float_list_to_bytes(embedding),
+                })
+                total += 1
+        except Exception as e:
+            logger.error(f"[KB] Failed to process {md_file.name}: {e}")
+
+    logger.info(f"[KB] Ingested {total} chunks into Redis index 'idx:kb'.")
+
+# Run KB initialization once at startup
 initialize_global_knowledge_base()
 
 def estimate_token_count(text: str) -> int:
@@ -874,8 +940,8 @@ def load_dream_memory():
 
 class DreamMemory:
     """
-    Session-scoped FAISS vector store with typed memory entries.
-    Now equipped with JSON-backed persistence across engine reboots.
+    Session-scoped Redis vector store with typed memory entries.
+    Persists via JSON file + Redis for vector search.
 
     memory_store entries are dicts: {"text": str, "memory_type": str}
     memory_type values:
@@ -887,86 +953,72 @@ class DreamMemory:
       "NEMESIS"       – surviving enemies or death locations (stored in sector_events)
       "NARRATIVE"     – unresolved lore promises extracted from Rachel's own replies
 
-    Retrieval is blended: semantic FAISS hits + pinned slots per type so the LLM
+    Retrieval is blended: semantic Redis KNN hits + pinned slots per type so the LLM
     always sees behavioural, ecological, config, story, and nemesis context.
     """
 
     def __init__(self):
         try:
-            self.encoder = GLOBAL_ENCODER
-            if self.encoder:
-                self.dim = self.encoder.get_sentence_embedding_dimension()
-                self.index = faiss.IndexFlatL2(self.dim)
-                self.memory_store: List[dict] = []
-                self.sector_events: List[dict] = []
-                
+            self.redis = get_redis()
+            self.session_id = hashlib.md5(f"{time.time()}{random.random()}".encode()).hexdigest()[:12]
+            self.prefix = f"mem:{self.session_id}:"
+            self.index_name = f"idx:mem:{self.session_id}"
+            self.memory_store: List[dict] = []
+            self.sector_events: List[dict] = []
+            self._doc_counter = 0
+
+            if self.redis:
+                _ensure_redis_index(self.redis, self.index_name, self.prefix)
+
                 # --- Persistent Memory Loading ---
                 persisted_data = load_dream_memory()
                 loaded_memories = persisted_data.get("memory_store", [])
                 loaded_sectors = persisted_data.get("sector_events", [])
-                
+
                 if loaded_memories:
-                    texts = [m["text"] for m in loaded_memories]
-                    # Batch encode all preserved memories for high-speed indexing
-                    embeddings = self.encoder.encode(texts, convert_to_numpy=True)
-                    self.index.add(embeddings)
+                    for m in loaded_memories:
+                        self._store_sync(m["text"], m["memory_type"])
                     self.memory_store.extend(loaded_memories)
-                
+
                 if loaded_sectors:
                     self.sector_events.extend(loaded_sectors)
-                
+
                 if loaded_memories or loaded_sectors:
-                    logger.info(f"Persistent DreamMemory initialized. Rehydrated {len(self.memory_store)} memories and {len(self.sector_events)} sector events from persistent storage.")
+                    logger.info(f"Persistent DreamMemory initialized. Rehydrated {len(self.memory_store)} memories and {len(self.sector_events)} sector events.")
                 else:
-                    logger.warning("No persistent memory found or file was empty. Starting with amnesia.")
+                    logger.warning("No persistent memory found. Starting with amnesia.")
             else:
-                raise ValueError("Global encoder is offline.")
+                logger.warning("Redis unavailable — DreamMemory running in degraded mode (no vector search).")
         except Exception as e:
             logger.error(f"Failed to initialize DreamMemory: {e}")
-            self.encoder = None
+            self.redis = None
             self.sector_events = []
 
-    def _load_knowledge_base(self):
-        """Deprecated: KB is now global and cached."""
-        pass
-
-        total_chunks = 0
-        for md_file in sorted(data_dir.glob("*.md")):
-            try:
-                text = md_file.read_text("utf-8")
-                # Split on "## " heading markers — keeps context per section
-                raw_chunks = text.split("\n## ")
-                file_chunks = 0
-                for i, chunk in enumerate(raw_chunks):
-                    chunk = chunk.strip()
-                    if not chunk:
-                        continue
-                    # Re-add the heading marker that was consumed by split
-                    if i > 0:
-                        chunk = f"## {chunk}"
-                    # Skip the top-level title / comment lines (< 40 chars, no real content)
-                    if len(chunk) < 40:
-                        continue
-                    self.add_text_memory(chunk)
-                    file_chunks += 1
-                total_chunks += file_chunks
-                logger.info(f"[KnowledgeBase] Loaded {file_chunks} chunks from {md_file.name}")
-            except Exception as e:
-                logger.error(f"[KnowledgeBase] Failed to load {md_file.name}: {e}")
-
-        logger.info(f"[KnowledgeBase] Total: {total_chunks} chunks embedded from {data_dir}")
+    def _store_sync(self, text: str, memory_type: str, x: float = 0.0, y: float = 0.0, z: float = 0.0):
+        """Synchronously embed and store a document in Redis."""
+        if not self.redis:
+            return
+        embedding = generate_embedding_sync(text)
+        if not embedding:
+            return
+        doc_id = f"{self.prefix}{self._doc_counter}"
+        self._doc_counter += 1
+        self.redis.hset(doc_id, mapping={
+            "text": text,
+            "memory_type": memory_type,
+            "x": x, "y": y, "z": z,
+            "embedding": _float_list_to_bytes(embedding),
+        })
 
     # ------------------------------------------------------------------ #
     #  Core insertion methods                                              #
     # ------------------------------------------------------------------ #
 
-    def _embed_and_store(self, text: str, memory_type: str, skip_save: bool = False):
-        """Internal: add one entry to both memory_store and the FAISS index."""
-        if not self.encoder:
-            return
+    def _embed_and_store(self, text: str, memory_type: str, skip_save: bool = False,
+                         x: float = 0.0, y: float = 0.0, z: float = 0.0):
+        """Internal: add one entry to both memory_store and Redis."""
         self.memory_store.append({"text": text, "memory_type": memory_type})
-        embedding = self.encoder.encode([text], convert_to_numpy=True)
-        self.index.add(embedding)
+        self._store_sync(text, memory_type, x, y, z)
         if not skip_save:
             save_dream_memory(self.memory_store, self.sector_events)
 
@@ -976,8 +1028,6 @@ class DreamMemory:
 
     def add_memory(self, state_json: dict):
         """Add a world-state summary as a SECTOR_EVENT memory."""
-        if not self.encoder:
-            return
         summary = state_json.get("summary", "")
         theme = state_json.get("environment_theme") or state_json.get("visual_prompt") or "Cyberpunk"
         terrain = state_json.get("terrain_rules") or "Standard Grid"
@@ -986,12 +1036,10 @@ class DreamMemory:
 
     def add_sector_event(self, text: str, x: float, y: float, z: float,
                          memory_type: str = "SECTOR_EVENT"):
-        """Store a location-tagged event in FAISS + sector_events list."""
-        if not self.encoder:
-            return
+        """Store a location-tagged event in Redis + sector_events list."""
         sector_name = f"Sector ({x:.0f}, {z:.0f})"
         tagged = f"[{sector_name}] {text}"
-        self._embed_and_store(tagged, memory_type, skip_save=True)
+        self._embed_and_store(tagged, memory_type, skip_save=True, x=x, y=y, z=z)
         self.sector_events.append({"text": tagged, "x": x, "y": y, "z": z,
                                    "memory_type": memory_type})
         save_dream_memory(self.memory_store, self.sector_events)
@@ -1002,8 +1050,6 @@ class DreamMemory:
         so the blended retriever can surface them to the LLM regardless of
         semantic similarity to the current query.
         """
-        if not self.encoder:
-            return
         self._embed_and_store(text, memory_type)
         logger.info(f"[Memory:{memory_type}] Stored: {text[:80]}...")
 
@@ -1024,38 +1070,62 @@ class DreamMemory:
         lines = [f"- {ev['text']} (dist: {dist(ev):.0f}u)" for ev in sorted_events]
         return "\n".join(lines)
 
+    def _redis_knn_search(self, query_embedding: List[float], index_name: str,
+                           top_k: int = 20) -> List[dict]:
+        """Run a KNN vector search on a Redis index. Returns list of {text, memory_type, score}."""
+        r = self.redis or get_redis()
+        if not r:
+            return []
+        try:
+            q = (
+                RedisQuery.Query(f"*=>[KNN {top_k} @embedding $vec AS score]")
+                .sort_by("score")
+                .return_fields("text", "memory_type", "score")
+                .dialect(2)
+            )
+            results = r.ft(index_name).search(q, query_params={
+                "vec": _float_list_to_bytes(query_embedding)
+            })
+            hits = []
+            for doc in results.docs:
+                hits.append({
+                    "text": doc.text if hasattr(doc, "text") else "",
+                    "memory_type": doc.memory_type if hasattr(doc, "memory_type") else "",
+                    "score": float(doc.score) if hasattr(doc, "score") else 999.0,
+                })
+            return hits
+        except Exception as e:
+            logger.warning(f"[Redis KNN] Search failed on {index_name}: {e}")
+            return []
+
     def get_relevant_context(self, query: str, k: int = 3,
                              px: float = 0.0, py: float = 0.0, pz: float = 0.0) -> str:
         """
         Blended retrieval (Dungeon Master edition):
-          • up to k   SECTOR_EVENT hits  (semantic similarity)
-          • up to 1   PLAYER_PROFILE     (most recent in FAISS hits)
-          • up to 1   ECOLOGY            (most recent in FAISS hits)
-          • up to 1   META_CONFIG        (most recent in FAISS hits)
-          • up to 1   NARRATIVE          (most recent in FAISS hits)
-          • up to 1   NEMESIS            (spatially nearest from sector_events)
-          • up to 2   ENGINE_KB          (from FAISS hits)
+          - up to k   SECTOR_EVENT hits  (semantic similarity)
+          - up to 1   PLAYER_PROFILE     (most recent in Redis hits)
+          - up to 1   ECOLOGY            (most recent in Redis hits)
+          - up to 1   META_CONFIG        (most recent in Redis hits)
+          - up to 1   NARRATIVE          (most recent in Redis hits)
+          - up to 1   NEMESIS            (spatially nearest from sector_events)
+          - up to 2   ENGINE_KB          (from Redis KB index hits)
 
-        NEMESIS is surfaced by proximity, not semantic similarity, so the LLM
-        confronts the same enemy every time the player returns to that sector.
+        NEMESIS is surfaced by proximity, not semantic similarity.
         NARRATIVE forces lore continuity regardless of topical similarity.
         """
-        if not self.encoder or self.index.ntotal == 0:
+        query_emb = generate_embedding_sync(query)
+        if not query_emb:
             return "No previous memories."
 
-        # Cast a wide semantic net so we have enough candidates to filter
-        search_k = min(max(k * 15, 30), self.index.ntotal)
-        query_emb = self.encoder.encode([query], convert_to_numpy=True)
-        # ── Search Session (Live) Memory ──
-        D_live, I_live = self.index.search(query_emb, search_k)
-        
-        # ── Search Global Knowledge Base (Shared/Cached) ──
+        # ── Search Session (Live) Memory via Redis ──
+        session_hits = self._redis_knn_search(query_emb, self.index_name, top_k=30)
+
+        # ── Search Global Knowledge Base (Shared) via Redis ──
         kb_texts: List[str] = []
-        if GLOBAL_KB_INDEX:
-            D_kb, I_kb = GLOBAL_KB_INDEX.search(query_emb, min(5, GLOBAL_KB_INDEX.ntotal))
-            for idx in I_kb[0]:
-                if idx != -1 and idx < len(GLOBAL_KB_METADATA):
-                    kb_texts.append(GLOBAL_KB_METADATA[idx]["text"])
+        kb_hits = self._redis_knn_search(query_emb, "idx:kb", top_k=5)
+        for hit in kb_hits:
+            if hit["text"]:
+                kb_texts.append(hit["text"])
 
         sector_texts = []
         profile_text: Optional[str] = None
@@ -1063,12 +1133,9 @@ class DreamMemory:
         meta_config_text: Optional[str] = None
         narrative_text: Optional[str] = None
 
-        for idx in I_live[0]:
-            if idx == -1 or idx >= len(self.memory_store):
-                continue
-            entry = self.memory_store[idx]
-            mtype = entry["memory_type"]
-            text = entry["text"]
+        for hit in session_hits:
+            mtype = hit["memory_type"]
+            text = hit["text"]
 
             if mtype == "PLAYER_PROFILE" and profile_text is None:
                 profile_text = text
@@ -1079,7 +1146,7 @@ class DreamMemory:
             elif mtype == "NARRATIVE" and narrative_text is None:
                 narrative_text = text
             elif mtype == "SECTOR_EVENT" and len(sector_texts) < k:
-                sector_texts.append((idx, text))
+                sector_texts.append(text)
 
         # ── NEMESIS: nearest by 3-D distance from sector_events ──────────
         nemesis_text: Optional[str] = None
@@ -1089,11 +1156,10 @@ class DreamMemory:
                 dx, dy, dz = ev["x"] - px, ev["y"] - py, ev["z"] - pz
                 return (dx*dx + dy*dy + dz*dz) ** 0.5
             nearest_nemesis = min(nemesis_entries, key=_dist3)
-            if _dist3(nearest_nemesis) < 3000: # Only consider if within 3000 units
+            if _dist3(nearest_nemesis) < 3000:
                 nemesis_text = nearest_nemesis["text"]
 
         # ── Assemble blended context ──────────────────────────────────────
-        sector_texts.sort(key=lambda x: x[0])
         blended: List[str] = []
         if profile_text:
             blended.append(f"[PLAYER PROFILE] {profile_text}")
@@ -1108,8 +1174,6 @@ class DreamMemory:
         blended.extend(kb_texts)
 
         # ── Hard character budget: 4 000 chars max ───────────────────────
-        # Priority: NEMESIS > META_CONFIG > NARRATIVE > ECOLOGY > PLAYER_PROFILE
-        #           > ENGINE_KB (##) > SECTOR_EVENT (trimmed first).
         _MAX_CTX = 4000
         _PINNED_PREFIXES = (
             "[PLAYER PROFILE]", "[ECOLOGY]", "[META_CONFIG]",
@@ -1127,7 +1191,7 @@ class DreamMemory:
                 chunk = s[:remaining]
                 result_trimmed.append(chunk)
                 remaining -= len(chunk)
-            for s in trimmable:          # SECTOR_EVENT — trim oldest (lowest relevance) first
+            for s in trimmable:
                 if remaining <= 0:
                     break
                 chunk = s[:remaining]
@@ -1548,7 +1612,7 @@ def extract_and_embed_lore(dream_memory: DreamMemory,
 
     Deliberately lightweight (regex only) — no extra LLM calls.
     """
-    if not conversational_reply or not dream_memory.encoder:
+    if not conversational_reply or not dream_memory.redis:
         return
 
     for pattern in _LORE_PATTERNS:
@@ -1675,7 +1739,7 @@ def analyze_and_embed_player_profile(dream_memory: DreamMemory) -> str:
             "Rachel should provide tactical briefings and balanced enemy waves."
         )
 
-    if profile_text and dream_memory.encoder:
+    if profile_text and dream_memory.redis:
         # Deduplicate: only embed if different from the last stored profile
         existing_profiles = [
             e["text"] for e in dream_memory.memory_store
@@ -2110,7 +2174,7 @@ async def dream_stream(websocket: WebSocket):
     current_player_z: float = 0.0
 
     # --- Session Initialization Details ---
-    # We NO LONGER load the prior context state into FAISS to prevent LLM memory poisoning
+    # We NO LONGER load the prior context state into vector memory to prevent LLM memory poisoning
     # Each connection is granted a perfectly clean Memory structure to build new objectives.
     snapshot_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
@@ -2125,7 +2189,7 @@ async def dream_stream(websocket: WebSocket):
             env_theme = snap.get("environment_theme") or snap.get("visual_prompt") or "Cyberpunk"
             terrain = snap.get("terrain_rules") or "Standard Grid"
             
-            # Count entities for immediate context, but don't poison FAISS
+            # Count entities for immediate context, but don't poison vector memory
             entity_counts: Dict[str, int] = {}
             for ent in snap.get("entities", []):
                 t = ent.get("ent_type", "unknown")
@@ -2866,7 +2930,7 @@ async def dream_stream(websocket: WebSocket):
                                 try:
                                     async with httpx.AsyncClient() as _bh_client:
                                         await _bh_client.post(
-                                            "http://127.0.0.1:8080/despawn",
+                                            f"{RUST_ENGINE_URL}/despawn",
                                             json={"ent_type": "anomaly"},
                                             timeout=2.0,
                                         )
@@ -2984,7 +3048,7 @@ async def dream_stream(websocket: WebSocket):
                                 logger.info("Mission Commander Override Triggered. Sending next-level command to Rust Engine.")
                                 try:
                                     async with httpx.AsyncClient() as client:
-                                        await client.post("http://127.0.0.1:8080/api/engine/next-level", timeout=5.0)
+                                        await client.post(f"{RUST_ENGINE_URL}/api/engine/next-level", timeout=5.0)
                                 except Exception as e:
                                     logger.error(f"Failed to force advance level: {e}")
 
@@ -2992,7 +3056,7 @@ async def dream_stream(websocket: WebSocket):
                                 logger.info("Resetting Engine Defaults!")
                                 try:
                                     async with httpx.AsyncClient() as client:
-                                        await client.post("http://127.0.0.1:8080/api/engine/reset", timeout=5.0)
+                                        await client.post(f"{RUST_ENGINE_URL}/api/engine/reset", timeout=5.0)
                                 except Exception as e:
                                     logger.error(f"Failed to reset defaults: {e}")
 
@@ -3028,7 +3092,7 @@ async def dream_stream(websocket: WebSocket):
                                             new_r = base_r * scale
                                             try:
                                                 await client.post(
-                                                    "http://127.0.0.1:8080/set-planet-radius",
+                                                    f"{RUST_ENGINE_URL}/set-planet-radius",
                                                     json={"name": planet_name, "radius": new_r},
                                                     timeout=3.0
                                                 )
