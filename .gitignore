@@ -10,6 +10,7 @@ file_list.tmp
 world_snap.json
 .claude/
 tmp/
+data/
 .playwright-mcp/
 dist/
 build/
@@ -33,6 +34,7 @@ apps/web-client/build/
 apps/web-client/test-results/
 apps/web-client/*.txt
 apps/web-client/*.log
+apps/web-client/public/assets/audio/
 
 # Python Director
 apps/python-director/__pycache__/

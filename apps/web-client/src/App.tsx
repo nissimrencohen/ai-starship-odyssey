@@ -7,12 +7,14 @@ import { HUD } from './components/HUD';
 import { ChatLog, ChatMessage } from './components/ChatLog';
 
 const WS_URL = 'ws://localhost:8000/api/v1/dream-stream';
+const RESET_DEBOUNCE_MS = 1000;
 
 export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [directorMessage, setDirectorMessage] = useState<string>("Awaiting connection to The Void...");
   const [worldState, setWorldState] = useState<any>(null);
   const [customTextureUrl, setCustomTextureUrl] = useState<string | null>(null);
+  const [isTransitioning, setIsTransitioning] = useState(false);
 
   // Voice & Audio Meter State
   const [volumeLevel, setVolumeLevel] = useState(0);
@@ -240,11 +242,12 @@ export default function App() {
   const [deathStats, setDeathStats] = useState({ score: 0, level: 1 });
   const [showLevelTransition, setShowLevelTransition] = useState(false);
   const [transitionLevel, setTransitionLevel] = useState(1);
-  const prevLevelRef = useRef(1);
+  const prevLevelRef = useRef(0); // Initialize to 0 to catch the first level if it starts at 1
   const levelTransitionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showDamageFlash, setShowDamageFlash] = useState(false);
   const [showSuccessFlash, setShowSuccessFlash] = useState(false);
   const [showBoundaryFlash, setShowBoundaryFlash] = useState(false);
+  const lastResetTimeRef = useRef(0);
   const prevHealthRef = useRef(100);
   const damageFlashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const successFlashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -291,6 +294,7 @@ export default function App() {
   // Full reset: clears BH overlay + calls engine reset
   const bhAutoResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleFullReset = useCallback(async () => {
+    lastResetTimeRef.current = Date.now();
     if (bhAutoResetTimerRef.current) { clearTimeout(bhAutoResetTimerRef.current); bhAutoResetTimerRef.current = null; }
     try { await fetch('http://127.0.0.1:8080/api/engine/reset', { method: 'POST' }); } catch (_) { }
     setBlackHoleDeath(false);
@@ -299,7 +303,7 @@ export default function App() {
     setIsGameOver(false);
     setShowDeathScreen(false);
     setShowLevelTransition(false);
-    prevLevelRef.current = 1;
+    prevLevelRef.current = 0;
     setZoom(1.5);
   }, []);
 
@@ -562,6 +566,12 @@ export default function App() {
               // Level up detected — show transition screen
               setTransitionLevel(newLevel);
               setShowLevelTransition(true);
+
+              // If dying, dismiss death screen because level victory takes priority
+              if (showDeathScreen) {
+                setShowDeathScreen(false);
+              }
+
               if (levelTransitionTimerRef.current) clearTimeout(levelTransitionTimerRef.current);
               levelTransitionTimerRef.current = setTimeout(() => {
                 setShowLevelTransition(false);
@@ -572,13 +582,25 @@ export default function App() {
             setCurrentLevel(newLevel);
           }
           if (data.is_game_over !== undefined) {
-            setIsGameOver(data.is_game_over as boolean);
-            if (data.is_game_over) {
+            const isGameOverNow = data.is_game_over as boolean;
+            setIsGameOver(isGameOverNow);
+
+            if (isGameOverNow) {
+              // Avoid showing the death screen if we just reset (prevents re-triggering from laggy frames)
+              const timeSinceReset = Date.now() - lastResetTimeRef.current;
+              if (timeSinceReset < RESET_DEBOUNCE_MS) return;
+
               // Show death screen — wait for user interaction (no auto-reset)
               if (!blackHoleDeathFiredRef.current && !showDeathScreen) {
                 triggerDeathScreen('health');
               }
             } else {
+              // Engine auto-resurrected after 3s delay -> dismiss the death screen automatically
+              // so the user isn't stuck behind the overlay while they are actually alive.
+              if (showDeathScreen && deathReason === 'health') {
+                setShowDeathScreen(false);
+              }
+
               // Clear black hole death overlay only when transitioning OUT of a BH death
               if (blackHoleDeathFiredRef.current) {
                 setBlackHoleDeath(false);
@@ -586,6 +608,9 @@ export default function App() {
                 setSpectatorTargetId(null);
               }
             }
+          }
+          if (data.is_transitioning !== undefined) {
+            setIsTransitioning(data.is_transitioning as boolean);
           }
           if (data.black_hole_death === true && !blackHoleDeathFiredRef.current) {
             blackHoleDeathFiredRef.current = true;
@@ -1266,12 +1291,12 @@ export default function App() {
           </div>
         )}
 
-        {/* ── Level Transition Screen ── */}
         {showLevelTransition && (
           <div
-            className="absolute inset-0 z-[195] pointer-events-none flex items-center justify-center"
+            className="absolute inset-0 z-[205] pointer-events-none flex items-center justify-center overflow-hidden"
             style={{
               animation: `lvl-enter 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards, lvl-exit 0.8s ease-in 2.7s forwards`,
+              background: 'radial-gradient(circle at center, rgba(15, 23, 42, 0.95) 0%, rgba(2, 6, 23, 1) 100%)',
             }}
           >
             {/* Flash burst */}
@@ -1344,9 +1369,9 @@ export default function App() {
               }}>
                 {transitionLevel <= 3 ? 'Threat Level: Low'
                   : transitionLevel <= 6 ? 'Threat Level: Moderate'
-                  : transitionLevel <= 9 ? 'Threat Level: High'
-                  : transitionLevel <= 12 ? 'Threat Level: Extreme'
-                  : 'Threat Level: Apocalyptic'}
+                    : transitionLevel <= 9 ? 'Threat Level: High'
+                      : transitionLevel <= 12 ? 'Threat Level: Extreme'
+                        : 'Threat Level: Apocalyptic'}
               </div>
             </div>
           </div>
@@ -1378,6 +1403,42 @@ export default function App() {
           sidebarWidth={sidebarWidth}
           isResizing={isResizing}
         />
+
+        {/* Cinematic Level Transition Overlay */}
+        {isTransitioning && (
+          <div className="fixed inset-0 z-[100] pointer-events-none flex items-center justify-center overflow-hidden">
+            {/* Warp Speed Streaks */}
+            <div className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-pulse" />
+            <div className="absolute inset-0 opacity-40">
+              {[...Array(20)].map((_, i) => (
+                <div
+                  key={i}
+                  className="absolute bg-white rounded-full animate-warp-streak"
+                  style={{
+                    top: `${Math.random() * 100}%`,
+                    left: `${Math.random() * 100}%`,
+                    width: `${2 + Math.random() * 5}px`,
+                    height: `${40 + Math.random() * 100}px`,
+                    animationDelay: `${Math.random() * 2}s`,
+                    opacity: 0.3 + Math.random() * 0.7,
+                  }}
+                />
+              ))}
+            </div>
+
+            {/* Transition Text */}
+            <div className="relative group flex flex-col items-center">
+              <div className="absolute -inset-20 bg-purple-600/20 blur-[100px] rounded-full animate-pulse" />
+              <h1 className="text-6xl font-black text-white italic tracking-[1em] uppercase animate-level-text shadow-2xl">
+                Level {currentLevel} Secured
+              </h1>
+              <div className="h-0.5 w-64 bg-gradient-to-r from-transparent via-purple-500 to-transparent mt-4 animate-scale-x" />
+              <p className="mt-4 text-purple-400 font-mono text-sm tracking-[0.5em] uppercase opacity-80">
+                Engaging Slipstream Drive
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* The Director's Console (Left Sidebar) */}
         <div

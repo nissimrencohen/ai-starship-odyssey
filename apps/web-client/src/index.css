@@ -5,3 +5,35 @@
 :root {
   background-color: #000000;
 }
+
+@keyframes warp-streak {
+  0% { transform: translateY(100vh) scaleY(0.1); opacity: 0; }
+  50% { opacity: 1; }
+  100% { transform: translateY(-100vh) scaleY(2); opacity: 0; }
+}
+
+@keyframes level-text {
+  0% { transform: scale(0.5); opacity: 0; filter: blur(20px); }
+  20% { transform: scale(1.1); opacity: 1; filter: blur(0px); }
+  80% { transform: scale(1); opacity: 1; filter: blur(0px); }
+  100% { transform: scale(1.5); opacity: 0; filter: blur(10px); }
+}
+
+@keyframes scale-x {
+  0% { transform: scaleX(0); opacity: 0; }
+  20% { transform: scaleX(1); opacity: 1; }
+  80% { transform: scaleX(1); opacity: 1; }
+  100% { transform: scaleX(2); opacity: 0; }
+}
+
+.animate-warp-streak {
+  animation: warp-streak 0.8s linear infinite;
+}
+
+.animate-level-text {
+  animation: level-text 3.5s cubic-bezier(0.23, 1, 0.32, 1) forwards;
+}
+
+.animate-scale-x {
+  animation: scale-x 3.5s cubic-bezier(0.23, 1, 0.32, 1) forwards;
+}

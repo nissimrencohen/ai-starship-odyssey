@@ -294,7 +294,7 @@ async fn main() {
                 .id()
                 .index();
 
-            // --- MOON SPAWNING (×5 of 4× rescaled values + Keplerian speeds) ---
+            // --- MOON SPAWNING (×5 of 4× rescalED values + Keplerian speeds) ---
             // orbital_r = 5× pre-×3 values; visual_r = 5× pre-×3 values; speeds Keplerian-adjusted
             match name {
                 "Earth" => {
@@ -627,6 +627,7 @@ async fn main() {
     let do_full_reset: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let override_level: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
     let current_level_shared: Arc<Mutex<u32>> = Arc::new(Mutex::new(1));
+    let level_transition_timer: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     let force_next_level: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let is_paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
@@ -649,6 +650,7 @@ async fn main() {
         do_full_reset: do_full_reset.clone(),
         override_level: override_level.clone(),
         current_level_shared: current_level_shared.clone(),
+        level_transition_timer: level_transition_timer.clone(),
         is_paused: is_paused.clone(),
     };
 

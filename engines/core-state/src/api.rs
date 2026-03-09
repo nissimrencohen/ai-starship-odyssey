@@ -137,6 +137,7 @@ pub struct RenderFrameState {
     pub score: u32,
     pub current_level: u32,
     pub is_game_over: bool,
+    pub is_transitioning: bool,
     pub black_hole_death: bool,
     pub objective: String,
     pub kills_in_level: u32,
@@ -938,6 +939,7 @@ pub async fn start_api_server(engine_state: EngineState) {
 
     // POST /api/engine/next-level — Triggered by AI Director to autonomously finish a level
     let force_next_level_route = force_next_level.clone();
+    let game_over_timer_for_next = game_over_timer.clone();
     let next_level_route = warp::post()
         .and(warp::path("api"))
         .and(warp::path("engine"))
@@ -945,6 +947,7 @@ pub async fn start_api_server(engine_state: EngineState) {
         .map(move || {
             println!("[Engine] Commander Override received. Advancing to next level.");
             *force_next_level_route.lock().unwrap() = true;
+            *game_over_timer_for_next.lock().unwrap() = 0.0;
             warp::reply::json(&serde_json::json!({ "status": "level_advanced_forced" }))
         });
 
@@ -1053,6 +1056,7 @@ pub async fn start_api_server(engine_state: EngineState) {
                 "Sec-WebSocket-Extensions",
                 "Connection",
                 "Upgrade",
+                "Sec-WebSocket-Protocol",
             ])
             .allow_methods(vec!["GET", "POST", "DELETE", "OPTIONS", "PUT", "PATCH"]);
         warp::serve(ws_route.with(cors))

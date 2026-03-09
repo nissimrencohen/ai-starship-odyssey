@@ -23,5 +23,6 @@ pub struct EngineState {
     pub do_full_reset: Arc<Mutex<bool>>,
     pub override_level: Arc<Mutex<Option<u32>>>,
     pub current_level_shared: Arc<Mutex<u32>>,
+    pub level_transition_timer: Arc<Mutex<f64>>,
     pub is_paused: Arc<Mutex<bool>>,
 }

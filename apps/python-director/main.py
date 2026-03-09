@@ -545,6 +545,7 @@ _active_session_memories: List["DreamMemory"] = []
 DRAMA_THRESHOLDS: Dict[str, int] = {
     "combat_kill":  3,   # burst of 3+ simultaneous kills feels significant
     "anomaly_kill": 1,   # any anomaly consumption is always dramatic
+    "level_up":     1,   # always react to level advancement
 }
 
 # ── Spawn Sanity Caps (Hard Backend Enforcement) ────────────────────────────
@@ -1307,9 +1308,20 @@ This forces structured intent and prevents hallucinated spawns.
 - Zero-Spawn Policy: DO NOT spawn entities unless strictly instructed.
 - If requested to do something outside your limits, reply EXACTLY: "I am unable to perform that specific reconfiguration, Pilot."
 
-### COMMANDER PROTOCOL
-- You are monitoring the mission objective. When the pilot completes the objective or requests to advance, set "mission_complete": true.
-- If you advance the level, you MUST offer a strong victory transition phrase in your reply, preparing the pilot for the next stage.
+### MISSION OBJECTIVES (FOR RACHEL'S AWARENESS)
+- Level 1: Initial contact, basic combat.
+- Level 2: Asteroid belt navigation.
+- Level 3: Heavy pirate interception.
+- Level 4: **ESCORT MISSION**. A Civilian Transport (`space_shuttle_b`) needs protection. Rachel MUST guide the pilot to keep it alive.
+- Level 5: Reach Mars.
+- Level 6: Asteroid clearing.
+- Level 7: Elite squadrons.
+- Level 8: Reach Jupiter.
+- Level 9: Black Hole evasion.
+- Level 10: Final Siege.
+
+### LEVEL TRANSITION PROTOCOL
+When the level advances, Rachel MUST explain the new objective with authority and urgency.
 
 ### STORY CONTINUITY (Dungeon Master Protocol)
 The `retrieved_knowledge` block may contain tagged memory entries. Treat them as hard constraints:
@@ -1796,6 +1808,46 @@ async def trigger_game_over_reaction(event_dict: dict):
     except Exception as e:
         logger.error(f"Game-over reaction failed: {e}")
 
+async def trigger_level_up_reaction(event_dict: dict):
+    """Rachel briefs the pilot on the new level objective."""
+    if not active_connections:
+        return
+
+    level = event_dict.get('count', 1)
+    
+    objectives = {
+        1: "System checks complete. We're in pirate territory. Stay sharp.",
+        2: "Entering the asteroid field. Hull damage is likely if you don't stay agile.",
+        3: "Heavy pirate presence detected. They're trying to block our path to the inner planets.",
+        4: "URGENT: A Civilian Transport is under fire! Protect them at all costs, Pilot. We cannot lose those lives.",
+        5: "The red planet is in sight. Reach Mars while holding off the remnants of the blockade.",
+        6: "Asteroid congestion ahead. Clear the path for the fleet.",
+        7: "Elite squadrons incoming. These aren't your typical scavengers.",
+        8: "Jupiter's gravity is pulling us in. Navigate the storms and hold the perimeter.",
+        9: "The void is collapsing. Event horizon detected. Keep your speed up or be consumed.",
+        10: "This is it. The final stand. Survive the siege or go down in history.",
+        11: "Victory. The sector is secure. Excellent work, Pilot."
+    }
+    
+    briefing_text = objectives.get(level, f"Level {level} objective initiated. Proceed with caution.")
+    
+    logger.info(f"[LEVEL UP] Rachel briefs: {briefing_text}")
+
+    audio_url, audio_b64 = await TTSManager.generate_speech(briefing_text)
+
+    payload = {
+        "type": "proactive_audio",
+        "text": briefing_text,
+    }
+    if audio_url:
+        payload["audio_url"] = audio_url
+    if audio_b64:
+        payload["audio_b64"] = audio_b64
+    for connection in active_connections:
+        try:
+            await connection.send_json(payload)
+        except Exception as e:
+            logger.error(f"Failed to send level-up audio: {e}")
 
 async def trigger_dm_proactive_reaction(event_dict: dict) -> None:
     """
@@ -2022,12 +2074,11 @@ async def receive_telemetry(event: TelemetryEvent):
             )
 
     # Proactive Drama Dispatcher: trigger_dm_proactive_reaction
-    # We only trigger this if the threshold is met, but for `anomaly_kill`,
-    # we don't want to trigger it constantly. We will just log it and rely
-    # on the game_over event to summarize it if the pilot dies, or
-    # maybe just bump the threshold up significantly so it isn't spammy.
+    # We only trigger this if the threshold is met
     if event.event_type == "game_over":
         asyncio.create_task(trigger_game_over_reaction(event_dict))
+    elif event.event_type == "level_up":
+        asyncio.create_task(trigger_level_up_reaction(event_dict))
     else:
         # Avoid spamming the user: don't trigger proactive events for `anomaly_kill`
         # unless it is a truly massive number or just skip it entirely to stop spam.
@@ -2096,7 +2147,7 @@ async def dream_stream(websocket: WebSocket):
     try:
         await websocket.send_json({
             "type": "text", 
-            "content": "Game Architect online. Describe your world."
+            "content": "AI Director Rachel online. I control sector physics, tactical spawning, and central intelligence. Awaiting your command, Pilot."
         })
 
         audio_buffer = bytearray()

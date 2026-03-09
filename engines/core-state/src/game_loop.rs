@@ -21,6 +21,7 @@ pub async fn run(engine_state: EngineState) {
     let do_full_reset_for_loop = engine_state.do_full_reset;
     let override_level_for_loop = engine_state.override_level;
     let current_level_shared_for_loop = engine_state.current_level_shared;
+    let level_transition_timer_for_loop = engine_state.level_transition_timer;
     let is_paused_for_loop = engine_state.is_paused;
     let player_input_state = engine_state.player_input_state;
     let reality_for_sys = engine_state.reality_modifiers;
@@ -57,6 +58,17 @@ pub async fn run(engine_state: EngineState) {
             println!("  [TICK START]");
         }
         print_counter += 1;
+
+        // --- LEVEL TRANSITION TIMER ---
+        let is_transitioning_active = {
+            let mut timer = level_transition_timer_for_loop.lock().unwrap();
+            if *timer > 0.0 {
+                *timer = (*timer - tick_dt).max(0.0);
+                true
+            } else {
+                false
+            }
+        };
 
         // Evaluate input for this frame
         let (thrust_forward, thrust_back, cam_yaw, cam_pitch, boost_active, shoot) = {
@@ -1126,7 +1138,7 @@ pub async fn run(engine_state: EngineState) {
                 let mut bh_q = w.query::<&SpatialAnomaly>();
                 bh_q.iter(&w).any(|a| a.anomaly_type == "black_hole")
             };
-            if non_player_enemy_deaths > 0 && !is_game_over_this_frame && !bh_active {
+            if non_player_enemy_deaths > 0 && !is_game_over_this_frame && !bh_active && !is_transitioning_active {
                 let variant = if current_level >= 10 { 2 } else if current_level >= 5 { 1 } else { 0 };
                 let range = if current_level <= 2 {
                     (1500.0, 4000.0)
@@ -1306,8 +1318,77 @@ pub async fn run(engine_state: EngineState) {
                     level_advanced = true;
                 }
             } else if current_level == 4 {
-                objective = format!("LEVEL 4: Destroy 25 mixed targets ({}/25)", target_kills);
-                if target_kills >= 25 {
+                // LEVEL 4 ESCORT MISSION
+                let mut transport_exists = false;
+                let mut transport_health = 0.0;
+                let mut transport_max_health = 100.0;
+
+                {
+                    let mut tq = w.query::<(&EntityType, &Name, &Health)>();
+                    for (et, name, health) in tq.iter(&w) {
+                        if et.0 == "neutral" && name.0 == "Civilian Transport" {
+                            transport_exists = true;
+                            transport_health = health.current;
+                            transport_max_health = health.max;
+                            break;
+                        }
+                    }
+                }
+
+                if !transport_exists && !is_transitioning_active {
+                    // Spawn the transport near the player
+                    println!("[Level 4] Spawning Civilian Transport...");
+                    w.spawn((
+                        EntityType("neutral".to_string()),
+                        Name("Civilian Transport".to_string()),
+                        Transform {
+                            x: p_pos.0 + 500.0,
+                            y: 0.0,
+                            z: p_pos.1 + 500.0,
+                            rotation: 0.0,
+                        },
+                        PhysicsType::Velocity { vx: 20.0, vy: 0.0, vz: 20.0 },
+                        SteeringAgent {
+                            velocity: (20.0, 0.0, 20.0),
+                            max_speed: 40.0,
+                            max_force: 1.0,
+                            behavior: "neutral_wander".to_string(),
+                        },
+                        Health { current: 200.0, max: 200.0 },
+                        Faction("neutral".to_string()),
+                        Visuals {
+                            model_type: Some("space_shuttle_b".to_string()),
+                            color: "#38bdf8".to_string(),
+                            is_cloaked: false,
+                        },
+                        SpatialAnomaly {
+                            anomaly_type: "ship".to_string(),
+                            mass: 0.0,
+                            radius: 60.0,
+                        },
+                    ));
+                }
+
+                objective = format!(
+                    "LEVEL 4: Protect Civilian Transport ({:.0}%) [{}s/60s]",
+                    (transport_health / transport_max_health * 100.0),
+                    elapsed_time
+                );
+
+                if transport_exists && transport_health <= 0.0 {
+                    println!("[Level 4] Transport DESTROYED! Resetting mission...");
+                    // Reset Level 4
+                    *level_start_time_for_loop.lock().unwrap() = std::time::Instant::now();
+                    // Cleanup existing enemies to give player a fresh start
+                    let mut to_cleanup = Vec::new();
+                    let mut eq = w.query::<(Entity, &EntityType)>();
+                    for (e, et) in eq.iter(&w) {
+                        if et.0 == "enemy" { to_cleanup.push(e); }
+                    }
+                    for e in to_cleanup { w.despawn(e); }
+                }
+
+                if elapsed_time >= 60 && transport_exists && transport_health > 0.0 {
                     current_level = 5;
                     level_advanced = true;
                 }
@@ -1365,6 +1446,7 @@ pub async fn run(engine_state: EngineState) {
                 if elapsed_time >= 180 || target_kills >= 100 {
                     objective = "VICTORY: The Void is quiet.".to_string();
                     current_level = 11;
+                    level_advanced = true;
                 }
             } else {
                 objective = "VICTORY: The Void is quiet.".to_string();
@@ -1377,6 +1459,28 @@ pub async fn run(engine_state: EngineState) {
 
             if level_advanced {
                 println!(">>> ADVANCED TO LEVEL {}! <<<", current_level);
+                *game_over_timer_for_loop.lock().unwrap() = 0.0;
+                *level_transition_timer_for_loop.lock().unwrap() = 2.5;
+
+                // Fire telemetry for AI Director
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let payload = serde_json::json!({
+                        "event_type": "level_up",
+                        "count": current_level,
+                        "cause": format!("Level {} Objective Completed", current_level - 1),
+                        "timestamp": format!("{}", ts)
+                    });
+                    let _ = client
+                        .post("http://127.0.0.1:8000/engine_telemetry")
+                        .json(&payload)
+                        .send()
+                        .await;
+                });
 
                 // --- PHASE 8.3: WORLD CLEAR PASS ---
                 // Despawn old enemies and projectiles on level advance. Asteroids persist as permanent world geometry.
@@ -1659,6 +1763,7 @@ pub async fn run(engine_state: EngineState) {
             score: current_score,
             current_level: current_level,
             is_game_over: current_game_over,
+            is_transitioning: is_transitioning_active,
             black_hole_death: bh_death_active && current_game_over,
             objective: objective,
             kills_in_level: current_score, // Simplified tracker
