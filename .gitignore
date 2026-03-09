@@ -1,29 +1,60 @@
 # General
 .env
+.env.local
 *.tmp
 *.log
 *.webm
+diff.txt
 node_modules/
 file_list.tmp
 world_snap.json
+.claude/
+tmp/
+.playwright-mcp/
+dist/
+build/
+bin/
+obj/
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+.pytest_cache/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
 
 # Web Client (React/Vite)
 apps/web-client/node_modules/
 apps/web-client/dist/
 apps/web-client/build/
 apps/web-client/test-results/
+apps/web-client/*.txt
+apps/web-client/*.log
 
 # Python Director
 apps/python-director/__pycache__/
 apps/python-director/venv/
 apps/python-director/.venv/
+apps/python-director/data/.cache/
+apps/python-director/test_hf.png
+apps/python-director/*.txt
+apps/python-director/*.log
 
 # Core State (Rust)
 engines/core-state/target/
-engines/core-state/debug.log
-engines/core-state/errors.txt
-engines/core-state/build_output.txt
+engines/core-state/cargo_*.log
+engines/core-state/cargo_*.txt
+engines/core-state/*.txt
+engines/core-state/*.log
 
 # OS File
 .DS_Store
 Thumbs.db
+Desktop.ini
+
+# AI Assets
+apps/web-client/public/assets/generated/
+apps/python-director/data/.cache/

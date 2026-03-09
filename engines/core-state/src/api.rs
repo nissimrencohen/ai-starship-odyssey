@@ -48,6 +48,10 @@ pub struct SpawnEntityRequest {
     pub frequency: Option<f64>,
     pub anomaly_type: Option<String>,
     pub mass: Option<f64>,
+    pub color: Option<String>,
+    pub model_type: Option<String>,
+    pub fire_rate_multiplier: Option<f64>,
+    pub behavior: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -333,12 +337,44 @@ pub async fn start_api_server(engine_state: EngineState) {
                     Faction(faction_str.clone()),
                 ));
                 // Add SteeringAgent for enemy/companion types so they can participate in faction combat
-                if req.ent_type == "enemy" || req.ent_type == "companion" {
+                if req.ent_type == "enemy" || req.ent_type == "companion" || req.ent_type == "neutral" {
+                    let default_behavior = if req.behavior.is_some() {
+                        req.behavior.clone().unwrap()
+                    } else if req.ent_type == "neutral" {
+                        "neutral_wander".to_string()
+                    } else {
+                        "idle".to_string()
+                    };
                     ent_mut.insert(SteeringAgent {
-                        behavior: "idle".to_string(),
+                        behavior: default_behavior.to_string(),
                         velocity: (0.0, 0.0, 0.0),
-                        max_speed: 80.0,
-                        max_force: 2.0,
+                        max_speed: if req.ent_type == "neutral" { 40.0 } else { 80.0 },
+                        max_force: if req.ent_type == "neutral" { 1.0 } else { 2.0 },
+                    });
+                }
+                if let Some(color) = &req.color {
+                    let m_type = req.model_type.clone().unwrap_or_else(|| req.ent_type.clone());
+                    ent_mut.insert(Visuals {
+                        model_type: Some(m_type),
+                        color: color.clone(),
+                        is_cloaked: false,
+                    });
+                    // Also initialize WeaponParameters with the same color
+                    ent_mut.insert(WeaponParameters {
+                        projectile_color: color.clone(),
+                        fire_rate_multiplier: req.fire_rate_multiplier.unwrap_or(1.0),
+                        ..Default::default()
+                    });
+                } else if req.ent_type == "enemy" {
+                    // Default enemy visuals
+                    ent_mut.insert(Visuals {
+                        model_type: Some("enemy".to_string()),
+                        color: "#ef4444".to_string(),
+                        is_cloaked: false,
+                    });
+                    ent_mut.insert(WeaponParameters {
+                        fire_rate_multiplier: req.fire_rate_multiplier.unwrap_or(1.0),
+                        ..Default::default()
                     });
                 }
                 if let Some(atype) = req.anomaly_type.clone() {
@@ -741,10 +777,16 @@ pub async fn start_api_server(engine_state: EngineState) {
                 if let Some(sc) = ent.scale { eb.insert(Scale(sc)); }
                 // Re-attach AI steering for enemies
                 if ent.ent_type == "enemy" || ent.ent_type == "alien_ship" {
-                    eb.insert(SteeringAgent { velocity: (0.0, 0.0, 0.0), max_speed: 7.5, max_force: 0.5, behavior: "wander".to_string() });
+                    eb.insert(SteeringAgent { velocity: (0.0, 0.0, 0.0), max_speed: 7.5, max_force: 0.5, behavior: "attack".to_string() });
                     eb.insert(Faction("pirate".to_string()));
                     eb.insert(SpatialAnomaly { anomaly_type: "alien".to_string(), mass: 0.0, radius: 100.0 });
-                    eb.insert(WeaponParameters { projectile_count: 1, projectile_color: "#ff3333".to_string(), spread: 0.1, projectile_size: 6.0 });
+                    eb.insert(WeaponParameters { 
+                        projectile_count: 1, 
+                        projectile_color: "#ff3333".to_string(), 
+                        spread: 0.1, 
+                        projectile_size: 6.0,
+                        fire_rate_multiplier: 1.0, 
+                    });
                 }
                 spawned += 1;
             }
@@ -799,6 +841,9 @@ pub async fn start_api_server(engine_state: EngineState) {
                         if let Some(sz) = proj_size {
                             weapon.projectile_size = sz;
                         }
+                        if let Some(frm) = req.fire_rate_multiplier {
+                            weapon.fire_rate_multiplier = frm;
+                        }
                     } else {
                         w.entity_mut(e).insert(WeaponParameters {
                             projectile_count: proj_count.unwrap_or(1),
@@ -807,6 +852,7 @@ pub async fn start_api_server(engine_state: EngineState) {
                                 .unwrap_or_else(|| "#ef4444".to_string()),
                             spread: spread.unwrap_or(0.1),
                             projectile_size: proj_size.unwrap_or(8.0),
+                            fire_rate_multiplier: req.fire_rate_multiplier.unwrap_or(1.0),
                         });
                     }
                 }

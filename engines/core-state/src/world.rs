@@ -97,6 +97,7 @@ pub fn spawn_wave(
                 projectile_color: proj_color,
                 spread: proj_spread,
                 projectile_size: proj_size,
+                fire_rate_multiplier: 1.0,
             });
         }
     }

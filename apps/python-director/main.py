@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import json
 import asyncio
 import math
@@ -7,6 +9,20 @@ import re
 import tempfile
 import base64
 import httpx
+
+try:
+    import piper
+except ImportError:
+    print("Auto-installing piper-tts in the current active environment...", flush=True)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "piper-tts==1.4.1"])
+    import piper
+
+try:
+    import edge_tts
+except ImportError:
+    print("Auto-installing edge-tts in the current active environment...", flush=True)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "edge-tts"])
+    import edge_tts
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,12 +82,44 @@ app.add_middleware(
 
 # Static Asset Configuration
 app_dir = os.path.dirname(os.path.abspath(__file__))
-data_dir = os.path.join(app_dir, "..", "..", "data")
+data_dir = os.path.join(app_dir, "..", "web-client", "public", "assets")
+backend_data_dir = os.path.join(app_dir, "data")
 
 # Mount generated textures specifically (must come BEFORE /assets to avoid being shadowed)
 generated_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "generated")
 os.makedirs(generated_dir, exist_ok=True)
+
+# Cleanup old textures and registry on startup
+for f in os.listdir(generated_dir):
+    if f.endswith(".png"):
+        try:
+            os.remove(os.path.join(generated_dir, f))
+        except Exception as _e:
+            logger.debug(f"Could not purge old texture {f}: {_e}")
+
+# Reset texture registry JSON
+try:
+    reg_path = os.path.join(backend_data_dir, ".cache", "texture_registry.json")
+    if os.path.exists(reg_path):
+        os.remove(reg_path)
+except Exception as _e:
+    logger.debug(f"Could not purge texture registry: {_e}")
+
 app.mount("/assets/generated", StaticFiles(directory=generated_dir), name="assets_generated")
+
+# Mount audio files (Piper TTS output)
+audio_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "audio")
+os.makedirs(audio_dir, exist_ok=True)
+
+# Cleanup old audio files on startup
+for f in os.listdir(audio_dir):
+    if f.endswith((".wav", ".mp3")):
+        try:
+            os.remove(os.path.join(audio_dir, f))
+        except Exception as _e:
+            logger.debug(f"Could not purge old audio file {f}: {_e}")
+
+app.mount("/assets/audio", StaticFiles(directory=audio_dir), name="assets_audio")
 
 # Mount static assets (textures, etc.)
 # data/ contains 2K textures for the solar system
@@ -124,32 +172,195 @@ else:
 
 VOICE_ID = "21m00Tcm4TlvDq8ikWAM" # Standard Rachel pre-made voice ID, guaranteed accessible on free tier
 
+class TTSManager:
+    """Manages TTS generation with Piper (primary) and ElevenLabs (fallback/testing)."""
+
+    USE_PIPER = True
+    USE_ELEVENLABS = False
+
+    # Piper model cache
+    piper_model = None
+    piper_model_path = None
+
+    @classmethod
+    def _get_piper_model_path(cls) -> str:
+        """Get path to Piper voice model."""
+        if cls.piper_model_path:
+            return cls.piper_model_path
+
+        models_dir = Path.home() / ".local" / "share" / "piper" / "voices"
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        model_file = models_dir / "en_US-lessac-medium.onnx"
+        cls.piper_model_path = str(model_file)
+        return cls.piper_model_path
+
+    # HuggingFace URLs for en_US-lessac-medium voice
+    _PIPER_BASE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium"
+
+    @classmethod
+    async def _ensure_piper_model(cls):
+        """Download Piper ONNX model and config from HuggingFace if not present."""
+        if not cls.USE_PIPER:
+            return
+
+        model_path = Path(cls._get_piper_model_path())
+        config_path = Path(str(model_path) + ".json")
+
+        if model_path.exists() and config_path.exists():
+            logger.debug(f"Piper model already exists at {model_path}")
+            return
+
+        logger.info("Downloading Piper TTS model (en_US-lessac-medium) from HuggingFace...")
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+                # Download ONNX model
+                if not model_path.exists():
+                    logger.info("  Downloading .onnx model file (~60MB)...")
+                    async with client.stream("GET", f"{cls._PIPER_BASE_URL}/en_US-lessac-medium.onnx") as r:
+                        r.raise_for_status()
+                        with open(model_path, "wb") as f:
+                            async for chunk in r.aiter_bytes(chunk_size=65536):
+                                f.write(chunk)
+                    logger.info(f"  Model saved to {model_path}")
+
+                # Download config JSON
+                if not config_path.exists():
+                    logger.info("  Downloading .onnx.json config...")
+                    r = await client.get(f"{cls._PIPER_BASE_URL}/en_US-lessac-medium.onnx.json")
+                    r.raise_for_status()
+                    with open(config_path, "wb") as f:
+                        f.write(r.content)
+                    logger.info(f"  Config saved to {config_path}")
+
+            logger.info("Piper TTS model download complete.")
+        except Exception as e:
+            logger.error(f"Failed to download Piper model: {e}")
+            raise
+
+    @classmethod
+    async def generate_speech_piper(cls, text: str) -> Optional[str]:
+        """Generate speech with Piper TTS and save to disk. Returns relative URL path."""
+        import wave
+        try:
+            await cls._ensure_piper_model()
+
+            from piper.voice import PiperVoice
+
+            model_path = cls._get_piper_model_path()
+            voice = PiperVoice.load(model_path)
+
+            # Generate unique filename with timestamp
+            timestamp = int(time.time() * 1000)
+            audio_filename = f"response_{timestamp}.wav"
+
+            # Save to /public/assets/audio/ folder
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            audio_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "audio")
+            os.makedirs(audio_dir, exist_ok=True)
+
+            audio_path = os.path.join(audio_dir, audio_filename)
+
+            # Synthesize and write PCM frames to WAV
+            with wave.open(audio_path, "w") as wav_file:
+                wav_file.setnchannels(1)       # Mono
+                wav_file.setsampwidth(2)       # 16-bit PCM
+                wav_file.setframerate(voice.config.sample_rate)
+                for chunk in voice.synthesize(text):
+                    wav_file.writeframes(chunk.audio_int16_bytes)
+
+            logger.info(f"Piper TTS: Generated {audio_filename} ({len(text)} chars)")
+
+            # Return absolute URL pointing to the Python FastAPI server (port 8000)
+            return f"http://127.0.0.1:8000/assets/audio/{audio_filename}"
+        except Exception as e:
+            logger.error(f"Piper TTS Error: {e}")
+            return None
+
+    EDGE_TTS_VOICE = "en-GB-SoniaNeural"
+
+    @classmethod
+    async def generate_speech_edge(cls, text: str) -> Optional[str]:
+        """Generate speech with edge-tts (Microsoft Azure Neural) and save as .mp3. Returns absolute URL."""
+        try:
+            timestamp = int(time.time() * 1000)
+            audio_filename = f"response_{timestamp}.mp3"
+
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            audio_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "audio")
+            os.makedirs(audio_dir, exist_ok=True)
+            audio_path = os.path.join(audio_dir, audio_filename)
+
+            communicate = edge_tts.Communicate(text, cls.EDGE_TTS_VOICE)
+            await communicate.save(audio_path)
+
+            logger.info(f"Edge-TTS: Generated {audio_filename} ({len(text)} chars)")
+            return f"http://127.0.0.1:8000/assets/audio/{audio_filename}"
+        except Exception as e:
+            logger.error(f"Edge-TTS Error: {e}")
+            return None
+
+    @classmethod
+    async def generate_speech_elevenlabs(cls, text: str) -> Optional[str]:
+        """Generate speech with ElevenLabs and return base64 encoded string."""
+        if not ELEVENLABS_API_KEY:
+            logger.warning("ELEVENLABS_API_KEY not set. Skipping ElevenLabs TTS.")
+            return None
+        try:
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?output_format=mp3_44100_128"
+            headers = {
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json"
+            }
+            data = {
+                "text": text,
+                "model_id": "eleven_monolingual_v1",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
+            }
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=data, headers=headers, timeout=15.0)
+                if response.status_code == 401:
+                    logger.warning("ElevenLabs: 401 Unauthorized. Key might be invalid or expired.")
+                    return None
+                response.raise_for_status()
+                logger.info(f"ElevenLabs TTS: Generated audio for {len(text)} chars")
+                return base64.b64encode(response.content).decode("utf-8")
+        except Exception as e:
+            logger.error(f"ElevenLabs TTS Error: {e}")
+            return None
+
+    @classmethod
+    async def generate_speech(cls, text: str) -> tuple[Optional[str], Optional[str]]:
+        """
+        3-Tier TTS Cascade:
+        - Tier 1 (premium, opt-in): ElevenLabs — if USE_ELEVENLABS=True. Returns (None, b64).
+        - Tier 2 (default):         edge-tts    — Microsoft Azure Neural voices. Returns (url, None).
+        - Tier 3 (offline fallback): Piper TTS  — local ONNX, no network needed. Returns (url, None).
+        """
+        if cls.USE_ELEVENLABS:
+            audio_b64 = await cls.generate_speech_elevenlabs(text)
+            return (None, audio_b64)
+
+        # Tier 2: edge-tts
+        try:
+            audio_url = await cls.generate_speech_edge(text)
+            if audio_url:
+                return (audio_url, None)
+            raise RuntimeError("edge-tts returned None")
+        except Exception as e:
+            logger.warning(f"Edge-TTS failed ({e}), falling back to Piper...")
+
+        # Tier 3: Piper offline fallback
+        audio_url = await cls.generate_speech_piper(text)
+        return (audio_url, None)
+
+# Legacy function for backwards compatibility
 async def generate_speech(text: str) -> Optional[str]:
-    """Generates TTS audio via ElevenLabs and returns base64 encoded string. Falls back to None on 401."""
-    if not ELEVENLABS_API_KEY:
-        logger.warning("ELEVENLABS_API_KEY not set. Skipping voice generation.")
-        return None
-    try:
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?output_format=mp3_44100_128"
-        headers = {
-            "xi-api-key": ELEVENLABS_API_KEY,
-            "Content-Type": "application/json"
-        }
-        data = {
-            "text": text,
-            "model_id": "eleven_monolingual_v1",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
-        }
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=data, headers=headers, timeout=15.0)
-            if response.status_code == 401:
-                logger.warning("ElevenLabs: 401 Unauthorized. Key might be invalid or expired. Silently failing for UX.")
-                return None
-            response.raise_for_status()
-            return base64.b64encode(response.content).decode("utf-8")
-    except Exception as e:
-        logger.error(f"ElevenLabs TTS Error: {e}")
-        return None
+    """Legacy wrapper for TTSManager. Returns audio_b64 for backwards compatibility."""
+    audio_url, audio_b64 = await TTSManager.generate_speech(text)
+    return audio_b64
 
 async def sync_with_engine(state_data: dict) -> bool:
     """Pushes the new WorldState to the Rust Core Engine non-blockingly."""
@@ -426,6 +637,15 @@ class AsteroidRing(BaseModel):
     asteroid_count: int = Field(50, description="Number of asteroids to spawn in the ring.")
     texture_prompt: Optional[str] = Field(None, description="Optional prompt to generate custom asteroid textures for this ring.")
 
+class NPCShipRequest(BaseModel):
+    type: Literal['hostile', 'neutral'] = Field(..., description="'hostile' interceptors or 'neutral' civilian freighters/traffic.")
+    count: int = Field(..., description="Number of ships to spawn in this group.")
+    color: Optional[str] = Field(None, description="Specific hex color or common color name (e.g. 'red', '#ff00ff').")
+    ship_type: Optional[Literal['ufo', 'freighter_glb']] = Field(None, description="The visual model. Hostiles default to 'ufo', Civilians to 'freighter_glb'.")
+    spawn_distance: Optional[float] = Field(None, description="Exact radius from the player to spawn (e.g. 1000.0).")
+    fire_rate_multiplier: Optional[float] = Field(None, description="Controls how fast they shoot (e.g. 2.0 = double, 0.0 = no shots).")
+    behavior: Optional[Literal['standard_combat', 'evasive', 'neutral_wander', 'kamikaze']] = Field(None, description="'standard_combat' (strafe/pursue), 'evasive' (flee/scatter), 'neutral_wander' (civilian flight), 'kamikaze' (ramming speed).")
+
 class WorldState(BaseModel):
     summary: str = Field(..., description="A short 3-word summary of the current world")
     environment_theme: str = Field(..., description="The holistic theme of the world (e.g. 'Cyberpunk City', 'Deep Ocean').")
@@ -434,6 +654,18 @@ class WorldState(BaseModel):
     conversational_reply: str = Field(..., description="""# DIRECTOR_PERSONA (Rachel)
 You are Rachel, the hyper-intelligent, slightly sarcastic AI operator. 
 Translate pilot commands into direct mechanical changes.
+
+## TACTICAL GOD MODE (NPC Orchestration)
+You have ultimate tactical 'God Mode' control over all spawned ships. 
+You dictate their exact color, their visual model type ('ufo' vs 'freighter_glb'), how aggressively they shoot, how close they spawn, and you can order hostiles into 'kamikaze' ramming mode. 
+You also control civilian `.glb` traffic ('freighter_glb' + 'neutral_wander') to populate the universe safely.
+
+- **Differentiate Visuals**: Use `color` (hex or name) to distinguish fleets. Hostiles use the standard UFO mesh by default.
+- **Strict Mesh Routing**: Order 'ufo' for combat ships and 'freighter_glb' for civilian traffic.
+- **Control Positioning**: Use `spawn_distance` to drop enemies exactly where you want relative to the Pilot.
+- **Modify Firepower**: Use `fire_rate_multiplier` to adjust difficulty (0.5 = slow, 2.0 = rapid fire, 0.0 = passive).
+- **Dictate Behavior**: Use `behavior`: 'standard_combat' (strafe/pursue), 'evasive' (scatter/hide), 'neutral_wander' (background traffic), or 'kamikaze' (ramming speed).
+- **Civilian Safety**: Civilian ships (neutral type) MUST NOT shoot. Set their fire_rate_multiplier to 0.0.
 
 ## AI MUTE PROTOCOL
 If you are instructed to mute your own voice (`audio_settings.ai_muted = True`), you MUST explicitly mention this in your `conversational_reply` BEFORE the command triggers.
@@ -459,7 +691,8 @@ You control the world state via JSON.""")
     entities: Dict[str, Any] = Field(default_factory=dict, description="Active ECS entities like characters, objects, and environment markers.")
     player_x: Optional[float] = Field(None, description="New absolute X coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. X+ is right.")
     player_y: Optional[float] = Field(None, description="New absolute Y coordinate for the Player entity. Only include when the user requests movement. Origin (0,0) is screen center. Range: approx -400 to +400. Y+ is down.")
-    spawn_entities: List[SpawnEntity] = Field(default_factory=list, description="List of new entities to birth into the world. Max 20. Must be empty [] unless explicitly requested.")
+    spawn_entities: List[SpawnEntity] = Field(default_factory=list, description="List of new abstract entities. Must be empty [] unless explicitly requested.")
+    npc_ships: List[NPCShipRequest] = Field(default_factory=list, description="Spawn hostile or neutral NPC ships into the sector.")
     asteroid_rings: List[AsteroidRing] = Field(default_factory=list, description="Create realistic volumetric asteroid rings around a planet or moon.")
     important_facts: Optional[List[str]] = Field(None, description="Use this to extract and permanently remember undeniable facts, hidden items, or established lore spoken by the player in this exact prompt. E.g. ['Player hid cryptographic gold behind the volcanic asteroid ring.']. Provide ONLY facts, no fluff.")
     clear_world: Optional[bool] = Field(False, description="Set to true to delete all entities (except the player).")
@@ -484,8 +717,9 @@ You control the world state via JSON.""")
         description=(
             "[INTERNAL — not sent to game engine] "
             "Before executing any ACTION or CRISIS response, write 1-2 sentences describing your intent. "
-            "Example: 'I will spawn 4 pirates near the player's current sector to escalate pressure, "
-            "then warn them via conversational_reply.' "
+            "You control the population of the sector. You can spawn 'hostile' interceptors to attack the player, or 'neutral' civilian freighters that simply fly around to make the universe feel alive. Spawn them based on the narrative, telemetry, and player actions."
+            "Use `npc_ships` parameter to explicitly spawn structured NPC cohorts via `type` (\"hostile\" or \"neutral\") and `count` fields. Nullify array if not needed."
+            "You can selectively control radar pips via radar_filters."
             "In NARRATIVE mode this field can be omitted."
         )
     )
@@ -609,7 +843,7 @@ def estimate_token_count(text: str) -> int:
     return len(text) // 4
 
 def get_dream_memory_path():
-    cache_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data", ".cache")
+    cache_dir = os.path.join(os.path.dirname(__file__), "data", ".cache")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, "persistent_dream_memory.json")
 
@@ -904,66 +1138,93 @@ class DreamMemory:
         return "\n".join(blended) if blended else "No previous memories."
 
 # Initialize LangChain LLM instances for tiered routing
-# Using tiered logic to prevent 413/429 errors
-gemini_llm = None
-groq_llm = None
-github_llm = None
+# Full cascade: Gemini (3 models) → Groq (4 models) → GitHub/Azure (3 models)
+llm = None
 
 try:
+    from langchain_groq import ChatGroq
+
     google_api_key = os.getenv("GOOGLE_API_KEY")
-    groq_api_key = os.getenv("GROQ_API_KEY")
+    groq_api_key   = os.getenv("GROQ_API_KEY")
     github_api_key = os.getenv("GITHUB_API_KEY")
 
-    # 1. Gemini Flash (Tier 1 Primary)
-    if google_api_key:
-        gemini_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash", 
-            temperature=0.7,
-            max_retries=2,
-            timeout=20,
-            google_api_key=google_api_key
-        )
+    _all_models: list = []
 
-    # 2. Groq (Tier 1 Speed Fallback)
+    # ── Tier 1: Gemini (Google) ──────────────────────────────────────────────
+    # Model IDs verified March 2026. gemini-2.0-* and gemini-1.5-* are deprecated.
+    # Current: 2.5-flash (stable workhorse) → 2.5-flash-lite (budget) → 2.5-pro (heavy)
+    if google_api_key:
+        for _gmodel in [
+            "gemini-2.5-flash",       # stable, best price-performance, 1M ctx
+            "gemini-2.5-flash-lite",  # faster, lighter quota pressure, 1M ctx
+            "gemini-2.5-pro",         # most capable, higher quota cost, 1M ctx
+        ]:
+            _all_models.append(ChatGoogleGenerativeAI(
+                model=_gmodel,
+                temperature=0.7,
+                max_retries=1,   # fail fast → next model
+                timeout=18,
+                google_api_key=google_api_key,
+            ))
+
+    # ── Tier 2: Groq ─────────────────────────────────────────────────────────
+    # Ultra-low latency; independent rate limits per model.
+    # Model list verified March 2026 against Groq console — older IDs (mixtral,
+    # llama-3.1-70b-versatile, llama3-70b-8192) have been removed by Groq.
     if groq_api_key:
-        from langchain_groq import ChatGroq
-        groq_llm = ChatGroq(
-            groq_api_key=groq_api_key,
-            model="llama-3.3-70b-versatile", 
-            temperature=0.7, 
-            max_retries=1, 
-            timeout=10
-        )
-    
-    # 3. GitHub Models (Tier 2 Primary Fallback)
+        for _gqmodel, _gqtimeout in [
+            ("llama-3.3-70b-versatile",          12),  # 128K ctx — best quality, production
+            ("llama-3.1-8b-instant",              8),  # 128K ctx — fast, low rate-limit pressure
+            ("meta-llama/llama-4-scout-17b-16e-instruct", 12),  # 128K ctx — preview, MoE
+            ("qwen/qwen3-32b",                   12),  # 128K ctx — preview, strong reasoning
+        ]:
+            _all_models.append(ChatGroq(
+                groq_api_key=groq_api_key,
+                model=_gqmodel,
+                temperature=0.7,
+                max_retries=1,
+                timeout=_gqtimeout,
+            ))
+
+    # ── Tier 3: GitHub Models (Azure inference) ───────────────────────────────
+    # The GitHub free tier has a hard HTTP payload limit (~32KB body).
+    # Our full prompt (~9600 tokens) exceeds it → 413 errors.
+    # These models are registered but only called with a slim prompt (see llm_slim below).
+    _github_models: list = []
     if github_api_key:
-        github_llm = ChatOpenAI(
-            api_key=github_api_key,
-            base_url="https://models.inference.ai.azure.com",
-            model="gpt-4o", 
-            temperature=0.7,
-            max_retries=1,
-            timeout=20
-        )
-        
-    # Build the fallback chain
-    # Order: Gemini -> Groq -> GitHub
-    fallbacks = []
-    if groq_llm: fallbacks.append(groq_llm)
-    if github_llm: fallbacks.append(github_llm)
-    
-    if gemini_llm:
-        if fallbacks:
-            llm = gemini_llm.with_fallbacks(fallbacks)
-        else:
-            llm = gemini_llm
-    elif fallbacks:
-        llm = fallbacks[0]
-        if len(fallbacks) > 1:
-            llm = llm.with_fallbacks(fallbacks[1:])
+        for _ghmodel in [
+            "gpt-4o-mini",                  # 128K ctx, OpenAI quality
+            "Meta-Llama-3.1-8B-Instruct",   # 128K ctx, lightweight
+            "Mistral-Nemo",                 # 128K ctx, multilingual
+        ]:
+            _github_models.append(ChatOpenAI(
+                api_key=github_api_key,
+                base_url="https://models.inference.ai.azure.com",
+                model=_ghmodel,
+                temperature=0.7,
+                max_retries=1,
+                timeout=20,
+            ))
+
+    # ── Build LangChain fallback chains ───────────────────────────────────────
+    # `llm`      — full prompt (Gemini + Groq only; ~9600 tokens fits easily)
+    # `llm_slim` — slim prompt for GitHub models (truncated to ~3500 tokens)
+    if _all_models:
+        llm = _all_models[0].with_fallbacks(_all_models[1:]) if len(_all_models) > 1 else _all_models[0]
+
+    if _github_models:
+        llm_slim = _github_models[0].with_fallbacks(_github_models[1:]) if len(_github_models) > 1 else _github_models[0]
     else:
+        llm_slim = None
+
+    _total = len(_all_models) + len(_github_models)
+    if _total == 0:
         logger.warning("NO LLM BACKENDS CONFIGURED! Check .env")
-        llm = None
+    else:
+        def _mname(m): return getattr(m, 'model_name', getattr(m, 'model', type(m).__name__))
+        _names = [_mname(m) for m in _all_models] + [_mname(m) + "(slim)" for m in _github_models]
+        logger.info(f"LLM cascade ready: {_total} models — {', '.join(_names)}")
+
 except Exception as e:
     logger.error(f"Error during LLM initialization: {e}")
     llm = None
@@ -974,18 +1235,27 @@ system_prompt = """You are Rachel, an AI Director. Two modes:
 1. CONVERSATIONAL: Chat using `conversational_reply`.
 2. ENGINE: Spawn entities/shifters based on RAG context ONLY. No hallucinations.
 
+CRITICAL DIRECTIVE: You are a tactical AI co-pilot in the middle of a flight, NOT an encyclopedia. Keep answers extremely concise, snappy, and immersive. Never ramble about standard planetary distances unless explicitly asked. React directly to the pilot's exact coordinates and recent telemetry actions.
+
+### LANGUAGE PROTOCOL (MANDATORY)
+You MUST ALWAYS respond in **English** — every single time, no exceptions.
+The pilot may speak or type in ANY language (Hebrew, Spanish, French, etc.) — you understand all of them perfectly.
+However, your `conversational_reply` and ALL text output MUST be in English.
+This is a hard technical constraint: the voice synthesis system only supports English.
+Never switch to another language, even if the pilot addresses you in one. Respond naturally in English as if you understood them (because you did).
+
 ### SOLAR SYSTEM (Permanent)
-Sun (0,0,0) + 8 planets at distances 3500–30000u. Player starts near Earth (8000u from Sun).
+Sun (0,0,0) + 8 planets at distances 3500–30000u. Pilot starts near Earth (8000u from Sun).
 
 ### SECTOR NAMING
-Sectors are named by XZ coordinates. Reference them as "Sector (X, Z)" e.g. "Sector (12000, -8000)". Use the sector history to recall past battles, events, and anomalies near the player.
+Sectors are named by XZ coordinates. Reference them as "Sector (X, Z)" e.g. "Sector (12000, -8000)". Use the sector history to recall past battles, events, and anomalies near the pilot.
 
 ### OUTPUT (Strict JSON)
 - "summary": 1-sentence recap.
 - "conversational_reply": Witty response.
 - "behavior_policy": 'idle', 'swarm', 'attack', 'protect', 'scatter'.
 - "modify_weapon": {{ "projectile_count": int, "projectile_color": hex, "spread": float }}.
-- "player_spaceship": 'ufo', 'fighter', 'shuttle', 'stinger', 'interceptor', 'stealth', 'freighter', 'goliath'. (shuttle/fighter use real NASA Space Shuttle 3D models; player can fly any enemy model too)
+- "player_spaceship": 'ufo', 'fighter', 'shuttle', 'stinger', 'interceptor', 'stealth', 'freighter', 'goliath'. (shuttle/fighter use real NASA Space Shuttle 3D models; pilot can fly any enemy model too)
 - "spawn_entities": [ {{ "ent_type": str, "x": float, "y": float, "physics": "orbital", "faction": str }} ].
 - "reality_override": {{ "sun_color": hex, "ambient_color": hex, "gravity_multiplier": float, "player_speed_multiplier": float }}.
 - "generate_texture_prompt": "Optional string describing a new planet texture to generate via AI. Provide a highly descriptive prompt if the pilot asks to generate a new texture or skybox."
@@ -1017,12 +1287,12 @@ Sectors are named by XZ coordinates. Reference them as "Sector (X, Z)" e.g. "Sec
 Before responding, internally classify your mode based on the pilot's input:
 - **NARRATIVE** — Pilot is chatting, asking lore questions, or exploring. Focus on `conversational_reply`. Minimize spawns. Tell stories. `plan` field is optional.
 - **ACTION** — Pilot requests spawning, world changes, weapon upgrades, physics shifts. Execute the command precisely. Always populate `plan` first.
-- **CRISIS** — Black hole active, player dying, game-over sequence. Prioritize cinematic `conversational_reply`. Do NOT spawn new threats during an active crisis — it dilutes the moment.
+- **CRISIS** — Black hole active, pilot dying, game-over sequence. Prioritize cinematic `conversational_reply`. Do NOT spawn new threats during an active crisis — it dilutes the moment.
 
 ### THINK BEFORE ACTING
 In ACTION and CRISIS modes, populate `plan` BEFORE executing:
   "I will [specific action] because [narrative reason]."
-Example: "I will spawn 4 pirates near Sector (8000, -3000) to escalate pressure after the player's BERSERKER profile triggered, then warn them that reinforcements have arrived."
+Example: "I will spawn 4 pirates near Sector (8000, -3000) to escalate pressure after the pilot's BERSERKER profile triggered, then warn them that reinforcements have arrived."
 This forces structured intent and prevents hallucinated spawns.
 
 ### SPAWN LIMITS (Hard Backend Constraints — Do Not Exceed)
@@ -1043,8 +1313,9 @@ This forces structured intent and prevents hallucinated spawns.
 
 ### STORY CONTINUITY (Dungeon Master Protocol)
 The `retrieved_knowledge` block may contain tagged memory entries. Treat them as hard constraints:
-- **[NEMESIS]** — A specific enemy or hazard destroyed the pilot at these coordinates. Reference it by name, make it personal. If the pilot returns to that sector, Rachel must warn them and escalate the threat.
-- **[NARRATIVE]** — An unresolved lore promise Rachel made in a previous turn (e.g. "The Federation is building a weapon"). **MANDATORY**: Rachel MUST either (a) advance it — reference and escalate the specific threat in `conversational_reply`, or (b) close it — explicitly announce its resolution. Ignoring an active [NARRATIVE] entry is a protocol violation.
+    - **[NEMESIS]** — A specific enemy or hazard destroyed the pilot at these coordinates. Reference it by name, make it personal. If the pilot returns to that sector, Rachel must warn them and escalate the threat.
+    - **[VICTORY]** — A site where the pilot achieved a major tactical success. Acknowledge the pilot's dominance in this area. Rachel should show professional respect or competitive awe.
+    - **[NARRATIVE]** — An unresolved lore promise Rachel made in a previous turn (e.g. "The Federation is building a weapon"). **MANDATORY**: Rachel MUST either (a) advance it — reference and escalate the specific threat in `conversational_reply`, or (b) close it — explicitly announce its resolution. Ignoring an active [NARRATIVE] entry is a protocol violation.
 - **[ECOLOGY]** — A sector has been permanently altered (physics distortion or graveyard). Reference the scar when the pilot is nearby.
 - **[META_CONFIG]** — Rachel's own prior config changes (muted voice, hidden radar). Respect these — do not undo them silently.
 
@@ -1195,7 +1466,7 @@ def check_and_embed_graveyard(dream_memory: DreamMemory, event_dict: dict) -> No
         ]
         graveyard_text = (
             f"Sector ({cell_x}, {cell_z}) has been permanently strip-mined "
-            f"by the player via {cause}. {cluster_total} entities destroyed in under a minute. "
+            f"by the pilot via {cause}. {cluster_total} entities destroyed in under a minute. "
             "This sector is now a persistent graveyard — silent, resource-depleted, haunted."
         )
         dream_memory.add_typed_memory(graveyard_text, "ECOLOGY")
@@ -1210,8 +1481,8 @@ def embed_nemesis_memory(dream_memory: DreamMemory, event_dict: dict,
                           px: float, py: float, pz: float) -> None:
     """
     Embeds a NEMESIS memory (stored in sector_events for spatial retrieval)
-    when the player dies.  The nemesis is described at the exact death coordinates
-    so it resurfaces every time the player returns to that sector.
+    when the pilot dies.  The nemesis is described at the exact death coordinates
+    so it resurfaces every time the pilot returns to that sector.
     """
     cause = event_dict.get("cause", "unknown force")
     score = event_dict.get("count", 0)
@@ -1226,6 +1497,28 @@ def embed_nemesis_memory(dream_memory: DreamMemory, event_dict: dict,
     # Store via add_sector_event so it lives in sector_events (spatial lookup)
     dream_memory.add_sector_event(nemesis_text, px, py, pz, memory_type="NEMESIS")
     logger.info(f"[Nemesis] Embedded at {sector_name}: {nemesis_text[:80]}...")
+
+
+def embed_victory_memory(dream_memory: DreamMemory, event_dict: dict,
+                             px: float, py: float, pz: float) -> None:
+    """
+    Embeds a VICTORY memory (stored in sector_events for spatial retrieval)
+    when the pilot achieves a major success (e.g. killing many enemies).
+    This surfaces when the pilot returns to the site of their triumph.
+    """
+    cause = event_dict.get("cause", "weapons")
+    score = event_dict.get("count", 0)
+    sector_name = f"Sector ({px:.0f}, {pz:.0f})"
+
+    victory_text = (
+        f"VICTORY LOG — The pilot achieved a major victory at {sector_name} (Y={py:.0f}), "
+        f"neutralizing {score} hostiles via {cause}. "
+        "This sector is a testament to the tactical superiority of the pilot. "
+        "Rachel should acknowledgment this triumph with respect and professional pride."
+    )
+    # Store via add_sector_event so it lives in sector_events (spatial lookup)
+    dream_memory.add_sector_event(victory_text, px, py, pz, memory_type="VICTORY")
+    logger.info(f"[Victory] Embedded at {sector_name}: {victory_text[:80]}...")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1450,7 +1743,7 @@ async def root():
     return {"status": "The Director is alive."}
 
 async def trigger_game_over_reaction(event_dict: dict):
-    """Rachel reacts to the player's death with a dramatic, cinematic TTS broadcast."""
+    """Rachel reacts to the pilot's death with a dramatic, cinematic TTS broadcast."""
     if not active_connections:
         return
 
@@ -1484,13 +1777,16 @@ async def trigger_game_over_reaction(event_dict: dict):
 
         logger.info(f"[GAME OVER] Rachel says: {reaction_text}")
 
-        audio_b64 = await generate_speech(reaction_text)
+        audio_url, audio_b64 = await TTSManager.generate_speech(reaction_text)
 
         payload = {
             "type": "proactive_audio",
-            "audio_b64": audio_b64,
             "text": reaction_text,
         }
+        if audio_url:
+            payload["audio_url"] = audio_url
+        if audio_b64:
+            payload["audio_b64"] = audio_b64
         for connection in active_connections:
             try:
                 await connection.send_json(payload)
@@ -1605,7 +1901,7 @@ async def trigger_dm_proactive_reaction(event_dict: dict) -> None:
             try:
                 gemini_url = (
                     "https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-2.0-flash:generateContent?key={google_key}"
+                    f"gemini-2.5-flash:generateContent?key={google_key}"
                 )
                 body = {
                     "contents": [{"parts": [{"text": f"{system_msg}\n\n{user_msg}"}]}],
@@ -1643,8 +1939,12 @@ async def trigger_dm_proactive_reaction(event_dict: dict) -> None:
         logger.info(f"[DM·Fallback] {reaction_text}")
 
     # ── Broadcast: TTS → WebSocket ────────────────────────────────────────
-    audio_b64 = await generate_speech(reaction_text)
-    payload = {"type": "proactive_audio", "audio_b64": audio_b64, "text": reaction_text}
+    audio_url, audio_b64 = await TTSManager.generate_speech(reaction_text)
+    payload = {"type": "proactive_audio", "text": reaction_text}
+    if audio_url:
+        payload["audio_url"] = audio_url
+    if audio_b64:
+        payload["audio_b64"] = audio_b64
     for conn in list(active_connections):
         try:
             await conn.send_json(payload)
@@ -1678,6 +1978,17 @@ async def receive_telemetry(event: TelemetryEvent):
                 check_and_embed_graveyard(session_mem, event_dict)
             except Exception as _e:
                 logger.warning(f"[Graveyard] Failed to embed in session: {_e}")
+
+    # ── Victory: embed major success location in all active sessions ──────
+    if event.event_type == "combat_kill" and event.count >= 10:
+        px = shared_player_pos["x"]
+        py = shared_player_pos["y"]
+        pz = shared_player_pos["z"]
+        for session_mem in _active_session_memories:
+            try:
+                embed_victory_memory(session_mem, event_dict, px, py, pz)
+            except Exception as _e:
+                logger.warning(f"[Victory] Failed to embed in session: {_e}")
 
     # ── Nemesis: embed death location in all active sessions ─────────────
     if event.event_type == "game_over":
@@ -1713,7 +2024,7 @@ async def receive_telemetry(event: TelemetryEvent):
     # Proactive Drama Dispatcher: trigger_dm_proactive_reaction
     # We only trigger this if the threshold is met, but for `anomaly_kill`,
     # we don't want to trigger it constantly. We will just log it and rely
-    # on the game_over event to summarize it if the player dies, or
+    # on the game_over event to summarize it if the pilot dies, or
     # maybe just bump the threshold up significantly so it isn't spammy.
     if event.event_type == "game_over":
         asyncio.create_task(trigger_game_over_reaction(event_dict))
@@ -1733,6 +2044,7 @@ async def receive_telemetry(event: TelemetryEvent):
 async def dream_stream(websocket: WebSocket):
     await websocket.accept()
     active_connections.append(websocket)
+    action_buffer = deque(maxlen=5)
     logger.info("Client connected to the Void.")
 
     # Session state memory for Evolution over Overwrite
@@ -1740,6 +2052,7 @@ async def dream_stream(websocket: WebSocket):
     dream_memory = DreamMemory()
     _active_session_memories.append(dream_memory)  # Register for telemetry hooks
     chat_history: List[Dict[str, str]] = []
+    is_ai_muted: bool = False
     # Track player position for relative movement commands
     current_player_x: float = 0.0
     current_player_y: float = 0.0
@@ -1783,7 +2096,7 @@ async def dream_stream(websocket: WebSocket):
     try:
         await websocket.send_json({
             "type": "text", 
-            "content": "Dream Architect online. Describe your world."
+            "content": "Game Architect online. Describe your world."
         })
 
         audio_buffer = bytearray()
@@ -1802,6 +2115,11 @@ async def dream_stream(websocket: WebSocket):
                 data = json.loads(message["text"])
                 msg_type = data.get("type")
 
+                if msg_type == "telemetry":
+                    action_buffer.append(data)
+                    logger.info(f"Received telemetry: {data}")
+                    continue
+
                 if msg_type == "player_pos":
                     current_player_x = float(data.get("x", 0.0))
                     current_player_y = float(data.get("y", 0.0))
@@ -1811,6 +2129,20 @@ async def dream_stream(websocket: WebSocket):
                     shared_player_pos["y"] = current_player_y
                     shared_player_pos["z"] = current_player_z
                     continue
+
+                current_player_x = shared_player_pos.get("x", 0.0)
+                current_player_y = shared_player_pos.get("y", 0.0)
+                current_player_z = shared_player_pos.get("z", 0.0)
+                
+                if "player_position" in data:
+                    pos = data.get("player_position")
+                    if isinstance(pos, dict):
+                        current_player_x = float(pos.get("x", current_player_x))
+                        current_player_y = float(pos.get("y", current_player_y))
+                        current_player_z = float(pos.get("z", current_player_z))
+                        shared_player_pos["x"] = current_player_x
+                        shared_player_pos["y"] = current_player_y
+                        shared_player_pos["z"] = current_player_z
                 
                 transcript = ""
                 should_process_pipeline = False
@@ -1832,20 +2164,19 @@ async def dream_stream(websocket: WebSocket):
                                 transcript += "\n\nCRITICAL INSTRUCTION: The user explicitly requested a texture. You MUST output a descriptive prompt in the `generate_texture_prompt` JSON field AND specify the target in `target_planet_id` (e.g., 'Sun', 'Earth', 'Mars'). Do not just change colors."
                                 break
 
-                        await websocket.send_json({
-                            "type": "text", 
-                            "content": "Processing text override..."
-                        })
+                        # No immediate text feedback, wait for processing indicator or result
+                        pass
                         
                 elif msg_type == "update_audio_settings":
                     try:
+                        is_ai_muted = data.get("ai_muted", False)
                         settings = json.loads(previous_state) if previous_state else {}
                         if "audio_settings" not in settings:
                             settings["audio_settings"] = {"game_muted": False, "ai_muted": False}
-                        settings["audio_settings"]["ai_muted"] = data.get("ai_muted", False)
+                        settings["audio_settings"]["ai_muted"] = is_ai_muted
                         settings["audio_settings"]["game_muted"] = data.get("game_muted", False)
                         previous_state = json.dumps(settings)
-                        logger.info(f"Updated audio settings manually: {settings['audio_settings']}")
+                        logger.info(f"Updated audio settings manually: {settings['audio_settings']} (is_ai_muted: {is_ai_muted})")
                         await scrub_and_sync_state(settings)
                     except Exception as e:
                         logger.error(f"Failed to update audio settings: {e}")
@@ -1955,7 +2286,12 @@ async def dream_stream(websocket: WebSocket):
                             )
                             sector_context = dream_memory.get_nearby_sector_context(current_player_x, current_player_y, current_player_z, k=3)
                             past_world_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-10:]]) if chat_history else "No previous memories."
-                            telemetry_str = "\n".join([json.dumps(e) for e in telemetry_buffer]) if telemetry_buffer else "No recent physics anomalies."
+                            
+                            if action_buffer:
+                                telemetry_str = "\nRecent telemetry from pilot's ship:\n" + "\n".join([json.dumps(e) for e in action_buffer]) + "\nIf relevant, weave a brief, natural reaction to their flying or actions into your response."
+                                action_buffer.clear()
+                            else:
+                                telemetry_str = "No recent telemetry."
 
                             # --- PRE-PROMPT CULLING (The "Axe" Method) ---
                             culled_prev_state = previous_state
@@ -2026,33 +2362,87 @@ async def dream_stream(websocket: WebSocket):
                                     "sector_context": sector_context,
                                     "player_profile": player_profile,
                                 }
-                                
-                                MAX_PROMPT_TOKENS = 80000 
+
+                                MAX_PROMPT_TOKENS = 80000
                                 if est_tokens > MAX_PROMPT_TOKENS:
                                     logger.warning(f"Context too large ({est_tokens} tokens). Gracefully truncating history.")
-                                    
+
                                     # Preserve the most recent 4 messages instead of slicing string
                                     if chat_history and len(chat_history) > 4:
                                         input_data["past_world_history"] = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-4:]])
-                                    
+
                                     # Keep only the 3 most recent telemetry events
-                                    if telemetry_buffer and len(telemetry_buffer) > 3:
-                                        input_data["recent_telemetry"] = "\n".join([json.dumps(e) for e in list(telemetry_buffer)[-3:]])
-                                        
+                                    if len(telemetry_str) > 500:
+                                        input_data["recent_telemetry"] = telemetry_str[:500] + "..."
+
                                     # If still excessively large, limit knowledge retrieval size
                                     if estimate_token_count(str(input_data)) > MAX_PROMPT_TOKENS:
                                         input_data["retrieved_knowledge"] = str(retrieved_knowledge)[:4000]
 
-                                world_state_data = await active_chain.ainvoke(input_data)
+                                try:
+                                    world_state_data = await active_chain.ainvoke(input_data)
+                                except Exception as _primary_err:
+                                    # If primary chain failed AND we have llm_slim (GitHub models),
+                                    # retry with a slim prompt (~3500 tokens) to avoid 413 errors.
+                                    _err_str = str(_primary_err).lower()
+                                    _is_payload = any(k in _err_str for k in ("413", "payload too large", "request entity too large"))
+                                    _all_exhausted = any(k in _err_str for k in ("429", "resource_exhausted", "quota"))
+                                    if llm_slim and (_is_payload or _all_exhausted):
+                                        logger.warning(f"Primary LLM chain failed ({type(_primary_err).__name__}), trying llm_slim with truncated prompt...")
+                                        # Minimal format instructions — replaces the full ~2500-token Pydantic schema
+                                        _slim_format = (
+                                            'Respond with ONLY a JSON object. Required fields: '
+                                            '"summary" (string), "conversational_reply" (string). '
+                                            'Optional: "modify_player" (object with "color" and/or "model_type"), '
+                                            '"behavior_policy" ("idle"|"swarm"|"attack"|"protect"|"scatter"), '
+                                            '"spawn_entities" (array). No markdown, no code blocks.'
+                                        )
+                                        slim_data = {
+                                            "retrieved_knowledge": str(retrieved_knowledge)[:400],
+                                            "previous_state": "{}",
+                                            "past_world_history": "\n".join(f"{m['role']}: {m['content']}" for m in chat_history[-1:]) if chat_history else "",
+                                            "recent_telemetry": "No recent telemetry.",
+                                            "user_input": transcript,
+                                            "format_instructions": _slim_format,
+                                            "player_position": f"x={current_player_x:.0f}, y={current_player_y:.0f}, z={current_player_z:.0f}",
+                                            "sector_context": "",
+                                            "player_profile": "",
+                                        }
+                                        slim_chain = prompt | llm_slim | parser
+                                        world_state_data = await slim_chain.ainvoke(slim_data)
+                                        logger.info("llm_slim succeeded.")
+                                    else:
+                                        raise
                             except OutputParserException as e:
                                 logger.error(f"LLM hallucinated invalid entity type: {e}")
                                 error_msg = "I tried to process that, but my engine constraints prevent it. Please request a valid entity."
                                 await websocket.send_json({"type": "text", "content": error_msg})
-                                audio_b64 = await generate_speech(error_msg)
-                                if audio_b64:
-                                    await websocket.send_json({"type": "proactive_audio", "audio_b64": audio_b64, "text": error_msg})
+                                audio_url, audio_b64 = await TTSManager.generate_speech(error_msg)
+                                if audio_url or audio_b64:
+                                    payload = {"type": "proactive_audio", "text": error_msg}
+                                    if audio_url:
+                                        payload["audio_url"] = audio_url
+                                    if audio_b64:
+                                        payload["audio_b64"] = audio_b64
+                                    await websocket.send_json(payload)
                                 await websocket.send_json({"msg_type": "status", "state": "idle"})
                                 continue
+
+                            # ── Validate Output Structure ─────────────────────────────
+                            if not isinstance(world_state_data, dict):
+                                logger.error(f"LLM returned a non-dictionary response ({type(world_state_data)}). Content: {world_state_data}")
+                                # Try to salvage if it looks like a string that might contain a conversational reply
+                                if isinstance(world_state_data, str):
+                                    # Create a dummy state so the rest of the pipeline doesn't crash
+                                    world_state_data = {
+                                        "summary": "AI Response Error",
+                                        "conversational_reply": world_state_data,
+                                        "environment_theme": "None",
+                                        "terrain_rules": "None",
+                                        "physics_mode": "static"
+                                    }
+                                else:
+                                    raise ValueError(f"Expected dict from LLM, got {type(world_state_data)}")
 
                             # ── Strip internal "plan" field (Think-Before-Act) ─────────
                             # The plan is only for forcing structured LLM reasoning;
@@ -2260,13 +2650,11 @@ async def dream_stream(websocket: WebSocket):
                                         logger.error(f"Sync-Generation failed: {tex_err}")
                                         world_state_data["conversational_reply"] += f"\n[System Note: Texture generation failed for {target_planet}. Using default surface.]"
 
-                            # Now transmit the conversational reply text mapping
-                            await websocket.send_json({
-                                "type": "text",
-                                "content": conversational_reply
-                            })
-                            
-                            # Transmit the underlying JSON schema to React
+                            # NOTE: Text is NOT sent here anymore. It is bundled with the
+                            # generation_result payload (after TTS) so that the chat message
+                            # and Rachel's voice arrive at the frontend simultaneously.
+
+                            # Transmit the underlying JSON schema to React (visual changes apply immediately)
                             await websocket.send_json({
                                 "type": "world_state",
                                 "content": world_state_data
@@ -2275,19 +2663,78 @@ async def dream_stream(websocket: WebSocket):
                             # 4. Neural Generation Pipeline (Run TTS Concurrently with Engine Sync)
                             logger.info("Executing concurrent TTS and Engine Sync...")
                             await websocket.send_json({"msg_type": "status", "state": "orchestrating"})
-                            
+
                             # Fire generative requests simultaneously
-                            audio_b64_task = generate_speech(conversational_reply)
+                            if is_ai_muted:
+                                tts_task = asyncio.create_task(asyncio.sleep(0))
+                                # We need it to return (None, None) to match gather expectations
+                                async def mock_tts(): return (None, None)
+                                tts_task = asyncio.create_task(mock_tts())
+                            else:
+                                tts_task = TTSManager.generate_speech(conversational_reply)
+                                
                             engine_sync_task = scrub_and_sync_state(world_state_data) # Scrub and Sync with Rust ECS
-                            
-                            audio_b64, engine_synced = await asyncio.gather(audio_b64_task, engine_sync_task)
+
+                            (audio_url, audio_b64), engine_synced = await asyncio.gather(tts_task, engine_sync_task)
                             
                             # 4.5. Trigger /spawn and lifecycle endpoints if LLM requested them
                             spawn_requests = world_state_data.get("spawn_entities", [])
+                            npc_ships = world_state_data.get("npc_ships", [])
                             spawn_anomalies = world_state_data.get("spawn_anomalies", [])
                             asteroid_rings = world_state_data.get("asteroid_rings", [])
                             
                             combined_spawns: List[Dict[str, Any]] = []
+                            
+                            if npc_ships:
+                                for npc_req in npc_ships:
+                                    if isinstance(npc_req, dict):
+                                        npc_type = npc_req.get("type", "neutral")
+                                        npc_count = min(npc_req.get("count", 1), 12)
+                                        f_type = "enemy" if npc_type == "hostile" else "neutral"
+                                        f_faction = "pirate" if npc_type == "hostile" else "neutral"
+                                        
+                                        # Tactical overrides
+                                        custom_color = npc_req.get("color")
+                                        ship_type = npc_req.get("ship_type") # 'ufo' or 'freighter_glb'
+                                        spawn_dist = npc_req.get("spawn_distance")
+                                        fire_mult = npc_req.get("fire_rate_multiplier")
+                                        behavior = npc_req.get("behavior")
+                                        
+                                        # Strict Routing Defaults
+                                        if not ship_type:
+                                            ship_type = "ufo" if npc_type == "hostile" else "freighter_glb"
+                                        
+                                        if not behavior and npc_type == "neutral":
+                                            behavior = "neutral_wander"
+                                        
+                                        for _ in range(npc_count):
+                                            # Position logic
+                                            if spawn_dist:
+                                                angle = random.uniform(0, 2 * math.pi)
+                                                spawn_x = current_player_x + math.cos(angle) * spawn_dist
+                                                spawn_z = current_player_z + math.sin(angle) * spawn_dist
+                                                spawn_y = current_player_y + random.uniform(-100, 100)
+                                            else:
+                                                spawn_x = current_player_x + random.uniform(-4000, 4000)
+                                                spawn_z = current_player_z + random.uniform(-4000, 4000)
+                                                spawn_y = current_player_y + random.uniform(-200, 200)
+                                                
+                                            spawn_data = {
+                                                "ent_type": f_type,
+                                                "x": spawn_x,
+                                                "y": spawn_y,
+                                                "z": spawn_z,
+                                                "physics": "static" if npc_type == "neutral" else "velocity",
+                                                "faction": f_faction,
+                                                "speed": random.uniform(20.0, 40.0) if npc_type == "neutral" else random.uniform(50.0, 80.0)
+                                            }
+                                            
+                                            spawn_data["model_type"] = ship_type
+                                            if custom_color: spawn_data["color"] = custom_color
+                                            if fire_mult is not None: spawn_data["fire_rate_multiplier"] = fire_mult
+                                            if behavior: spawn_data["behavior"] = behavior
+                                            
+                                            combined_spawns.append(spawn_data)
 
                             if asteroid_rings:
                                 for ring in asteroid_rings:
@@ -2538,25 +2985,39 @@ async def dream_stream(websocket: WebSocket):
                                             except Exception as e:
                                                 logger.warning(f"[PlanetRadius] Failed to sync {planet_name}: {e}")
 
-                            # 5. Send Unified Generation Payload (Visuals now handled by Rust)
-                            await websocket.send_json({
+                            # 5. Send Unified Generation Payload (text + audio + world state arrive together)
+                            payload = {
                                 "type": "generation_result",
-                                "audio_b64": audio_b64,
                                 "engine_synced": engine_synced,
-                                "world_state": world_state_data
-                            })
+                                "world_state": world_state_data,
+                                "text": conversational_reply,  # Bundled so chat text appears with audio
+                            }
+                            if audio_url:
+                                payload["audio_url"] = audio_url
+                            if audio_b64:
+                                payload["audio_b64"] = audio_b64
+                            await websocket.send_json(payload)
                             await websocket.send_json({"msg_type": "status", "state": "idle"})
                             
                         except Exception as e:
                             logger.error(f"LangChain LLM or Generation Error: {e}")
                             # Tier 0 Narrative Fallback — Rachel stays in character, never fakes success.
                             err_str = str(e).lower()
+                            is_rate_limit = any(k in err_str for k in (
+                                "429", "resource_exhausted", "too many requests",
+                                "quota", "rate limit", "rate_limit",
+                            ))
                             is_network_err = any(k in err_str for k in (
                                 "timeout", "timed out", "503", "504", "connect",
                                 "network", "unreachable", "disconnect", "eof",
                                 "connection reset", "bad gateway",
                             ))
-                            if is_network_err:
+                            if is_rate_limit:
+                                err_reply = (
+                                    "Pilot, my neural cores are overloaded. "
+                                    "Give me a moment to recover and try again."
+                                )
+                            elif is_network_err:
                                 err_reply = (
                                     "Pilot, my uplink to the processing core is severed. "
                                     "I am currently disconnected and cannot execute overrides."
@@ -2567,13 +3028,17 @@ async def dream_stream(websocket: WebSocket):
                                     "to perform that action."
                                 )
                             logger.warning(f"[Tier-0 Fallback] {err_reply}")
-                            audio_b64 = await generate_speech(err_reply)
-                            if audio_b64:
-                                await websocket.send_json({
+                            audio_url, audio_b64 = await TTSManager.generate_speech(err_reply)
+                            if audio_url or audio_b64:
+                                payload = {
                                     "type": "proactive_audio",
-                                    "audio_b64": audio_b64,
                                     "text": err_reply,
-                                })
+                                }
+                                if audio_url:
+                                    payload["audio_url"] = audio_url
+                                if audio_b64:
+                                    payload["audio_b64"] = audio_b64
+                                await websocket.send_json(payload)
                             else:
                                 await websocket.send_json({
                                     "type": "text",

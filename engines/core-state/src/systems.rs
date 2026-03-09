@@ -207,16 +207,13 @@ pub fn steering_system(
             if let Some(target) = best_target {
                 target
             } else {
-                // Fallback: pirate targets player, federation/neutral patrol idly
+                // Fallback: pirate targets player, federation/neutral continue with their behavior
                 if my_faction == "pirate" {
                     (px, py, pz)
                 } else {
-                    // No valid target — decelerate gently
-                    agent.velocity.0 *= friction;
-                    agent.velocity.1 *= friction;
-                    agent.velocity.2 *= friction;
-                    idx += 1;
-                    continue;
+                    // Non-pirates with no target: continue steering, don't early exit
+                    // Let their behavior (neutral_wander, etc) drive them
+                    (transform.x, transform.y, transform.z)
                 }
             }
         };
@@ -247,11 +244,27 @@ pub fn steering_system(
                     desired_vz = (dz / dist) * agent.max_speed;
                 }
             }
-            "scatter" => {
+            "kamikaze" => {
+                // Pure pursuit: maximize speed towards target, ignoring standard firing distance
+                desired_vx = (dx / dist) * agent.max_speed;
+                desired_vy = (dy / dist.max(1.0)) * agent.max_speed;
+                desired_vz = (dz / dist) * agent.max_speed;
+            }
+            "scatter" | "evasive" => {
                 // Flee from target
                 desired_vx = -(dx / dist) * agent.max_speed;
                 desired_vy = -(dy / dist.max(1.0)) * agent.max_speed;
                 desired_vz = -(dz / dist) * agent.max_speed;
+            }
+            "neutral_wander" => {
+                // Pseudo-random drift based on entity index to ensure stable but diverse flight paths
+                let seed = entity.index() as f64 * 0.1337;
+                let angle_y = (seed + (birth_age_opt.map_or(0.0, |ba| ba.0) * 0.05)).cos() * std::f64::consts::PI;
+                let angle_xz = (seed * 0.7 + (birth_age_opt.map_or(0.0, |ba| ba.0) * 0.1)).sin() * std::f64::consts::PI * 2.0;
+                
+                desired_vx = angle_xz.cos() * angle_y.cos() * agent.max_speed;
+                desired_vy = angle_y.sin() * agent.max_speed * 0.3; // Gentle vertical oscillation
+                desired_vz = angle_xz.sin() * angle_y.cos() * agent.max_speed;
             }
             "protect" => {
                 // Spherical Protection: 3D orbit around the player
@@ -329,9 +342,8 @@ pub fn steering_system(
                     desired_vz += sep_z;
                 }
             }
-            "wander" | _ => {
-                // Pseudo-random architectural wandering in 3D
-                // We use Sine/Cos based on ID and birth_age for deterministic drift
+            _ => {
+                // Default: Smooth architectural wandering in 3D
                 let id = entity.index() as f64;
                 let age = birth_age_opt.map_or(0.0, |a| a.0);
                 desired_vx = (age * 0.5 + id).cos() * agent.max_speed;

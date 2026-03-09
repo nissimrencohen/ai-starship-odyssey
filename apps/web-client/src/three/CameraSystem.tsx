@@ -60,8 +60,10 @@ export const CameraSystem: React.FC<CameraSystemProps> = ({
         prevSpectatorId.current = spectatorTargetId;
 
         // 2. Interpolation Alphas (frame-rate-independent lerp)
+        // Both use the same rate so camera maintains constant distance from ship
+        // (different rates caused apparent zoom changes when accelerating/decelerating)
         const posAlpha = 1 - Math.pow(0.6, delta * 60);
-        const camAlpha = 1 - Math.pow(0.85, delta * 60);
+        const camAlpha = posAlpha;
 
         // Smoothly follow the entity's position
         smoothedPos.current.lerp(targetPos, posAlpha);

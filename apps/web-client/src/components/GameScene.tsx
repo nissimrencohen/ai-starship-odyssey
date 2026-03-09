@@ -24,6 +24,8 @@ const LaserBeam: React.FC<{
 }> = ({ shipPos, laserOriginRef, yawRef, pitchRef, entities, color, isFiring }) => {
     const meshRef = useRef<THREE.Mesh>(null);
     const glowRef = useRef<THREE.Mesh>(null);
+    const frameCounterRef = useRef(0);
+    const cachedHitDistRef = useRef(4000);
     useFrame((_, delta) => {
         if (!meshRef.current || !glowRef.current) return;
 
@@ -47,18 +49,32 @@ const LaserBeam: React.FC<{
         const dirZ = Math.sin(yaw) * Math.cos(pitch);
         const dir = new THREE.Vector3(dirX, dirY, dirZ);
 
-        // Raycast against asteroids and enemies from startPos
-        let hitDist = 4000;
-        for (const ent of Object.values(entities)) {
-            if (ent.ent_type !== 'asteroid' && ent.ent_type !== 'enemy' && ent.ent_type !== 'sun' && ent.ent_type !== 'planet') continue;
-            const ep = new THREE.Vector3(ent.x, ent.y, ent.z);
-            const toEnt = ep.clone().sub(startPos);
-            const proj = toEnt.dot(dir);
-            if (proj < 0 || proj > hitDist) continue;
-            const perp = toEnt.clone().sub(dir.clone().multiplyScalar(proj)).length();
-            const r = (ent.radius || 50) * (ent.scale || 1);
-            if (perp < r) hitDist = proj;
+        // Target detection: throttle to every 4 frames for performance
+        frameCounterRef.current++;
+        if (frameCounterRef.current % 4 === 0) {
+            let hitDist = 4000;
+            const ents = Object.values(entities);
+            for (let i = 0; i < ents.length; i++) {
+                const ent = ents[i];
+                if (ent.ent_type !== 'asteroid' && ent.ent_type !== 'enemy' && ent.ent_type !== 'sun' && ent.ent_type !== 'planet' && ent.ent_type !== 'station') continue;
+
+                // Fast distance culling: only check if within 4000u box
+                const dx = ent.x - startPos.x;
+                const dz = (ent.z || 0) - startPos.z;
+                if (Math.abs(dx) > 4000 || Math.abs(dz) > 4000) continue;
+
+                const ep = new THREE.Vector3(ent.x, ent.y, ent.z);
+                const toEnt = ep.sub(startPos);
+                const proj = toEnt.dot(dir);
+                if (proj < 0 || proj > hitDist) continue;
+                const perp = toEnt.clone().sub(dir.clone().multiplyScalar(proj)).length();
+                const r = (ent.radius || 50) * (ent.scale || 1);
+                if (perp < r) hitDist = proj;
+            }
+            cachedHitDistRef.current = hitDist;
         }
+
+        const hitDist = cachedHitDistRef.current;
 
         const halfLen = hitDist / 2;
         const midX = startPos.x + dirX * halfLen;
@@ -79,15 +95,15 @@ const LaserBeam: React.FC<{
 
     return (
         <group>
-            {/* Core beam - Thinner and less intense for always-on targeting */}
+            {/* Core beam - Thicker and using BasicMaterial so it ignores lighting and is always visible */}
             <mesh ref={meshRef}>
-                <cylinderGeometry args={[1.0, 1.0, 1, 8]} />
-                <meshStandardMaterial color={color || "#ff2222"} emissive={color || "#ff2222"} emissiveIntensity={5} transparent opacity={0.6} toneMapped={false} />
+                <cylinderGeometry args={[2.0, 2.0, 1, 8]} />
+                <meshBasicMaterial color={color || "#ff2222"} transparent opacity={0.6} depthWrite={false} />
             </mesh>
             {/* Soft outer glow */}
             <mesh ref={glowRef}>
-                <cylinderGeometry args={[4.0, 4.0, 1, 8]} />
-                <meshStandardMaterial color={color || "#ff0000"} emissive={color || "#ff0000"} emissiveIntensity={2} transparent opacity={0.15} toneMapped={false} />
+                <cylinderGeometry args={[6.0, 6.0, 1, 8]} />
+                <meshBasicMaterial color={color || "#ff0000"} transparent opacity={0.15} depthWrite={false} blending={THREE.AdditiveBlending} />
             </mesh>
         </group>
     );

@@ -4,6 +4,7 @@ import { useTexture, Html, useGLTF } from '@react-three/drei';
 import { useFrame } from '@react-three/fiber';
 import { ProceduralPlanet } from './ProceduralPlanet';
 import { Singularity } from '../three/entities/Anomalies';
+import { CombatShipMesh, CockpitDashboard, PilotAvatar, TUB_RIM_Y, GLTFErrorBoundary } from './PlayerShip';
 
 // ── Instanced Asteroid Renderer ─────────────────────────────────────────────
 const MAX_ASTEROID_INSTANCES = 200;
@@ -12,7 +13,7 @@ const _asteroidHidden = new THREE.Matrix4().makeScale(0, 0, 0);
 
 // GLB version: uses the real NASA Bennu (1999 RQ36) asteroid model as instance geometry.
 // Falls back to procedural InstancedAsteroids if the GLB fails to load.
-const ASTEROID_GLB_URL = 'http://localhost:8000/assets/models/asteroids/asteroid.glb';
+const ASTEROID_GLB_URL = '/assets/models/asteroids/asteroid.glb';
 useGLTF.preload(ASTEROID_GLB_URL);
 
 // Helper function to stretch ("spaghettify") entities as they approach a black hole
@@ -178,7 +179,8 @@ const InstancedAsteroids = React.memo(
     }
 );
 
-const ASSET_BASE_URL = 'http://localhost:8000/assets/';
+const ASSET_BASE_URL = '/assets/';
+const MODEL_BASE = ASSET_BASE_URL + 'models/';
 
 // Client-side distance culling — cull dynamic entities beyond this radius from player
 const CULL_DISTANCE_SQ = 15000 * 15000;
@@ -286,12 +288,20 @@ const PlanetMesh: React.FC<PlanetMeshProps> = ({ name, radius, fallbackColor, is
 // Wrapped in Suspense + ErrorBoundary so any missing/corrupt file gracefully
 // falls back to the provided `fallback` node (default: nothing).
 
+// Global cache of URLs that have already failed — avoids retrying broken models
+// every render cycle, which was causing massive error spam and freezing.
+const _failedGlbUrls = new Set<string>();
+
 class GlbErrorBoundary extends React.Component<
-    { children: React.ReactNode; fallback: React.ReactNode },
+    { children: React.ReactNode; fallback: React.ReactNode; url?: string },
     { hasError: boolean }
 > {
     constructor(props: any) { super(props); this.state = { hasError: false }; }
     static getDerivedStateFromError() { return { hasError: true }; }
+    componentDidCatch() {
+        // Cache the failed URL so we never retry it
+        if (this.props.url) _failedGlbUrls.add(this.props.url);
+    }
     render() { return this.state.hasError ? this.props.fallback : this.props.children; }
 }
 
@@ -318,16 +328,20 @@ const GlbModel: React.FC<{
     url: string; scale?: number;
     rotation?: [number, number, number];
     fallback?: React.ReactNode;
-}> = ({ url, scale = 1, rotation, fallback = null }) => (
-    <GlbErrorBoundary fallback={fallback}>
-        <Suspense fallback={fallback}>
-            <GlbModelInner url={url} scale={scale} rotation={rotation} />
-        </Suspense>
-    </GlbErrorBoundary>
-);
+}> = ({ url, scale = 1, rotation, fallback = null }) => {
+    // If this URL already failed, skip the load entirely — render fallback
+    if (_failedGlbUrls.has(url)) return <>{fallback}</>;
+    return (
+        <GlbErrorBoundary fallback={fallback} url={url}>
+            <Suspense fallback={fallback}>
+                <GlbModelInner url={url} scale={scale} rotation={rotation} />
+            </Suspense>
+        </GlbErrorBoundary>
+    );
+};
 
 // Preload all models so they are cached before first use
-const MODEL_BASE = 'http://localhost:8000/assets/models/';
+// Note: MODEL_BASE points to the Vite-served /assets/models/ folder populated by xcopy.
 
 // Per-GLB orientation corrections applied inside Ry(-R + PI/2) outer group.
 // Same convention as SHIP_TYPE_CORRECTIONS in PlayerShip.tsx.
@@ -335,7 +349,21 @@ const MODEL_BASE = 'http://localhost:8000/assets/models/';
 const GLB_ROTATIONS: Record<string, [number, number, number]> = {
     [MODEL_BASE + 'ships/fighter.glb']: [Math.PI / 2, Math.PI, 0],
     [MODEL_BASE + 'ships/shuttle.glb']: [Math.PI / 2, Math.PI, 0],
+    [MODEL_BASE + 'ships/suzaku.glb']: [Math.PI / 2, Math.PI, 0],
+    [MODEL_BASE + 'ships/Space Shuttle (B).glb']: [Math.PI / 2, Math.PI, 0],
+    [MODEL_BASE + 'ships/rick_and_morty_space_ship.glb']: [0, 0, 0],
 };
+
+// Map Rust model_type strings to actual GLB URLs for neutral ships
+const NEUTRAL_SHIP_URLS: Record<string, string> = {
+    shuttle: MODEL_BASE + 'ships/shuttle.glb',
+    fighter: MODEL_BASE + 'ships/fighter.glb',
+    suzaku: MODEL_BASE + 'ships/suzaku.glb',
+    space_shuttle_b: MODEL_BASE + 'ships/Space Shuttle (B).glb',
+    rick_cruiser: MODEL_BASE + 'ships/rick_and_morty_space_ship.glb',
+};
+// Preload all neutral ship GLBs so spectator-focus shows the model instantly (no fallback flash)
+Object.values(NEUTRAL_SHIP_URLS).forEach(url => useGLTF.preload(url));
 
 // ── Visual Config — AI-controlled overrides ─────────────────────────────────
 // Sent by the AI Director via world_state.visual_config and forwarded here.
@@ -363,6 +391,7 @@ const PLANET_MODELS: Record<string, string> = {
     'Uranus': MODEL_BASE + 'planets/uranus.glb',
     'Neptune': MODEL_BASE + 'planets/neptune.glb',
     'Titan': MODEL_BASE + 'planets/titan.glb',
+    'Cromulon': '/assets/models/big_head_cromulons_from_rick_and_morty.glb',
 };
 // Alternative variants (Jupiter/Saturn have two models; AI can pick via 'glb_alt')
 const PLANET_MODELS_ALT: Record<string, string> = {
@@ -373,17 +402,21 @@ const PLANET_MODELS_ALT: Record<string, string> = {
 // Planet models are loaded as needed by GlbModelInner. 
 // Preloading has been disabled to prevent console errors from legacy assets.
 const STATION_MODELS = [
-    MODEL_BASE + 'stations/observatory.glb',
-    MODEL_BASE + 'stations/tdrs.glb',
-    MODEL_BASE + 'stations/suzaku.glb',
-    MODEL_BASE + 'stations/aim.glb',
-    MODEL_BASE + 'stations/lander.glb',
-    MODEL_BASE + 'stations/gateway.glb',  // index 5 — Gateway Core (ModelVariant 5 in Rust)
+    MODEL_BASE + 'stations/observatory.glb',          // variant 0
+    MODEL_BASE + 'stations/tdrs.glb',                 // variant 1
+    MODEL_BASE + 'stations/aim.glb',                  // variant 2
+    MODEL_BASE + 'stations/lander.glb',               // variant 3
+    MODEL_BASE + 'stations/gateway.glb',              // variant 4
+    MODEL_BASE + 'stations/stellar_sail.glb',         // variant 5
+    MODEL_BASE + 'stations/Mars Atmosphere and Volatile EvolutioN (MAVEN) (B).glb', // variant 6
 ];
 const COMPANION_MODELS = [
     MODEL_BASE + 'companions/astronaut.glb',
     MODEL_BASE + 'companions/robonaut.glb',
 ];
+// Preload station & companion GLBs to eliminate fallback flash during spectator focus
+STATION_MODELS.forEach(url => useGLTF.preload(url));
+COMPANION_MODELS.forEach(url => useGLTF.preload(url));
 
 // ── Alien Enemy Procedural Geometry ─────────────────────────────────────────
 
@@ -407,7 +440,6 @@ const AlienSwarmer: React.FC<{ radius: number }> = ({ radius }) => {
                 <sphereGeometry args={[radius * 0.2, 8, 8]} />
                 <meshBasicMaterial color="#ef4444" />
             </mesh>
-            <pointLight position={[0, 0, radius * 0.5]} color="#ef4444" intensity={100} distance={radius * 5} />
         </group>
     );
 };
@@ -432,7 +464,6 @@ const AlienRavager: React.FC<{ radius: number }> = ({ radius }) => {
                     <meshStandardMaterial color="#022c22" />
                 </mesh>
             ))}
-            <pointLight color="#10b981" intensity={300} distance={radius * 8} />
         </group>
     );
 };
@@ -465,8 +496,7 @@ const AlienMothership: React.FC<{ radius: number }> = ({ radius }) => {
                     <meshStandardMaterial color="#18181b" />
                 </mesh>
             ))}
-            {/* Giant Central Light */}
-            <pointLight color="#a855f7" intensity={1000} distance={radius * 20} />
+            {/* Giant Central Light — removed pointLight for performance */}
             <mesh position={[0, 0, radius * 0.8]}>
                 <sphereGeometry args={[radius * 0.3, 32, 32]} />
                 <meshBasicMaterial color="#a855f7" />
@@ -617,7 +647,8 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                 const isAlien = ent.ent_type === 'alien_ship';
                 const isProjectile = ent.ent_type === 'projectile';
                 const isAsteroid = ent.ent_type === 'asteroid';
-                const isEnemy = ent.ent_type === 'enemy';
+                const isEnemy = ent.ent_type === 'enemy' || ent.ent_type === 'hostile';
+                const isNeutral = ent.ent_type === 'neutral';
                 const isCompanion = ent.ent_type === 'companion';
                 const isExplosion = ent.ent_type === 'explosion';
 
@@ -650,6 +681,7 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                         case 'Saturn': return '#c5ab6e';  // Pale gold
                         case 'Uranus': return '#b8e3e4';  // Cyan ice
                         case 'Neptune': return '#3d5ef9'; // Dark blue gas
+                        case 'Cromulon': return '#d19b45'; // Gold head
                         default: return '#71717a';
                     }
                 };
@@ -665,6 +697,7 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                         case 'Saturn': return 630;
                         case 'Uranus': return 420;
                         case 'Neptune': return 390;
+                        case 'Cromulon': return 800;
                         default: return 150;
                     }
                 };
@@ -698,9 +731,9 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                             let sunFallback;
 
                             if (specificCustomUrl) {
-                                const finalTextureUrl = specificCustomUrl.startsWith('http')
-                                    ? specificCustomUrl
-                                    : `http://localhost:8000${specificCustomUrl}`;
+                                const finalTextureUrl = specificCustomUrl.includes('/assets/')
+                                    ? specificCustomUrl.substring(specificCustomUrl.indexOf('/assets/'))
+                                    : specificCustomUrl;
 
                                 sunFallback = (
                                     <TextureErrorBoundary fallback={<PlanetMesh name="Sun" radius={sunScale} fallbackColor="#ffd700" isSun />}>
@@ -746,9 +779,9 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                             let pFallback;
                             if (specificCustomUrl) {
                                 // Ensure the URL is absolute to the backend if it's a relative path
-                                const finalTextureUrl = specificCustomUrl.startsWith('http')
-                                    ? specificCustomUrl
-                                    : `http://localhost:8000${specificCustomUrl}`;
+                                const finalTextureUrl = specificCustomUrl.includes('/assets/')
+                                    ? specificCustomUrl.substring(specificCustomUrl.indexOf('/assets/'))
+                                    : specificCustomUrl;
 
                                 pFallback = (
                                     <TextureErrorBoundary fallback={hasTexture ? <PlanetMesh name={ent.name} radius={pScale} fallbackColor={getPlanetColor(ent.name)} isSun={isPlanetActuallySun} /> : <ProceduralPlanet radius={pScale} entityId={ent.id} />}>
@@ -766,7 +799,8 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                             const pGlbUrl = pMode === 'glb_alt'
                                 ? (PLANET_MODELS_ALT[ent.name] || PLANET_MODELS[ent.name])
                                 : PLANET_MODELS[ent.name];
-                            const showPlanetGlb = (pMode === 'glb' || pMode === 'glb_alt') && pGlbUrl;
+                            // Cromulon is EXCLUSIVELY a GLB model
+                            const showPlanetGlb = (ent.name === 'Cromulon') || ((pMode === 'glb' || pMode === 'glb_alt') && pGlbUrl);
                             return (
                                 <group>
                                     {showPlanetGlb
@@ -797,9 +831,9 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
 
                                         let moonFallback;
                                         if (moonCustomUrl) {
-                                            const finalMoonUrl = moonCustomUrl.startsWith('http')
-                                                ? moonCustomUrl
-                                                : `http://localhost:8000${moonCustomUrl}`;
+                                            const finalMoonUrl = moonCustomUrl.includes('/assets/')
+                                                ? moonCustomUrl.substring(moonCustomUrl.indexOf('/assets/'))
+                                                : moonCustomUrl;
 
                                             moonFallback = (
                                                 <TextureErrorBoundary fallback={hasMoonTexture ? <PlanetMesh name={moon.name} radius={moonR} fallbackColor={moon.custom_color || '#a8a8a8'} /> : <ProceduralPlanet radius={moonR} entityId={moon.id} />}>
@@ -848,43 +882,62 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                         )}
 
                         {isProjectile && (
-                            <group>
-                                <mesh>
-                                    <sphereGeometry args={[ent.projectile_size || 8, 12, 12]} />
-                                    <meshBasicMaterial
-                                        color={ent.custom_color || "#ef4444"}
-                                        toneMapped={false}
-                                    />
-                                </mesh>
-                                <pointLight
+                            <mesh>
+                                <sphereGeometry args={[ent.projectile_size || 8, 8, 8]} />
+                                <meshBasicMaterial
                                     color={ent.custom_color || "#ef4444"}
-                                    intensity={200}
-                                    distance={400}
+                                    toneMapped={false}
                                 />
-                            </group>
+                            </mesh>
                         )}
 
                         {isEnemy && (() => {
                             const r = ent.radius || 18;
-                            const isLarge = ent.model_variant === 2;
-                            const isMedium = ent.model_variant === 1;
-                            const enemyOverride = visualConfig?.enemy_ship_model;
-                            const shipUrl = enemyOverride
-                                ? MODEL_BASE + `ships/${enemyOverride}.glb`
-                                : (isMedium || isLarge) ? MODEL_BASE + 'ships/shuttle.glb' : MODEL_BASE + 'ships/fighter.glb';
-                            const lightColor = isLarge ? '#ef4444' : isMedium ? '#f97316' : '#a855f7';
+                            // Tactical Control: AI can override color and ship type (e.g. 'ufo', 'fighter', 'stealth')
+                            // Requirement: Default to RED and UFO mesh.
+                            const lightColor = ent.custom_color || "#ef4444";
+                            const shipType = ent.model_type || "ufo";
+
+                            return (
+                                <group rotation={[0, -(ent.rotation || 0) + Math.PI / 2, 0]} scale={[r / 40, r / 40, r / 40]}>
+                                    <CombatShipMesh type={shipType} color={lightColor} />
+
+                                    {/* Enemy Cockpit: Only for UFO or enemy types */}
+                                    {(shipType === 'ufo' || shipType === 'enemy') && (
+                                        <group position={[0, TUB_RIM_Y - 25, 0]} scale={[2.6, 2.6, 2.6]}>
+                                            <group position={[0, 0, 0.5]}>
+                                                <CockpitDashboard color={lightColor} isFiring={ent.is_firing} />
+                                            </group>
+                                            <group position={[0, 0, -1.8]}>
+                                                <Suspense fallback={null}>
+                                                    <GLTFErrorBoundary fallback={<></>}>
+                                                        <PilotAvatar url="/assets/models/chibi.glb" scale={20} />
+                                                    </GLTFErrorBoundary>
+                                                </Suspense>
+                                            </group>
+                                        </group>
+                                    )}
+
+                                    {/* Removed pointLight to fix performance lag - light count was too high */}
+                                </group>
+                            );
+                        })()}
+
+                        {isNeutral && (() => {
+                            const r = ent.radius || 18;
+                            // Map model_type to actual GLB URL — each model_type maps to a unique ship
+                            const shipUrl = (ent.model_type && NEUTRAL_SHIP_URLS[ent.model_type])
+                                ? NEUTRAL_SHIP_URLS[ent.model_type]
+                                : MODEL_BASE + 'ships/shuttle.glb';
+
                             const fallback = (
                                 <group>
-                                    {isLarge ? <AlienMothership radius={r} />
-                                        : isMedium ? <AlienRavager radius={r} />
-                                            : <AlienSwarmer radius={r} />}
+                                    <AlienSwarmer radius={r} />
                                 </group>
                             );
                             return (
                                 <group rotation={[0, -(ent.rotation || 0) + Math.PI / 2, 0]}>
-                                    {/* scale = r → model fits entity collision radius */}
                                     <GlbModel url={shipUrl} scale={r} rotation={GLB_ROTATIONS[shipUrl] ?? [0, 0, 0]} fallback={fallback} />
-                                    <pointLight color={lightColor} intensity={400} distance={r * 10} />
                                 </group>
                             );
                         })()}
@@ -935,7 +988,6 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                             return (
                                 <group>
                                     <GlbModel url={stationUrl} scale={stationScale} fallback={stationFallback} />
-                                    <pointLight color="#38bdf8" intensity={500} distance={2000} />
                                 </group>
                             );
                         })()}
@@ -950,7 +1002,6 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                                         rotation={GLB_ROTATIONS[MODEL_BASE + 'ships/shuttle.glb']}
                                         fallback={<AlienRavager radius={r} />}
                                     />
-                                    <pointLight color="#10b981" intensity={500} distance={r * 10} />
                                 </group>
                             );
                         })()}

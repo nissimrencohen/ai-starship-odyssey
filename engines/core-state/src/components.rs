@@ -290,6 +290,12 @@ pub struct WeaponParameters {
     pub spread: f64,
     #[serde(default = "default_projectile_size")]
     pub projectile_size: f64,
+    #[serde(default = "default_fire_rate")]
+    pub fire_rate_multiplier: f64,
+}
+
+fn default_fire_rate() -> f64 {
+    1.0
 }
 
 fn default_projectile_size() -> f64 {
@@ -303,6 +309,7 @@ impl Default for WeaponParameters {
             projectile_color: "#ef4444".to_string(),
             spread: 0.1,
             projectile_size: 8.0,
+            fire_rate_multiplier: 1.0,
         }
     }
 }
@@ -386,6 +393,7 @@ pub struct CommandRequest {
     pub projectile_color: Option<String>,
     pub spread: Option<f64>,
     pub projectile_size: Option<f64>,
+    pub fire_rate_multiplier: Option<f64>,
     pub target_id: Option<u32>,
     // Visual override fields (for set_visuals action)
     #[serde(default)]

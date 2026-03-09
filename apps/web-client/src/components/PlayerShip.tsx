@@ -3,23 +3,34 @@ import { useGLTF } from '@react-three/drei';
 import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 
-useGLTF.preload('http://127.0.0.1:8000/assets/chibi.glb');
+useGLTF.preload('/assets/models/chibi.glb');
+// pickle_rick_rat_suit.glb is 73MB — lazy-load via Suspense, do NOT preload
 
-const ChibiAvatar = () => {
-    const { scene } = useGLTF('http://127.0.0.1:8000/assets/chibi.glb');
+export const PilotAvatar = ({ url, scale: targetHeight = 20 }: { url: string; scale?: number }) => {
+    const { scene } = useGLTF(url);
     const clone = React.useMemo(() => scene.clone(true), [scene]);
 
     // Normalize scale and shift origin so feet are EXACTLY at Y=0
+    // Use an aggressive small-scale normalization to handle models with huge world-coordinates
     const { normalizedScale, offsetY } = React.useMemo(() => {
         const box = new THREE.Box3().setFromObject(clone);
+        const center = new THREE.Vector3();
+        box.getCenter(center);
         const size = new THREE.Vector3();
         box.getSize(size);
-        const maxDim = Math.max(size.x, size.y, size.z) || 1;
-        const scale = 20 / maxDim; // Pilot is 20 units tall
-        return { normalizedScale: scale, offsetY: -box.min.y };
-    }, [clone]);
 
-    // Avatar faces FORWARD
+        // If the model is exported with dummy elements at [0,0,0], the bounding box is huge.
+        // We force scale based on the largest dimension of the actual mesh content.
+        const maxDim = Math.max(size.x, size.y, size.z) || 1;
+        const scale = targetHeight / maxDim;
+
+        return {
+            normalizedScale: scale,
+            offsetY: -box.min.y
+        };
+    }, [clone, targetHeight]);
+
+    // Avatar faces FORWARD (Z+)
     return (
         <group scale={[normalizedScale, normalizedScale, normalizedScale]}>
             <primitive object={clone} position={[0, offsetY, 0]} />
@@ -30,19 +41,19 @@ const ChibiAvatar = () => {
 // ═══════════════════════════════════════════════════════════════════════════
 // Global geometry constants — thick hull with recessed cockpit
 // ═══════════════════════════════════════════════════════════════════════════
-const HULL_R = 95;         // hull outer radius (hug tightly to the dome to reduce pancake effect)
-const HULL_Y = 0;          // hull center Y
-const TUB_RIM_Y = 18;      // top of hull where tub opens
-const TUB_R = 85;          // HUGE cockpit tub inner radius
-const TUB_DEPTH = 34;      // tub floor at Y=-16 (stays safely inside the thick hull)
-const DOME_R = 85;         // HUGE dome radius = tub radius for seamless join
-const DOME_Y = TUB_RIM_Y;  // Hemisphere rests exactly on rim
+export const HULL_R = 95;         // hull outer radius (hug tightly to the dome to reduce pancake effect)
+export const HULL_Y = 0;          // hull center Y
+export const TUB_RIM_Y = 18;      // top of hull where tub opens
+export const TUB_R = 85;          // HUGE cockpit tub inner radius
+export const TUB_DEPTH = 34;      // tub floor at Y=-16 (stays safely inside the thick hull)
+export const DOME_R = 85;         // HUGE dome radius = tub radius for seamless join
+export const DOME_Y = TUB_RIM_Y;  // Hemisphere rests exactly on rim
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Cockpit Dashboard — volumetric low-poly cockpit with physical bezels
 // Scaled up and mounted on a physical metallic pedestal
 // ═══════════════════════════════════════════════════════════════════════════
-const CockpitDashboard = ({ color, isFiring }: { color?: string; isFiring?: boolean }) => {
+export const CockpitDashboard = ({ color, isFiring }: { color?: string; isFiring?: boolean }) => {
     const cPrimary = color || '#22d3ee';
     const cSecondary = color || '#a855f7';
     const cTertiary = color || '#34d399';
@@ -189,9 +200,9 @@ const CockpitDashboard = ({ color, isFiring }: { color?: string; isFiring?: bool
 };
 
 // Procedural Fallback Ship Component — scaled to world units (hundreds of units across)
-const ShipFallback = ({ type = 'ufo', color, laserOriginRef }: { type?: string, color?: string, laserOriginRef?: React.MutableRefObject<any> }) => {
+export const CombatShipMesh = ({ type = 'ufo', color, laserOriginRef }: { type?: string, color?: string, laserOriginRef?: React.MutableRefObject<any> }) => {
     // Map tactical chassis names to base visual models
-    const mappedType = type === 'goliath' ? 'freighter' : (type === 'stinger' || type === 'interceptor' ? 'fighter' : type);
+    const mappedType = type === 'goliath' ? 'freighter' : (type === 'stinger' || type === 'interceptor' ? 'fighter' : (type === 'enemy' ? 'ufo' : type));
 
     // Default colors if not supplied
     const cPrimary = color || (mappedType === 'ufo' ? '#a855f7' : '#22d3ee');
@@ -446,13 +457,15 @@ const ShipFallback = ({ type = 'ufo', color, laserOriginRef }: { type?: string, 
 };
 
 // Error Boundary for GLTF Loading
-class GLTFErrorBoundary extends React.Component<{ children: React.ReactNode, fallback: React.ReactNode }, { hasError: boolean }> {
+export class GLTFErrorBoundary extends React.Component<{ children: React.ReactNode, fallback: React.ReactNode }, { hasError: boolean }> {
     constructor(props: any) {
         super(props);
         this.state = { hasError: false };
     }
     static getDerivedStateFromError() {
         return { hasError: true };
+    }
+    componentDidCatch(error: any) {
     }
     render() {
         if (this.state.hasError) return this.props.fallback;
@@ -465,7 +478,6 @@ export const preloadShipModel = (url: string) => {
     try {
         useGLTF.preload(url);
     } catch (e) {
-        console.warn("Could not preload ship model:", url);
     }
 };
 
@@ -487,27 +499,29 @@ const SHIP_TYPE_CORRECTIONS: Record<string, [number, number, number]> = {
 
 // NASA GLB models served by the Python Director from C:\Project\data\models\ships\
 const SHIP_MODEL_URLS: Record<string, string> = {
-    shuttle: 'http://127.0.0.1:8000/assets/models/ships/shuttle.glb',  // Space Shuttle (A) 1.2MB
-    fighter: 'http://127.0.0.1:8000/assets/models/ships/fighter.glb',  // Space Shuttle (D) 2.4MB
-    stinger: 'http://127.0.0.1:8000/assets/models/ships/fighter.glb',
-    interceptor: 'http://127.0.0.1:8000/assets/models/ships/fighter.glb',
-    freighter: 'http://127.0.0.1:8000/assets/models/ships/shuttle.glb',
-    goliath: 'http://127.0.0.1:8000/assets/models/ships/shuttle.glb',
+    shuttle: '/assets/models/ships/shuttle.glb',  // Space Shuttle (A) 1.2MB
+    fighter: '/assets/models/ships/fighter.glb',  // Space Shuttle (D) 2.4MB
+    stinger: '/assets/models/ships/fighter.glb',
+    interceptor: '/assets/models/ships/fighter.glb',
+    freighter: '/assets/models/ships/shuttle.glb',
+    goliath: '/assets/models/ships/shuttle.glb',
 };
+// Preload all player ship GLBs at module level so CombatShipMesh fallback never flashes
+new Set(Object.values(SHIP_MODEL_URLS)).forEach(url => useGLTF.preload(url));
 
 // Per-model orientation corrections.
 // Goal: after this rotation the model's nose points along +Z so the parent
 // quaternion (which maps inner +Z → world forward) works correctly.
 // Both NASA shuttle GLBs have their nose along +Z already → no correction needed.
 const SHIP_MODEL_ROTATIONS: Record<string, [number, number, number]> = {
-    'http://127.0.0.1:8000/assets/models/ships/shuttle.glb': [0, 0, 0],
-    'http://127.0.0.1:8000/assets/models/ships/fighter.glb': [0, 0, 0],
+    '/assets/models/ships/shuttle.glb': [0, 0, 0],
+    '/assets/models/ships/fighter.glb': [0, 0, 0],
 };
 
 const ShipModel = ({ url }: { url: string }) => {
     const { scene } = useGLTF(url);
     const clone = React.useMemo(() => scene.clone(true), [scene]);
-    // Auto-normalize to radius=30 (matches ShipFallback proportions)
+    // Auto-normalize to radius=30 (matches CombatShipMesh proportions)
     const scale = React.useMemo(() => {
         const box = new THREE.Box3().setFromObject(clone);
         const sphere = box.getBoundingSphere(new THREE.Sphere());
@@ -638,13 +652,13 @@ export const PlayerShip: React.FC<PlayerShipProps> = ({ position, rotationRef, c
             {/* Inner correction group: static per-model visual fix, parent handles world heading */}
             <group rotation={correction}>
                 {resolvedModelUrl ? (
-                    <Suspense fallback={<ShipFallback type={shipType} color={shipColor} laserOriginRef={laserOriginRef} />}>
-                        <GLTFErrorBoundary fallback={<ShipFallback type={shipType} color={shipColor} laserOriginRef={laserOriginRef} />}>
+                    <Suspense fallback={<CombatShipMesh type={shipType} color={shipColor} laserOriginRef={laserOriginRef} />}>
+                        <GLTFErrorBoundary fallback={<CombatShipMesh type={shipType} color={shipColor} laserOriginRef={laserOriginRef} />}>
                             <ShipModel url={resolvedModelUrl} />
                         </GLTFErrorBoundary>
                     </Suspense>
                 ) : (
-                    <ShipFallback type={shipType} color={shipColor} laserOriginRef={laserOriginRef} />
+                    <CombatShipMesh type={shipType} color={shipColor} laserOriginRef={laserOriginRef} />
                 )}
 
                 {/* Cockpit contents */}
@@ -655,11 +669,11 @@ export const PlayerShip: React.FC<PlayerShipProps> = ({ position, rotationRef, c
                             <CockpitDashboard color={shipColor || (isUfoType ? '#22d3ee' : undefined)} isFiring={playerEnt?.is_firing} />
                         </group>
 
-                        {/* Chibi pilot standing proudly in front of the console seat (Pulled tighter to dashboard) */}
+                        {/* Player pilot — chibi avatar */}
                         <group position={[0, 0, -1.8]}>
                             <Suspense fallback={null}>
                                 <GLTFErrorBoundary fallback={<></>}>
-                                    <ChibiAvatar />
+                                    <PilotAvatar url="/assets/models/chibi.glb" scale={20} />
                                 </GLTFErrorBoundary>
                             </Suspense>
                         </group>

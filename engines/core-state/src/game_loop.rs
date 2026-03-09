@@ -113,6 +113,7 @@ pub async fn run(engine_state: EngineState) {
             };
             if full_reset {
                 bh_death_active = false;
+                *game_over_timer_for_loop.lock().unwrap() = 0.0;
                 current_level = 1;
                 kills_at_level_start = 0;
                 enemy_kills_at_level_start = 0;
@@ -283,9 +284,9 @@ pub async fn run(engine_state: EngineState) {
                             ref mut vz,
                         } = *phys
                         {
-                            let mut thrust_force = 3000.0; // Reduced by a third from 4500.0
+                            let mut thrust_force = 6000.0; // Increased significantly for snappier flight
                             if boost_active {
-                                thrust_force *= 2.5;
+                                thrust_force *= 3.0; // Stronger boost
                             }
 
                             // Forward direction = camera facing in 3D (yaw + pitch)
@@ -309,7 +310,8 @@ pub async fn run(engine_state: EngineState) {
                             *vz += knockback.1;
 
                             // Drag - increased for smoother glide
-                            let damping = 0.97; // Increased from 0.96
+                            // Drag - reduced to allow for longer glides and higher speeds
+                            let damping = 0.985;
                             *vx *= damping;
                             *vy *= damping;
                             *vz *= damping;
@@ -456,7 +458,9 @@ pub async fn run(engine_state: EngineState) {
                             let aim_yaw = dz.atan2(dx);
                             let aim_pitch = dy.atan2(dist_xz); // elevation toward player Y
                             t.rotation = aim_yaw;
-                            if rand::random::<f64>() < 0.010 {
+                            let base_prob = if agent.behavior == "kamikaze" { 0.25 } else { 0.010 };
+                            let fire_prob = base_prob * weapon_opt.map_or(1.0, |wp| wp.fire_rate_multiplier);
+                            if rand::random::<f64>() < fire_prob {
                                 let (color, size, count, spread) = if let Some(wp) = weapon_opt {
                                     (
                                         wp.projectile_color.clone(),
@@ -1440,6 +1444,10 @@ pub async fn run(engine_state: EngineState) {
         {
             let (px, pz) = player_pos;
             let mut w = world.lock().unwrap();
+            let mut rng = rand::thread_rng();
+            use rand::Rng;
+
+            // Neutral ships are spawned once at init (5 unique models) — no dynamic respawning
             let mut query = w.query::<(
                 Entity,
                 &Transform,

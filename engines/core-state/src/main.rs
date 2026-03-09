@@ -221,6 +221,7 @@ async fn main() {
                 projectile_color: "#ef4444".to_string(),
                 spread: 0.15,
                 projectile_size: 8.0,
+                fire_rate_multiplier: 1.0,
             },
             components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
         ));
@@ -257,6 +258,7 @@ async fn main() {
             ("Saturn", 23000.0, 0.082, 630.0),
             ("Uranus", 27000.0, 0.064, 420.0),
             ("Neptune", 30000.0, 0.055, 390.0),
+            ("Cromulon", 35000.0, 0.045, 800.0),
         ];
 
         for (name, dist, speed, size) in planet_configs {
@@ -466,63 +468,54 @@ async fn main() {
         // 3. GLOBAL ASTEROID DISTRIBUTION — Handled by rebuild_asteroids() above.
 
         // 4. NEW ENTITY TYPES: SpaceStations & AlienShips
-        let mut rng = rand::thread_rng();
-        for i in 0..5 {
-            let r = 5000.0 + (30000.0 - 5000.0) * rng.gen::<f64>().sqrt();
-            let angle = rng.gen_range(0.0..std::f64::consts::TAU);
+        // 4. Space Stations — one per GLB model, each at a unique fixed position
+        let station_names = [
+            "Deep Space Observatory",     // variant 0 — observatory.glb
+            "TDRS Relay Hub",             // variant 1 — tdrs.glb
+            "AIM Research Platform",      // variant 2 — aim.glb
+            "Lunar Lander Outpost",       // variant 3 — lander.glb
+            "Gateway Core",               // variant 4 — gateway.glb
+            "Stellar Sail Array",         // variant 5 — stellar_sail.glb
+            "MAVEN Science Lab",          // variant 6 — maven.glb
+        ];
+        let station_positions: [(f64, f64, f64); 7] = [
+            (15000.0, 400.0, 8000.0),     // Observatory — near Mars orbit
+            (-12000.0, -300.0, 18000.0),   // TDRS — outer belt
+            (7000.0, 1200.0, -5000.0),     // AIM — near Earth
+            (22000.0, -800.0, -10000.0),   // Lander — asteroid belt
+            (12000.0, 300.0, 600.0),       // Gateway — Lunar orbit
+            (-8000.0, 2000.0, 25000.0),    // Stellar Sail — deep space
+            (5000.0, -500.0, 14000.0),     // MAVEN — between Earth and Mars
+        ];
+        for i in 0..7 {
+            let (sx, sy, sz) = station_positions[i];
             w.spawn((
                 EntityType("space_station".to_string()),
-                Name(format!("Station-{}", i)),
+                Name(station_names[i].to_string()),
                 Transform {
-                    x: angle.cos() * r,
-                    y: rng.gen_range(-2000.0..2000.0),
-                    z: angle.sin() * r,
+                    x: sx,
+                    y: sy,
+                    z: sz,
                     rotation: 0.0,
                 },
                 PhysicsType::Static,
                 components::SpatialAnomaly {
                     anomaly_type: "station".to_string(),
-                    mass: 1000.0,
-                    radius: 400.0,
+                    mass: 2000.0,
+                    radius: 500.0,
                 },
                 components::Scale(1.0),
-                components::ModelVariant(0),
+                components::ModelVariant(i as u32),
                 Visuals {
                     model_type: Some("station".to_string()),
-                    color: "#ffffff".to_string(),
+                    color: "#38bdf8".to_string(),
                     is_cloaked: false,
                 },
                 components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
             ));
         }
 
-        // 5. GATEWAY CORE — permanent named station near Lunar orbit (Earth ~8000, Luna ~+3800)
-        // ModelVariant(5) maps to gateway.glb in the frontend STATION_MODELS array.
-        w.spawn((
-            EntityType("space_station".to_string()),
-            Name("Gateway Core".to_string()),
-            Transform {
-                x: 12000.0,
-                y: 300.0,
-                z: 600.0,
-                rotation: 0.0,
-            },
-            PhysicsType::Static,
-            components::SpatialAnomaly {
-                anomaly_type: "station".to_string(),
-                mass: 5000.0,
-                radius: 800.0,
-            },
-            components::Scale(1.0),
-            components::ModelVariant(5),
-            Visuals {
-                model_type: Some("station".to_string()),
-                color: "#38bdf8".to_string(),
-                is_cloaked: false,
-            },
-            components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
-        ));
-
+        let mut rng = rand::thread_rng();
         for i in 0..12 {
             let r = 3000.0 + (28000.0 - 3000.0) * rng.gen::<f64>().sqrt();
             let angle = rng.gen_range(0.0..std::f64::consts::TAU);
@@ -544,7 +537,7 @@ async fn main() {
                     velocity: (0.0, 0.0, 0.0),
                     max_speed: 7.5, // halved from 15.0
                     max_force: 0.5,
-                    behavior: "wander".to_string(),
+                    behavior: "attack".to_string(),
                 },
                 components::Faction("pirate".to_string()),
                 components::SpatialAnomaly {
@@ -556,7 +549,7 @@ async fn main() {
                 components::ModelVariant(rng.gen_range(0..2)),
                 Visuals {
                     model_type: Some("enemy".to_string()),
-                    color: "rgba(239, 68, 68, 0.85)".to_string(),
+                    color: "#ef4444".to_string(),
                     is_cloaked: false,
                 },
                 components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
@@ -565,10 +558,56 @@ async fn main() {
                     projectile_color: "#ff3333".to_string(),
                     spread: 0.1,
                     projectile_size: 6.0,
+                    fire_rate_multiplier: 1.0,
                 },
             ));
         }
-        println!("Solar System initialized with Sun, 8 planets, and scattered asteroids.");
+
+        // 6. Neutral Passenger Ships — exactly one per GLB model (5 total)
+        let neutral_ships: [(&str, &str, f64); 5] = [
+            ("shuttle",        "Shuttle Transport",    1.5),
+            ("fighter",        "Fighter Escort",       1.5),
+            ("suzaku",         "Suzaku Cruiser",       1.8),
+            ("space_shuttle_b","Orbital Shuttle",      1.5),
+            ("rick_cruiser",   "Dimensional Cruiser",  2.4),
+        ];
+        for (model, name, scale) in &neutral_ships {
+            let r = rng.gen_range(4000.0..20000.0);
+            let angle = rng.gen_range(0.0..std::f64::consts::TAU);
+            w.spawn((
+                EntityType("neutral".to_string()),
+                Name(name.to_string()),
+                Transform {
+                    x: angle.cos() * r,
+                    y: rng.gen_range(-800.0..800.0),
+                    z: angle.sin() * r,
+                    rotation: 0.0,
+                },
+                PhysicsType::Velocity { vx: 0.0, vy: 0.0, vz: 0.0 },
+                components::SteeringAgent {
+                    velocity: (0.0, 0.0, 0.0),
+                    max_speed: rng.gen_range(12.0..25.0),
+                    max_force: 0.4,
+                    behavior: "neutral_wander".to_string(),
+                },
+                components::Faction("neutral".to_string()),
+                components::SpatialAnomaly {
+                    anomaly_type: "ship".to_string(),
+                    mass: 0.0,
+                    radius: 50.0,
+                },
+                components::Scale(*scale),
+                Visuals {
+                    model_type: Some(model.to_string()),
+                    color: "#0891b2".to_string(),
+                    is_cloaked: false,
+                },
+                components::PersistentId(GLOBAL_ENTITY_ID.fetch_add(1, Ordering::SeqCst)),
+                components::BirthAge(0.0),
+            ));
+        }
+
+        println!("Solar System initialized with Sun, 10 planets, and a diverse, close-range civilian fleet.");
     } // drop the lock held during init
 
     let clients: Clients = Arc::new(Mutex::new(Vec::new()));

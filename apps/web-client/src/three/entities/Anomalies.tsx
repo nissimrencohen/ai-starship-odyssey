@@ -173,7 +173,7 @@ export const Singularity: React.FC<{ radius: number; isDestructive?: boolean }> 
     }), [isDestructive]);
 
     useFrame((state) => {
-        const time = state.clock.getElapsedTime();
+        const time = state.clock.elapsedTime;
         if (diskRef.current) diskRef.current.uniforms.uTime.value = time;
     });
 

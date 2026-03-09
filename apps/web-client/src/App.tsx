@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import useWebSocket, { ReadyState } from 'react-use-websocket';
-import { Activity, Server, Mic, MicOff, ChevronLeft, Send } from 'lucide-react';
+import { Activity, Server, Mic, MicOff, ChevronLeft, Send, Wifi, Bot, Volume2, VolumeX } from 'lucide-react';
 import { Canvas } from '@react-three/fiber';
 import { GameScene } from './components/GameScene';
 import { HUD } from './components/HUD';
@@ -16,6 +16,8 @@ export default function App() {
 
   // Voice & Audio Meter State
   const [volumeLevel, setVolumeLevel] = useState(0);
+  const [isAudioUnlocked, setIsAudioUnlocked] = useState(false);
+  const audioQueueRef = useRef<Array<{ url: string; text: string }>>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
@@ -26,6 +28,8 @@ export default function App() {
   const [aiState, setAiState] = useState<"idle" | "synthesizing" | "orchestrating">("idle");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isChatVisible, setIsChatVisible] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(450);
+  const [isResizing, setIsResizing] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunks = useRef<Blob[]>([]);
 
@@ -34,11 +38,22 @@ export default function App() {
     reconnectInterval: 3000,
   });
 
+  const dispatchTelemetryRef = useRef((action: string, details: string, severity: string) => { });
+  useEffect(() => {
+    dispatchTelemetryRef.current = (action: string, details: string, severity: string) => {
+      if (readyState === ReadyState.OPEN) {
+        const payload = { type: 'telemetry', action, details, severity };
+        // Silent telemetry dispatch
+        sendMessage(JSON.stringify(payload));
+      }
+    };
+  }, [readyState, sendMessage]);
+
   // ECS WebSocket connection
   const { lastMessage: ecsMessage, sendMessage: sendEcsMessage } = useWebSocket('ws://localhost:8081/ws', {
     shouldReconnect: () => true,
     reconnectInterval: 500,
-    onError: (e) => console.error('Rust engine connection error:', e),
+    onError: (e) => { }, // Suppressed error spam
   });
 
   // Player Input Stream
@@ -98,6 +113,14 @@ export default function App() {
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
       if (e.code === 'Escape') {
         setSpectatorTargetId(null);
+        // Ensure tactical map and engine pause are cleared when escaping
+        handleFocusModeChange(false);
+      }
+      if (e.code === 'Space' && !activeKeysRef.current.has('Space')) {
+        dispatchTelemetryRef.current('fired_weapon', 'laser', 'low');
+      }
+      if ((e.code === 'ShiftLeft' || e.code === 'ShiftRight') && !activeKeysRef.current.has(e.code)) {
+        dispatchTelemetryRef.current('rapid_acceleration', 'boost_engaged', 'low');
       }
       if (GAME_KEYS.has(e.code)) { e.preventDefault(); activeKeysRef.current.add(e.code); }
     };
@@ -175,12 +198,13 @@ export default function App() {
       canvas.requestPointerLock();
     }
     // Initialize AudioContext on first user gesture (browser autoplay policy)
-    if (!audioCtxRef.current) {
-      audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
-    if (audioCtxRef.current.state === 'suspended') {
-      audioCtxRef.current.resume();
+    if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
     }
+    setIsAudioUnlocked(true);
   }, []);
 
   const [ecsEntities, setEcsEntities] = useState<Record<string, any>>({});
@@ -194,9 +218,15 @@ export default function App() {
   const lastSentZoomRef = useRef(1.5);
   const shakeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isMuted, setIsMuted] = useState(false);
+  const handleToggleMute = useCallback((muted: boolean) => {
+    setIsMuted(muted);
+    sendMessage(JSON.stringify({
+      type: 'update_audio_settings',
+      ai_muted: muted,
+      game_muted: muted
+    }));
+  }, [sendMessage]);
   const [isRachelEnabled, setIsRachelEnabled] = useState(true);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-
   // ── Survival HUD state ──────────────────────────────────────────────────
   const [playerHealth, setPlayerHealth] = useState(100);
   const [score, setScore] = useState(0);
@@ -205,6 +235,13 @@ export default function App() {
   const [isGameOver, setIsGameOver] = useState(false);
   const [blackHoleDeath, setBlackHoleDeath] = useState(false);
   const blackHoleDeathFiredRef = useRef(false);
+  const [showDeathScreen, setShowDeathScreen] = useState(false);
+  const [deathReason, setDeathReason] = useState<'health' | 'blackhole' | 'restart'>('health');
+  const [deathStats, setDeathStats] = useState({ score: 0, level: 1 });
+  const [showLevelTransition, setShowLevelTransition] = useState(false);
+  const [transitionLevel, setTransitionLevel] = useState(1);
+  const prevLevelRef = useRef(1);
+  const levelTransitionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showDamageFlash, setShowDamageFlash] = useState(false);
   const [showSuccessFlash, setShowSuccessFlash] = useState(false);
   const [showBoundaryFlash, setShowBoundaryFlash] = useState(false);
@@ -212,6 +249,29 @@ export default function App() {
   const damageFlashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const successFlashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const boundaryFlashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const startResizing = useCallback(() => setIsResizing(true), []);
+  const stopResizing = useCallback(() => setIsResizing(false), []);
+  const resize = useCallback((e: MouseEvent) => {
+    if (isResizing) {
+      const newWidth = Math.max(300, Math.min(e.clientX, window.innerWidth * 0.5));
+      setSidebarWidth(newWidth);
+    }
+  }, [isResizing]);
+
+  useEffect(() => {
+    if (isResizing) {
+      window.addEventListener('mousemove', resize);
+      window.addEventListener('mouseup', stopResizing);
+    } else {
+      window.removeEventListener('mousemove', resize);
+      window.removeEventListener('mouseup', stopResizing);
+    }
+    return () => {
+      window.removeEventListener('mousemove', resize);
+      window.removeEventListener('mouseup', stopResizing);
+    };
+  }, [isResizing, resize, stopResizing]);
 
   // Tab targeting state
   const [targetedEntityId, setTargetedEntityId] = useState<number | null>(null);
@@ -230,7 +290,6 @@ export default function App() {
 
   // Full reset: clears BH overlay + calls engine reset
   const bhAutoResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const gameOverResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleFullReset = useCallback(async () => {
     if (bhAutoResetTimerRef.current) { clearTimeout(bhAutoResetTimerRef.current); bhAutoResetTimerRef.current = null; }
     try { await fetch('http://127.0.0.1:8080/api/engine/reset', { method: 'POST' }); } catch (_) { }
@@ -238,8 +297,18 @@ export default function App() {
     blackHoleDeathFiredRef.current = false;
     setSpectatorTargetId(null);
     setIsGameOver(false);
+    setShowDeathScreen(false);
+    setShowLevelTransition(false);
+    prevLevelRef.current = 1;
     setZoom(1.5);
   }, []);
+
+  // Show the dramatic death/restart screen — requires user interaction to continue
+  const triggerDeathScreen = useCallback((reason: 'health' | 'blackhole' | 'restart') => {
+    setDeathStats({ score, level: currentLevel });
+    setDeathReason(reason);
+    setShowDeathScreen(true);
+  }, [score, currentLevel]);
 
   // Pause/resume Rust physics when tactical map opens/closes or spectator mode changes
   const syncEnginePauseState = useCallback(() => {
@@ -335,8 +404,8 @@ export default function App() {
 
   // Generative collision sound: sine+sawtooth oscillator pulse
   const playCollisionSound = useCallback((speed: number, distance: number) => {
-    if (isMuted || !audioCtxRef.current) return;
-    const ctx = audioCtxRef.current;
+    if (isMuted || !audioContextRef.current) return;
+    const ctx = audioContextRef.current;
     if (ctx.state === 'suspended') return;
 
     const now = ctx.currentTime;
@@ -377,6 +446,53 @@ export default function App() {
     osc2.stop(now + 0.15);
   }, [isMuted]);
 
+  // Play audio from HTTP URL (Piper TTS)
+  const playAudioFromUrl = useCallback((url: string, text: string) => {
+    if (!isRachelEnabled) return;
+
+    if (!isAudioUnlocked) {
+      audioQueueRef.current.push({ url, text });
+      return;
+    }
+
+    const audio = new Audio(url);
+    audio.play().catch(e => { });
+  }, [isRachelEnabled, isAudioUnlocked]);
+
+  // Process queued audio when unlocked
+  const playQueuedAudio = useCallback(() => {
+    while (audioQueueRef.current.length > 0) {
+      const { url } = audioQueueRef.current.shift() || {};
+      if (url && isRachelEnabled) {
+        const audio = new Audio(url);
+        audio.play().catch(e => { });
+      }
+    }
+  }, [isRachelEnabled]);
+
+  // Unlock audio on first user interaction (click or key press)
+  useEffect(() => {
+    if (isAudioUnlocked) return; // Already unlocked
+
+    const unlockAudio = () => {
+      setIsAudioUnlocked(true);
+      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume();
+      }
+      playQueuedAudio();
+      // Remove listeners once unlocked
+      document.removeEventListener('click', unlockAudio);
+      document.removeEventListener('keydown', unlockAudio);
+    };
+
+    document.addEventListener('click', unlockAudio);
+    document.addEventListener('keydown', unlockAudio);
+
+    return () => {
+      document.removeEventListener('click', unlockAudio);
+      document.removeEventListener('keydown', unlockAudio);
+    };
+  }, [isAudioUnlocked, playQueuedAudio]);
 
   // Debounced Camera Zoom via scroll wheel
   useEffect(() => {
@@ -412,9 +528,9 @@ export default function App() {
           camera_zoom: Math.round(zoom * 100) / 100, // clean float
         }),
       })
-        .then(res => { if (!res.ok) console.warn('State Sync failed:', res.status); })
-        .catch(err => console.warn('Zoom sync failed:', err));
-    }, 100);
+        .then(res => { })
+        .catch(err => { });
+    }, 300);
   }, [zoom, worldState]);
 
   // Handle incoming ECS updates
@@ -433,6 +549,7 @@ export default function App() {
               if (damageFlashTimeoutRef.current) clearTimeout(damageFlashTimeoutRef.current);
               setShowDamageFlash(true);
               damageFlashTimeoutRef.current = setTimeout(() => setShowDamageFlash(false), 550);
+              dispatchTelemetryRef.current('took_damage', `Health dropped to ${newHealth}`, 'high');
             }
             prevHealthRef.current = newHealth;
           }
@@ -440,24 +557,28 @@ export default function App() {
             setScore(data.score as number);
           }
           if (data.current_level !== undefined) {
-            setCurrentLevel(data.current_level as number);
+            const newLevel = data.current_level as number;
+            if (newLevel > prevLevelRef.current && prevLevelRef.current > 0) {
+              // Level up detected — show transition screen
+              setTransitionLevel(newLevel);
+              setShowLevelTransition(true);
+              if (levelTransitionTimerRef.current) clearTimeout(levelTransitionTimerRef.current);
+              levelTransitionTimerRef.current = setTimeout(() => {
+                setShowLevelTransition(false);
+                levelTransitionTimerRef.current = null;
+              }, 3500);
+            }
+            prevLevelRef.current = newLevel;
+            setCurrentLevel(newLevel);
           }
           if (data.is_game_over !== undefined) {
             setIsGameOver(data.is_game_over as boolean);
             if (data.is_game_over) {
-              // ANY game over (enemy, asteroid, or BH) → auto-reset after 4s
-              // (matches Rust 3s countdown + 1s drama buffer)
-              if (gameOverResetTimerRef.current) clearTimeout(gameOverResetTimerRef.current);
-              gameOverResetTimerRef.current = setTimeout(() => {
-                handleFullReset();
-                gameOverResetTimerRef.current = null;
-              }, 4000);
-            } else {
-              // Game resumed — cancel any pending reset
-              if (gameOverResetTimerRef.current) {
-                clearTimeout(gameOverResetTimerRef.current);
-                gameOverResetTimerRef.current = null;
+              // Show death screen — wait for user interaction (no auto-reset)
+              if (!blackHoleDeathFiredRef.current && !showDeathScreen) {
+                triggerDeathScreen('health');
               }
+            } else {
               // Clear black hole death overlay only when transitioning OUT of a BH death
               if (blackHoleDeathFiredRef.current) {
                 setBlackHoleDeath(false);
@@ -469,16 +590,19 @@ export default function App() {
           if (data.black_hole_death === true && !blackHoleDeathFiredRef.current) {
             blackHoleDeathFiredRef.current = true;
             setBlackHoleDeath(true);
-            // Focus camera on the black hole — search current frame entities first (freshest), then cached ref
+            // Focus camera on the black hole
             const frameEnts: any[] = Array.isArray(data.entities) ? data.entities : [];
             const bhEnt = (frameEnts.find((e: any) => e.anomaly_type === 'black_hole') ??
               Object.values(ecsEntitiesRef.current).find((e: any) => e.anomaly_type === 'black_hole')) as any;
             if (bhEnt) setSpectatorTargetId(bhEnt.id);
             // Zoom out dramatically
             setZoom(prev => Math.min(prev + 8, 25));
-            // Auto-reset after 5 seconds
+            // Show death screen after BH animation (3s drama, then death screen)
             if (bhAutoResetTimerRef.current) clearTimeout(bhAutoResetTimerRef.current);
-            bhAutoResetTimerRef.current = setTimeout(() => { handleFullReset(); }, 5000);
+            bhAutoResetTimerRef.current = setTimeout(() => {
+              triggerDeathScreen('blackhole');
+              bhAutoResetTimerRef.current = null;
+            }, 3000);
           }
           if (data.objective !== undefined) {
             setObjective(data.objective as string);
@@ -516,6 +640,8 @@ export default function App() {
           setIsShaking(true);
           if (shakeTimeoutRef.current) clearTimeout(shakeTimeoutRef.current);
           shakeTimeoutRef.current = setTimeout(() => setIsShaking(false), 220);
+
+          dispatchTelemetryRef.current('collision', `Collided at speed ${data.speed ?? 1.0}`, 'medium');
 
           // True 3D spatial distance for audio
           const dx = data.dx ?? 0;
@@ -612,7 +738,7 @@ export default function App() {
         // ignore parsing errors for tick data
       }
     }
-  }, [ecsMessage, playCollisionSound, handleFullReset]);
+  }, [ecsMessage, playCollisionSound, handleFullReset, triggerDeathScreen, showDeathScreen]);
 
   // Handle incoming WebSocket messages
   useEffect(() => {
@@ -624,9 +750,18 @@ export default function App() {
           // Received back from the Python Director for voice transcriptions
           setChatHistory(prev => [...prev, { sender: 'user', text: data.content, timestamp: new Date() }]);
         } else if (data.type === 'text') {
-          // LLM responding to the user
+          // Only used for error/fallback messages now (Tier 0 narrative fallback).
+          // Normal LLM replies arrive bundled inside 'generation_result'.
+
+          // Deduplication: Don't add if it's the exact same as the last Rachel message (e.g. double welcome)
+          setChatHistory(prev => {
+            if (prev.length > 0) {
+              const last = prev[prev.length - 1];
+              if (last.sender === 'rachel' && last.text === data.content) return prev;
+            }
+            return [...prev, { sender: 'rachel', text: data.content, timestamp: new Date() }];
+          });
           setDirectorMessage(data.content);
-          setChatHistory(prev => [...prev, { sender: 'rachel', text: data.content, timestamp: new Date() }]);
         } else if (data.msg_type === 'status') {
           setAiState(data.state);
         } else if (data.type === 'status_update') {
@@ -645,35 +780,42 @@ export default function App() {
         } else if (data.type === 'proactive_audio') {
           setDirectorMessage("Rachel looks on: " + data.text);
           setChatHistory(prev => [...prev, { sender: 'rachel', text: data.text, timestamp: new Date() }]);
-          setAiState("synthesizing"); // Re-using valid Loader state Enum
+          setAiState("synthesizing");
 
-          if (data.audio_b64 && isRachelEnabled) {
+          // Check for audio_url first (Piper TTS), fall back to audio_b64 (ElevenLabs)
+          if (data.audio_url) {
+            playAudioFromUrl(data.audio_url, data.text);
+          } else if (data.audio_b64 && isRachelEnabled) {
             try {
               const audio = new Audio("data:audio/mp3;base64," + data.audio_b64);
-              audio.play().catch(e => console.error("Audio playback restricted by browser:", e));
-            } catch (err) {
-              console.error("Audio initialization failed:", err);
-            }
+              audio.play().catch(e => { });
+            } catch (err) { }
           }
           setTimeout(() => setAiState("idle"), 4000);
         } else if (data.type === 'generation_result') {
+          // Text + Audio arrive together for synchronized display
+          if (data.text) {
+            setDirectorMessage(data.text);
+            setChatHistory(prev => [...prev, { sender: 'rachel', text: data.text, timestamp: new Date() }]);
+          }
           if (data.world_state) {
             setWorldState(data.world_state);
           }
-          if (data.audio_b64 && isRachelEnabled) {
+          // Check for audio_url first (Piper TTS), fall back to audio_b64 (ElevenLabs)
+          if (data.audio_url) {
+            playAudioFromUrl(data.audio_url, data.text || "");
+          } else if (data.audio_b64 && isRachelEnabled) {
             try {
               const audio = new Audio("data:audio/mp3;base64," + data.audio_b64);
-              audio.play().catch(e => console.error("Audio playback restricted by browser:", e));
-            } catch (err) {
-              console.error("Audio initialization failed:", err);
-            }
+              audio.play().catch(e => { });
+            } catch (err) { }
           }
         }
       } catch (err) {
-        console.error("Error parsing websocket message", err);
+        // Suppress parsing errors
       }
     }
-  }, [lastMessage]);
+  }, [lastMessage, playAudioFromUrl, isRachelEnabled]);
 
   // Periodically sync player position to the Director for spatial awareness
   useEffect(() => {
@@ -752,19 +894,15 @@ export default function App() {
       };
 
       mediaRecorderRef.current.onstop = () => {
-        // Stop the mic tracks
-        if (mediaRecorderRef.current && mediaRecorderRef.current.stream) {
-          mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
-        }
-
         if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-          audioContextRef.current.close().catch(console.error);
+        if (audioContextRef.current) {
+          audioContextRef.current.close().catch(() => { });
+          audioContextRef.current = null;
         }
+        analyserRef.current = null;
         setVolumeLevel(0);
 
         if (!hasAudioDetected.current) {
-          console.warn("No audio detected during recording.");
           setDirectorMessage('No audio detected! Please check your microphone source.');
           setAiState('idle');
           return;
@@ -775,7 +913,15 @@ export default function App() {
           // We don't have the transcript yet, but we've finished recording.
           // The transcript will come back via the websocket handled above.
           sendMessage(fullBlob);
-          sendMessage(JSON.stringify({ type: 'audio_end' }));
+          const playerEnt = Object.values(ecsEntitiesRef.current).find((e: any) => e.ent_type === 'player') as any;
+          sendMessage(JSON.stringify({
+            type: 'audio_end',
+            player_position: {
+              x: playerEnt?.x || 0,
+              y: playerEnt?.y || 0,
+              z: playerEnt?.z || 0
+            }
+          }));
         }
       };
 
@@ -791,7 +937,6 @@ export default function App() {
       }, 500);
 
     } catch (err) {
-      console.error("Failed to access microphone:", err);
       setDirectorMessage("Error: Could not access microphone.");
     }
   };
@@ -874,6 +1019,72 @@ export default function App() {
           30%  { opacity: 1; transform: scale(1.0); }
           100% { opacity: 1; transform: scale(1.0); }
         }
+        @keyframes death-fade-in {
+          0%   { opacity: 0; }
+          100% { opacity: 1; }
+        }
+        @keyframes death-glitch {
+          0%   { transform: translate(0, 0) skewX(0deg); opacity: 0; }
+          10%  { transform: translate(-3px, 2px) skewX(-2deg); opacity: 0.3; }
+          20%  { transform: translate(5px, -1px) skewX(3deg); opacity: 0.6; }
+          30%  { transform: translate(-2px, 3px) skewX(-1deg); opacity: 0.4; }
+          40%  { transform: translate(4px, -2px) skewX(2deg); opacity: 0.8; }
+          50%  { transform: translate(0, 0) skewX(0deg); opacity: 1; }
+          100% { transform: translate(0, 0) skewX(0deg); opacity: 1; }
+        }
+        @keyframes death-scanline {
+          0%   { top: -10%; }
+          100% { top: 110%; }
+        }
+        @keyframes death-pulse {
+          0%, 100% { opacity: 0.4; }
+          50%      { opacity: 1; }
+        }
+        @keyframes death-stats-slide {
+          0%   { transform: translateY(30px); opacity: 0; }
+          100% { transform: translateY(0); opacity: 1; }
+        }
+        @keyframes death-prompt-blink {
+          0%, 100% { opacity: 0.3; }
+          50%      { opacity: 1; }
+        }
+        @keyframes lvl-enter {
+          0%   { opacity: 0; transform: scale(0.8); }
+          50%  { opacity: 1; transform: scale(1.05); }
+          70%  { transform: scale(0.98); }
+          100% { opacity: 1; transform: scale(1.0); }
+        }
+        @keyframes lvl-exit {
+          0%   { opacity: 1; transform: scale(1.0); }
+          100% { opacity: 0; transform: scale(1.3); filter: blur(8px); }
+        }
+        @keyframes lvl-number-slam {
+          0%   { transform: scale(4) rotate(-5deg); opacity: 0; filter: blur(10px); }
+          40%  { transform: scale(1.1) rotate(1deg); opacity: 1; filter: blur(0); }
+          55%  { transform: scale(0.95) rotate(-0.5deg); }
+          70%  { transform: scale(1.02) rotate(0deg); }
+          100% { transform: scale(1.0) rotate(0deg); opacity: 1; }
+        }
+        @keyframes lvl-line-expand {
+          0%   { width: 0; opacity: 0; }
+          100% { width: 200px; opacity: 1; }
+        }
+        @keyframes lvl-subtitle-rise {
+          0%   { transform: translateY(20px); opacity: 0; letter-spacing: 0.8em; }
+          100% { transform: translateY(0); opacity: 1; letter-spacing: 0.5em; }
+        }
+        @keyframes lvl-flash {
+          0%   { opacity: 0.6; }
+          100% { opacity: 0; }
+        }
+        @keyframes lvl-ring-expand {
+          0%   { transform: scale(0); opacity: 0.8; }
+          100% { transform: scale(3); opacity: 0; }
+        }
+        @keyframes lvl-particles {
+          0%   { transform: translateY(0) scale(1); opacity: 1; }
+          100% { transform: translateY(-80px) scale(0); opacity: 0; }
+        }
         @keyframes cinematic-shake {
           0%,100% { transform: translate(0,0) rotate(0deg); }
           15% { transform: translate(-6px, 4px) rotate(-1deg); }
@@ -955,6 +1166,192 @@ export default function App() {
           />
         )}
 
+        {/* ── Death / Game Over Screen ── */}
+        {showDeathScreen && (
+          <div
+            className="absolute inset-0 z-[200] flex items-center justify-center cursor-pointer"
+            style={{ animation: 'death-fade-in 0.6s ease-out forwards' }}
+            onClick={handleFullReset}
+            onKeyDown={handleFullReset}
+            tabIndex={0}
+            ref={(el) => el?.focus()}
+          >
+            {/* Dark vignette background */}
+            <div className="absolute inset-0" style={{
+              background: deathReason === 'blackhole'
+                ? 'radial-gradient(ellipse at center, rgba(20,0,40,0.85) 0%, rgba(0,0,0,0.97) 60%)'
+                : deathReason === 'restart'
+                  ? 'radial-gradient(ellipse at center, rgba(0,10,30,0.85) 0%, rgba(0,0,0,0.97) 60%)'
+                  : 'radial-gradient(ellipse at center, rgba(40,0,0,0.85) 0%, rgba(0,0,0,0.97) 60%)',
+            }} />
+
+            {/* Scanline effect */}
+            <div className="absolute inset-0 overflow-hidden pointer-events-none">
+              <div className="absolute left-0 w-full h-[2px] opacity-20" style={{
+                background: 'linear-gradient(90deg, transparent, rgba(255,255,255,0.5), transparent)',
+                animation: 'death-scanline 2s linear infinite',
+              }} />
+            </div>
+
+            {/* CRT noise overlay */}
+            <div className="absolute inset-0 pointer-events-none opacity-[0.03]" style={{
+              backgroundImage: 'url("data:image/svg+xml,%3Csvg viewBox=\'0 0 256 256\' xmlns=\'http://www.w3.org/2000/svg\'%3E%3Cfilter id=\'noise\'%3E%3CfeTurbulence type=\'fractalNoise\' baseFrequency=\'0.9\' numOctaves=\'4\' stitchTiles=\'stitch\'/%3E%3C/filter%3E%3Crect width=\'100%25\' height=\'100%25\' filter=\'url(%23noise)\'/%3E%3C/svg%3E")',
+            }} />
+
+            {/* Main content */}
+            <div className="relative flex flex-col items-center gap-8 z-10">
+              {/* Glitch title */}
+              <div style={{ animation: 'death-glitch 1.2s ease-out forwards' }}>
+                <div className="text-[11px] font-mono font-black uppercase tracking-[0.8em] mb-4" style={{
+                  color: deathReason === 'blackhole' ? '#a855f7' : deathReason === 'restart' ? '#38bdf8' : '#ef4444',
+                  animation: 'death-pulse 2s ease-in-out infinite',
+                  textShadow: deathReason === 'blackhole'
+                    ? '0 0 20px rgba(168,85,247,0.6)'
+                    : deathReason === 'restart'
+                      ? '0 0 20px rgba(56,189,248,0.6)'
+                      : '0 0 20px rgba(239,68,68,0.6)',
+                }}>
+                  {deathReason === 'blackhole' ? 'Event Horizon Breach' : deathReason === 'restart' ? 'System Reboot' : 'Hull Integrity Critical'}
+                </div>
+
+                <div className="text-5xl font-mono font-black uppercase tracking-[0.2em] text-white/95" style={{
+                  textShadow: deathReason === 'blackhole'
+                    ? '0 0 60px rgba(168,85,247,0.5), 0 0 120px rgba(168,85,247,0.2)'
+                    : deathReason === 'restart'
+                      ? '0 0 60px rgba(56,189,248,0.5), 0 0 120px rgba(56,189,248,0.2)'
+                      : '0 0 60px rgba(239,68,68,0.5), 0 0 120px rgba(239,68,68,0.2)',
+                }}>
+                  {deathReason === 'blackhole' ? 'CONSUMED' : deathReason === 'restart' ? 'RESETTING' : 'DESTROYED'}
+                </div>
+              </div>
+
+              {/* Subtitle */}
+              <div className="text-neutral-500 text-[11px] font-mono uppercase tracking-[0.5em]" style={{ animation: 'death-stats-slide 0.8s ease-out 0.4s both' }}>
+                {deathReason === 'blackhole'
+                  ? 'Spacetime fabric torn beyond repair'
+                  : deathReason === 'restart'
+                    ? 'Neural link reinitializing...'
+                    : 'All systems offline — no life signs detected'}
+              </div>
+
+              {/* Stats */}
+              {deathReason !== 'restart' && (
+                <div className="flex gap-12 mt-4" style={{ animation: 'death-stats-slide 0.8s ease-out 0.7s both' }}>
+                  <div className="flex flex-col items-center gap-1">
+                    <div className="text-[9px] uppercase tracking-[0.5em] text-neutral-600 font-mono font-bold">Final Level</div>
+                    <div className="text-3xl font-black font-mono text-sky-400" style={{ textShadow: '0 0 20px rgba(56,189,248,0.5)' }}>{deathStats.level}</div>
+                  </div>
+                  <div className="w-px bg-white/10" />
+                  <div className="flex flex-col items-center gap-1">
+                    <div className="text-[9px] uppercase tracking-[0.5em] text-neutral-600 font-mono font-bold">Total Kills</div>
+                    <div className="text-3xl font-black font-mono text-purple-400" style={{ textShadow: '0 0 20px rgba(168,85,247,0.5)' }}>{deathStats.score}</div>
+                  </div>
+                </div>
+              )}
+
+              {/* Prompt to continue */}
+              <div className="mt-8 text-neutral-400 text-[10px] font-mono uppercase tracking-[0.4em]" style={{ animation: 'death-prompt-blink 1.5s ease-in-out infinite 1.2s both' }}>
+                [ Click or press any key to restart ]
+              </div>
+
+              {/* Decorative line */}
+              <div className="w-48 h-px mt-2" style={{
+                background: deathReason === 'blackhole'
+                  ? 'linear-gradient(90deg, transparent, rgba(168,85,247,0.4), transparent)'
+                  : deathReason === 'restart'
+                    ? 'linear-gradient(90deg, transparent, rgba(56,189,248,0.4), transparent)'
+                    : 'linear-gradient(90deg, transparent, rgba(239,68,68,0.4), transparent)',
+              }} />
+            </div>
+          </div>
+        )}
+
+        {/* ── Level Transition Screen ── */}
+        {showLevelTransition && (
+          <div
+            className="absolute inset-0 z-[195] pointer-events-none flex items-center justify-center"
+            style={{
+              animation: `lvl-enter 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards, lvl-exit 0.8s ease-in 2.7s forwards`,
+            }}
+          >
+            {/* Flash burst */}
+            <div className="absolute inset-0" style={{
+              background: 'radial-gradient(circle at center, rgba(56,189,248,0.3) 0%, transparent 60%)',
+              animation: 'lvl-flash 1.0s ease-out forwards',
+            }} />
+
+            {/* Expanding ring */}
+            <div className="absolute" style={{
+              width: 200, height: 200,
+              border: '2px solid rgba(56,189,248,0.4)',
+              borderRadius: '50%',
+              animation: 'lvl-ring-expand 1.5s ease-out forwards',
+            }} />
+            <div className="absolute" style={{
+              width: 200, height: 200,
+              border: '1px solid rgba(168,85,247,0.3)',
+              borderRadius: '50%',
+              animation: 'lvl-ring-expand 1.5s ease-out 0.2s forwards',
+            }} />
+
+            {/* Rising particles */}
+            {[...Array(8)].map((_, i) => (
+              <div key={i} className="absolute" style={{
+                width: 4, height: 4,
+                borderRadius: '50%',
+                background: i % 2 === 0 ? '#38bdf8' : '#a855f7',
+                boxShadow: i % 2 === 0 ? '0 0 8px #38bdf8' : '0 0 8px #a855f7',
+                left: `${45 + Math.sin(i * 0.785) * 15}%`,
+                top: `${55 + Math.cos(i * 0.785) * 8}%`,
+                animation: `lvl-particles 1.2s ease-out ${0.3 + i * 0.08}s forwards`,
+                opacity: 0,
+              }} />
+            ))}
+
+            {/* Content */}
+            <div className="relative flex flex-col items-center z-10">
+              {/* Pre-title */}
+              <div className="text-[10px] font-mono font-bold uppercase tracking-[0.8em] text-sky-400/60 mb-6" style={{
+                animation: 'lvl-subtitle-rise 0.6s ease-out 0.2s both',
+              }}>
+                Entering
+              </div>
+
+              {/* Big level number */}
+              <div className="flex items-baseline gap-4 mb-4">
+                <div className="text-[11px] font-mono font-bold uppercase tracking-[0.5em] text-neutral-500" style={{
+                  animation: 'lvl-subtitle-rise 0.6s ease-out 0.3s both',
+                }}>
+                  Level
+                </div>
+                <div className="text-8xl font-black font-mono text-white" style={{
+                  animation: 'lvl-number-slam 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.1s both',
+                  textShadow: '0 0 80px rgba(56,189,248,0.6), 0 0 160px rgba(168,85,247,0.3), 0 4px 0 rgba(0,0,0,0.3)',
+                  WebkitTextStroke: '1px rgba(56,189,248,0.3)',
+                }}>
+                  {transitionLevel}
+                </div>
+              </div>
+
+              {/* Decorative line */}
+              <div className="h-px bg-gradient-to-r from-transparent via-sky-400/50 to-transparent" style={{
+                animation: 'lvl-line-expand 0.6s ease-out 0.5s both',
+              }} />
+
+              {/* Subtitle */}
+              <div className="mt-5 text-[10px] font-mono uppercase tracking-[0.5em] text-neutral-400" style={{
+                animation: 'lvl-subtitle-rise 0.6s ease-out 0.7s both',
+              }}>
+                {transitionLevel <= 3 ? 'Threat Level: Low'
+                  : transitionLevel <= 6 ? 'Threat Level: Moderate'
+                  : transitionLevel <= 9 ? 'Threat Level: High'
+                  : transitionLevel <= 12 ? 'Threat Level: Extreme'
+                  : 'Threat Level: Apocalyptic'}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Tactical HUD Overlay — Now handles all status icons and buttons */}
         <HUD
           playerHealth={playerHealth}
@@ -971,50 +1368,74 @@ export default function App() {
           readyState={readyState}
           isRachelEnabled={isRachelEnabled}
           setIsRachelEnabled={setIsRachelEnabled}
-          isMuted={worldState?.audio_settings?.ai_muted ?? isMuted}
-          setIsMuted={(muted: boolean) => {
-            setIsMuted(muted);
-            sendMessage(JSON.stringify({
-              type: 'update_audio_settings',
-              ai_muted: muted,
-              game_muted: muted
-            }));
-          }}
+          isMuted={isMuted}
+          setIsMuted={handleToggleMute}
           visualConfig={worldState?.visual_config}
           spectatorTargetId={spectatorTargetId}
           setSpectatorTargetId={setSpectatorTargetId}
-          onReset={handleFullReset}
+          onReset={() => triggerDeathScreen('restart')}
           onFocusModeChange={handleFocusModeChange}
+          sidebarWidth={sidebarWidth}
+          isResizing={isResizing}
         />
 
         {/* The Director's Console (Left Sidebar) */}
-        <div className={`fixed left-0 top-0 h-screen w-[450px] bg-black/80 backdrop-blur-3xl border-r border-white/10 z-50 flex flex-col p-6 transition-all duration-500 cubic-bezier(0.4, 0, 0.2, 1) shadow-[10px_0_50px_rgba(0,0,0,0.5)] ${isChatVisible ? 'translate-x-0 opacity-100' : '-translate-x-full opacity-0'}`}>
-          <div className="flex items-center justify-between mb-8">
-            <div className="flex items-center space-x-3">
-              <div className="w-2 h-2 rounded-full bg-purple-500 animate-pulse"></div>
-              <h2 className="text-xs font-bold text-neutral-400 uppercase tracking-[0.2em]">Director's Console</h2>
+        <div
+          className={`fixed left-0 top-0 h-screen bg-black/80 backdrop-blur-3xl border-r border-white/10 z-50 flex flex-col p-6 shadow-[10px_0_50px_rgba(0,0,0,0.5)] ${isChatVisible ? 'translate-x-0 opacity-100' : '-translate-x-full opacity-0'}`}
+          style={{ width: `${sidebarWidth}px`, transition: isResizing ? 'none' : 'transform 0.5s ease-out, opacity 0.5s ease-out' }}
+        >
+          {/* Resize Handle */}
+          <div
+            onMouseDown={startResizing}
+            className="absolute top-0 right-0 w-1 h-full cursor-col-resize hover:bg-purple-500/30 transition-colors z-[60]"
+          />
+
+          <div className="flex flex-col gap-4 mb-8">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className={`w-2.5 h-2.5 rounded-full ${readyState === 1 ? 'bg-green-500 shadow-[0_0_12px_rgba(34,197,94,0.6)]' : 'bg-red-500 animate-pulse shadow-[0_0_12px_rgba(239,68,68,0.6)]'}`} />
+                <h2 className="text-[11px] font-black text-white/90 uppercase tracking-[0.3em]">Link Sync</h2>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    const nextState = !isRachelEnabled;
+                    setIsRachelEnabled(nextState);
+                    handleToggleMute(!nextState);
+                  }}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border transition-all ${isRachelEnabled ? 'bg-purple-500/10 border-purple-500/20 text-purple-400' : 'bg-red-500/10 border-red-500/20 text-red-400'}`}
+                  title={isRachelEnabled ? "Mute Rachel" : "Unmute Rachel"}
+                >
+                  {isRachelEnabled ? <Bot className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
+                  <span className="text-[10px] font-mono font-bold uppercase tracking-tight">
+                    {isRachelEnabled ? 'Voice: Up' : 'Muted'}
+                  </span>
+                </button>
+                <button
+                  onClick={() => setIsChatVisible(false)}
+                  className="p-1.5 hover:bg-white/10 rounded-lg transition-colors text-neutral-500 hover:text-white"
+                  title="Minimize Console"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+              </div>
             </div>
-            <button
-              onClick={() => setIsChatVisible(false)}
-              className="p-1 hover:bg-white/10 rounded-lg transition-colors text-neutral-500 hover:text-white"
-              title="Minimize Console"
-            >
-              <ChevronLeft className="w-4 h-4" />
-            </button>
           </div>
 
           <div className="flex-1 flex flex-col gap-6 min-h-0">
             {/* Conversations / Subtitles */}
-            <div className="flex-1 flex flex-col bg-white/5 border border-white/10 p-4 rounded-xl shadow-inner group hover:border-purple-500/30 transition-colors min-h-0">
-              <h3 className="text-[10px] uppercase tracking-widest text-neutral-500 mb-3 font-bold">Conversational Stream</h3>
+            <div className="flex-1 flex flex-col bg-white/5 border border-white/10 rounded-xl shadow-inner group hover:border-purple-500/30 transition-colors min-h-0 overflow-hidden">
               <div className="flex-1 min-h-0">
-                <ChatLog messages={chatHistory} onRetry={() => (window as any).clearFailedState && (window as any).clearFailedState()} />
+                <ChatLog
+                  messages={chatHistory}
+                  onRetry={() => (window as any).clearFailedState && (window as any).clearFailedState()}
+                  isThinking={aiState !== 'idle'}
+                />
               </div>
             </div>
-            {/* Removed [Raw Engine State] JSON dump for cleaner UI v7.3 */}
           </div>
 
-          {/* New Relocated Control Interface inside sidebar */}
+          {/* Control Interface inside sidebar */}
           <div className="mt-6 pt-6 border-t border-white/5 space-y-4">
             <div className="flex items-center gap-4">
               <button
@@ -1049,10 +1470,18 @@ export default function App() {
                 onSubmit={(e) => {
                   e.preventDefault();
                   if (!textInput.trim() || readyState !== ReadyState.OPEN) return;
-                  sendMessage(JSON.stringify({ type: 'text_command', text: textInput }));
+                  const playerEnt = Object.values(ecsEntitiesRef.current).find((e: any) => e.ent_type === 'player') as any;
+                  sendMessage(JSON.stringify({
+                    type: 'text_command',
+                    text: textInput,
+                    player_position: {
+                      x: playerEnt?.x || 0,
+                      y: playerEnt?.y || 0,
+                      z: playerEnt?.z || 0
+                    }
+                  }));
                   setChatHistory(prev => [...prev, { sender: 'user', text: textInput, timestamp: new Date() }]);
                   setTextInput('');
-                  setDirectorMessage('Manual override initiated...');
                 }}
                 className="flex-1 flex items-center bg-black/40 backdrop-blur-xl border border-white/10 rounded-full p-1 pl-3 shadow-2xl group hover:border-purple-500/50 transition-all focus-within:border-purple-500/50 focus-within:ring-1 focus-within:ring-purple-500/20"
               >
@@ -1075,17 +1504,7 @@ export default function App() {
                 </button>
               </form>
             </div>
-            <div className="flex items-center justify-between px-2">
-              <span className="text-[9px] font-medium text-neutral-500 uppercase tracking-widest">
-                {isRecording ? 'Capturing Voice...' : 'Voice / Override'}
-              </span>
-              {aiState !== 'idle' && (
-                <div className="flex items-center gap-2">
-                  <Activity className="w-2.5 h-2.5 text-purple-400 animate-pulse" />
-                  <span className="text-[8px] font-bold text-purple-500/80 uppercase tracking-tighter">Syncing...</span>
-                </div>
-              )}
-            </div>
+
           </div>
         </div>
 
