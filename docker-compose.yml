@@ -15,6 +15,8 @@ services:
 
   # ── Python AI Director ────────────────────────────────────────────────────
   python-director:
+    env_file:
+      - .env
     build:
       context: ./apps/python-director
       dockerfile: Dockerfile
@@ -22,15 +24,16 @@ services:
       - "8000:8000"
     volumes:
       - ./apps/python-director/data:/app/data
+      - audio_assets:/app/audio
+      - generated_assets:/app/generated
     environment:
       - RUST_ENGINE_URL=http://rust-engine:8080
       - REDIS_URL=redis://redis-memory:6379
-      - SELF_URL=http://python-director:8000
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - HF_TOKEN=${HF_TOKEN}
-      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
-      - GITHUB_API_KEY=${GITHUB_API_KEY}
+      - SELF_URL=http://localhost:8000
+      - AI_MODEL_MODE=${AI_MODEL_MODE:-}
+      - COQUI_TOS_AGREED=1
+      - AUDIO_DIR=/app/audio
+      - GENERATED_DIR=/app/generated
     depends_on:
       - redis-memory
       - rust-engine
@@ -42,3 +45,7 @@ services:
     ports:
       - "6379:6379"
     restart: unless-stopped
+
+volumes:
+  audio_assets:
+  generated_assets:

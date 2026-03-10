@@ -1,6 +1,5 @@
 import os
 import sys
-import subprocess
 import json
 import asyncio
 import math
@@ -8,21 +7,10 @@ import logging
 import re
 import tempfile
 import base64
+import threading
 import httpx
-
-try:
-    import piper
-except ImportError:
-    print("Auto-installing piper-tts in the current active environment...", flush=True)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "piper-tts==1.4.1"])
-    import piper
-
-try:
-    import edge_tts
-except ImportError:
-    print("Auto-installing edge-tts in the current active environment...", flush=True)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "edge-tts"])
-    import edge_tts
+import piper
+import edge_tts
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +24,12 @@ from dotenv import load_dotenv
 import redis
 import redis.commands.search.field as RedisField
 import redis.commands.search.query as RedisQuery
-from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+from redis.commands.search.field import VectorField, TextField, TagField
+
+try:
+    from redis.commands.search.index_definition import IndexDefinition, IndexType
+except ImportError:
+    from redis.commands.search.indexDefinition import IndexDefinition, IndexType
 from pathlib import Path
 import numpy as np
 import hashlib
@@ -46,14 +39,27 @@ import struct
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load .env from the project root directory (c:\Project\.env)
-dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
-if not os.path.exists(dotenv_path):
-    logger.error(f"CRITICAL WARNING: .env FILE NOT FOUND AT: {dotenv_path}")
-else:
-    logger.info(f"Loaded .env file from: {dotenv_path}")
+# Attempt to load .env from common locations (local, parent, or project root)
+# In Docker, we rely on Docker's env_file, so this is primarily for local dev.
+possible_paths = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), '.env'),
+]
+dotenv_found = False
+for dotenv_path in possible_paths:
+    if os.path.exists(dotenv_path):
+        load_dotenv(dotenv_path, override=True)
+        logger.info(f"Loaded .env file from: {dotenv_path}")
+        dotenv_found = True
+        break
 
-load_dotenv(dotenv_path, override=True)
+if not dotenv_found:
+    if os.getenv("GOOGLE_API_KEY"):
+        logger.info("Running in Docker/container mode — env vars loaded from environment (no .env file needed).")
+    else:
+        logger.warning("No .env file found and GOOGLE_API_KEY is not set. Keys might be missing.")
+
 # LangChain and Groq
 from groq import AsyncGroq
 from langchain_groq import ChatGroq
@@ -86,18 +92,25 @@ app.add_middleware(
 
 # Static Asset Configuration
 app_dir = os.path.dirname(os.path.abspath(__file__))
-data_dir = os.path.join(app_dir, "..", "web-client", "public", "assets")
 backend_data_dir = os.path.join(app_dir, "data")
 
-# Mount generated textures specifically (must come BEFORE /assets to avoid being shadowed)
-generated_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "generated")
-os.makedirs(generated_dir, exist_ok=True)
+# AUDIO_DIR / GENERATED_DIR: configurable via env for Docker (defaults to local web-client path for dev)
+_default_audio    = os.path.join(app_dir, "..", "web-client", "public", "assets", "audio")
+_default_generated = os.path.join(app_dir, "..", "web-client", "public", "assets", "generated")
+_default_assets   = os.path.join(app_dir, "..", "web-client", "public", "assets")
 
-# Cleanup old textures and registry on startup
-for f in os.listdir(generated_dir):
+AUDIO_DIR     = os.getenv("AUDIO_DIR",     _default_audio)
+GENERATED_DIR = os.getenv("GENERATED_DIR", _default_generated)
+data_dir      = os.getenv("ASSETS_DIR",    _default_assets)
+
+os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(GENERATED_DIR, exist_ok=True)
+
+# Cleanup old textures on startup
+for f in os.listdir(GENERATED_DIR):
     if f.endswith(".png"):
         try:
-            os.remove(os.path.join(generated_dir, f))
+            os.remove(os.path.join(GENERATED_DIR, f))
         except Exception as _e:
             logger.debug(f"Could not purge old texture {f}: {_e}")
 
@@ -109,25 +122,21 @@ try:
 except Exception as _e:
     logger.debug(f"Could not purge texture registry: {_e}")
 
-app.mount("/assets/generated", StaticFiles(directory=generated_dir), name="assets_generated")
-
-# Mount audio files (Piper TTS output)
-audio_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "audio")
-os.makedirs(audio_dir, exist_ok=True)
+app.mount("/assets/generated", StaticFiles(directory=GENERATED_DIR), name="assets_generated")
 
 # Cleanup old audio files on startup
-for f in os.listdir(audio_dir):
+for f in os.listdir(AUDIO_DIR):
     if f.endswith((".wav", ".mp3")):
         try:
-            os.remove(os.path.join(audio_dir, f))
+            os.remove(os.path.join(AUDIO_DIR, f))
         except Exception as _e:
             logger.debug(f"Could not purge old audio file {f}: {_e}")
 
-app.mount("/assets/audio", StaticFiles(directory=audio_dir), name="assets_audio")
+app.mount("/assets/audio", StaticFiles(directory=AUDIO_DIR), name="assets_audio")
 
-# Mount static assets (textures, etc.)
-# data/ contains 2K textures for the solar system
-app.mount("/assets", StaticFiles(directory=data_dir), name="assets")
+# Mount static assets (textures, etc.) — only if directory exists (not available in Docker without volume)
+if os.path.isdir(data_dir):
+    app.mount("/assets", StaticFiles(directory=data_dir), name="assets")
 
 # Initialize Groq Client for Whisper STT
 try:
@@ -139,20 +148,25 @@ except Exception as e:
     logger.error(f"Failed to initialize Groq Client: {e}")
     groq_client = None
 
-# Initialize ElevenLabs config
+# Initialize ElevenLabs config (preflight check moved to startup event)
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
+VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Standard Rachel pre-made voice ID
 
-if not ELEVENLABS_API_KEY:
-    logger.error("CRITICAL WARNING: ELEVENLABS_API_KEY is missing or empty in the .env file!")
-else:
-    logger.debug(f"ELEVENLABS_API_KEY starts with: {ELEVENLABS_API_KEY[:4]}... (Length: {len(ELEVENLABS_API_KEY)})")
-    
-    # Pre-flight readiness check for ElevenLabs to prevent 401 Unauthorized during playtime
-    import requests
+async def _check_elevenlabs_quota():
+    """Async ElevenLabs preflight check — runs in startup event, not at import time."""
+    global ELEVENLABS_API_KEY
+    if not ELEVENLABS_API_KEY:
+        logger.warning("ELEVENLABS_API_KEY not set — ElevenLabs TTS disabled.")
+        return
     try:
-        r = requests.get("https://api.elevenlabs.io/v1/user/subscription", headers={"xi-api-key": ELEVENLABS_API_KEY}, timeout=5.0)
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(
+                "https://api.elevenlabs.io/v1/user/subscription",
+                headers={"xi-api-key": ELEVENLABS_API_KEY},
+            )
         if r.status_code == 401:
-            logger.error("ElevenLabs API Key is UNAUTHORIZED (401). TTS will be disabled.")
+            logger.error("ElevenLabs API Key UNAUTHORIZED (401). TTS will be disabled.")
             ELEVENLABS_API_KEY = None
         elif r.status_code == 200:
             subs = r.json()
@@ -163,18 +177,9 @@ else:
                 logger.warning("ElevenLabs quota EXCEEDED! TTS will be disabled.")
                 ELEVENLABS_API_KEY = None
         else:
-            logger.warning(f"ElevenLabs returned unexpected status on check: {r.status_code}")
+            logger.warning(f"ElevenLabs unexpected status: {r.status_code}")
     except Exception as e:
-        logger.warning(f"Failed to verify ElevenLabs subscription status: {e}")
-
-# Initialize HF_TOKEN check
-HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
-    logger.error("CRITICAL ERROR: HF_TOKEN is missing in the .env file! AI Texture Generation will FAIL.")
-else:
-    logger.info(f"Hugging Face Token detected: {HF_TOKEN[:8]}...")
-
-VOICE_ID = "21m00Tcm4TlvDq8ikWAM" # Standard Rachel pre-made voice ID, guaranteed accessible on free tier
+        logger.warning(f"ElevenLabs preflight failed: {e}")
 
 class TTSManager:
     """Manages TTS generation with Piper (primary) and ElevenLabs (fallback/testing)."""
@@ -260,12 +265,7 @@ class TTSManager:
             timestamp = int(time.time() * 1000)
             audio_filename = f"response_{timestamp}.wav"
 
-            # Save to /public/assets/audio/ folder
-            app_dir = os.path.dirname(os.path.abspath(__file__))
-            audio_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "audio")
-            os.makedirs(audio_dir, exist_ok=True)
-
-            audio_path = os.path.join(audio_dir, audio_filename)
+            audio_path = os.path.join(AUDIO_DIR, audio_filename)
 
             # Synthesize and write PCM frames to WAV
             with wave.open(audio_path, "w") as wav_file:
@@ -292,10 +292,7 @@ class TTSManager:
             timestamp = int(time.time() * 1000)
             audio_filename = f"response_{timestamp}.mp3"
 
-            app_dir = os.path.dirname(os.path.abspath(__file__))
-            audio_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "audio")
-            os.makedirs(audio_dir, exist_ok=True)
-            audio_path = os.path.join(audio_dir, audio_filename)
+            audio_path = os.path.join(AUDIO_DIR, audio_filename)
 
             communicate = edge_tts.Communicate(text, cls.EDGE_TTS_VOICE)
             await communicate.save(audio_path)
@@ -336,13 +333,45 @@ class TTSManager:
             return None
 
     @classmethod
+    async def generate_speech_xtts(cls, text: str) -> Optional[str]:
+        """Generate speech with local XTTS-v2 on GPU. Returns audio URL."""
+        if _local_xtts_model is None:
+            return None
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            timestamp = int(time.time() * 1000)
+            audio_filename = f"response_{timestamp}.wav"
+            audio_path = os.path.join(AUDIO_DIR, audio_filename)
+            _local_xtts_model.tts_to_file(
+                text=text,
+                speaker="Claribel Dervla",
+                language="en",
+                file_path=audio_path,
+            )
+            return f"{SELF_URL}/assets/audio/{audio_filename}"
+
+        return await loop.run_in_executor(None, _run)
+
+    @classmethod
     async def generate_speech(cls, text: str) -> tuple[Optional[str], Optional[str]]:
         """
-        3-Tier TTS Cascade:
-        - Tier 1 (premium, opt-in): ElevenLabs — if USE_ELEVENLABS=True. Returns (None, b64).
-        - Tier 2 (default):         edge-tts    — Microsoft Azure Neural voices. Returns (url, None).
-        - Tier 3 (offline fallback): Piper TTS  — local ONNX, no network needed. Returns (url, None).
+        4-Tier TTS Cascade:
+        - Tier 0 (LOCAL_GPU):        XTTS-v2     — GPU local, ~150ms warm. Returns (url, None).
+        - Tier 1 (premium, opt-in):  ElevenLabs  — if USE_ELEVENLABS=True. Returns (None, b64).
+        - Tier 2 (default):          edge-tts    — Microsoft Azure Neural voices. Returns (url, None).
+        - Tier 3 (offline fallback): Piper TTS   — local ONNX, no network needed. Returns (url, None).
         """
+        # Tier 0: LOCAL_GPU — XTTS-v2
+        if AI_MODEL_MODE == "LOCAL_GPU" and _local_xtts_model is not None:
+            try:
+                audio_url = await cls.generate_speech_xtts(text)
+                if audio_url:
+                    return (audio_url, None)
+            except Exception as e:
+                logger.warning(f"XTTS-v2 failed ({e}), falling back...")
+
+        # Tier 1: ElevenLabs (premium opt-in)
         if cls.USE_ELEVENLABS:
             audio_b64 = await cls.generate_speech_elevenlabs(text)
             return (None, audio_b64)
@@ -761,14 +790,55 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 RUST_ENGINE_URL = os.getenv("RUST_ENGINE_URL", "http://127.0.0.1:8080")
 SELF_URL = os.getenv("SELF_URL", "http://127.0.0.1:8000")
 REDIS_CLIENT: Optional[redis.Redis] = None
-EMBEDDING_DIM = 768  # Google text-embedding-004 dimension
+EMBEDDING_DIM = 768  # Google gemini-embedding-001 dimension (also used for fallback compatibility)
+
+# ── Local GPU Mode ────────────────────────────────────────────────────────────
+AI_MODEL_MODE = os.getenv("AI_MODEL_MODE", "")  # Set to "LOCAL_GPU" on AWS g5.xlarge
+
+# GPU model handles — populated at startup if AI_MODEL_MODE == "LOCAL_GPU"
+_local_whisper_model = None   # openai-whisper large-v3
+_local_xtts_model    = None   # Coqui XTTS-v2
+
+
+def _preload_whisper():
+    """Load Whisper large-v3 onto GPU in FP16. Called in background thread at startup."""
+    global _local_whisper_model
+    try:
+        import whisper, torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"[STT] Preloading Whisper large-v3 on {device} (fp16)...")
+        model = whisper.load_model("large-v3", device=device)
+        if device == "cuda":
+            model = model.half()
+        _local_whisper_model = model
+        logger.info("[STT] Whisper large-v3 ready.")
+    except Exception as e:
+        logger.error(f"[STT] Whisper preload failed: {e}")
+
+
+def _preload_xtts():
+    """Load XTTS-v2 onto GPU. Called in background thread at startup."""
+    global _local_xtts_model
+    try:
+        import torch
+        from TTS.api import TTS as CoquiTTS
+        os.environ["COQUI_TOS_AGREED"] = "1"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"[TTS] Preloading XTTS-v2 on {device}...")
+        _local_xtts_model = CoquiTTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+        logger.info("[TTS] XTTS-v2 ready.")
+    except Exception as e:
+        logger.error(f"[TTS] XTTS-v2 preload failed: {e}")
 
 def get_redis() -> Optional[redis.Redis]:
     """Get or create Redis connection."""
     global REDIS_CLIENT
     if REDIS_CLIENT is None:
         try:
-            REDIS_CLIENT = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+            REDIS_CLIENT = redis.Redis.from_url(
+                REDIS_URL, decode_responses=False,
+                socket_connect_timeout=10, socket_timeout=10
+            )
             REDIS_CLIENT.ping()
             logger.info(f"[Redis] Connected to {REDIS_URL}")
         except Exception as e:
@@ -777,8 +847,8 @@ def get_redis() -> Optional[redis.Redis]:
     return REDIS_CLIENT
 
 
-async def generate_embedding(text: str) -> Optional[List[float]]:
-    """Generate embedding using Google's text-embedding API (768-dim)."""
+async def generate_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> Optional[List[float]]:
+    """Generates a vector embedding for the given text using Google AI."""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         logger.error("[Embedding] GOOGLE_API_KEY not set")
@@ -786,34 +856,49 @@ async def generate_embedding(text: str) -> Optional[List[float]]:
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}",
-                json={"model": "models/text-embedding-004", "content": {"parts": [{"text": text}]}},
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={api_key}",
+                json={
+                    "content": {"parts": [{"text": text}]},
+                    "taskType": task_type,
+                    "outputDimensionality": 768
+                },
                 timeout=10.0,
             )
+            
             resp.raise_for_status()
-            values = resp.json()["embedding"]["values"]
+            result = resp.json()
+            # Handle both possible response formats (flat list or object wrapping)
+            values = result["embedding"]["values"] if "embedding" in result else result["values"]
             return values
+
     except Exception as e:
         logger.error(f"[Embedding] API call failed: {e}")
         return None
 
 
-def generate_embedding_sync(text: str) -> Optional[List[float]]:
+
+def generate_embedding_sync(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> Optional[List[float]]:
     """Synchronous embedding for startup use."""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         return None
     try:
         import urllib.request
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}"
-        data = json.dumps({"model": "models/text-embedding-004", "content": {"parts": [{"text": text}]}}).encode()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={api_key}"
+        payload = {
+            "content": {"parts": [{"text": text}]},
+            "taskType": task_type,
+            "outputDimensionality": 768
+        }
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
-            return result["embedding"]["values"]
+            return result["embedding"]["values"] if "embedding" in result else result["values"]
     except Exception as e:
         logger.error(f"[Embedding Sync] Failed: {e}")
         return None
+
 
 
 def _float_list_to_bytes(vec: List[float]) -> bytes:
@@ -879,7 +964,7 @@ def initialize_global_knowledge_base():
                 if len(chunk) < 40:
                     continue
 
-                embedding = generate_embedding_sync(chunk)
+                embedding = generate_embedding_sync(chunk, task_type="RETRIEVAL_DOCUMENT")
                 if not embedding:
                     continue
 
@@ -896,8 +981,43 @@ def initialize_global_knowledge_base():
 
     logger.info(f"[KB] Ingested {total} chunks into Redis index 'idx:kb'.")
 
-# Run KB initialization once at startup
-initialize_global_knowledge_base()
+# ── Startup Event ─────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    """Async startup: ElevenLabs preflight, KB ingestion, GPU model preloads."""
+    await _check_elevenlabs_quota()
+    initialize_global_knowledge_base()
+    if AI_MODEL_MODE == "LOCAL_GPU":
+        logger.info("[Startup] LOCAL_GPU mode — preloading models in background threads...")
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _preload_whisper)
+        loop.run_in_executor(None, _preload_xtts)
+        # SDXL preloader is defined in pipeline_setup; imported lazily to avoid torch at import time
+        try:
+            from pipeline_setup import _preload_sdxl
+            loop.run_in_executor(None, _preload_sdxl)
+        except Exception as e:
+            logger.error(f"[Startup] SDXL preload dispatch failed: {e}")
+
+
+async def _transcribe_local_whisper(audio_bytes: bytes) -> str:
+    """Fallback STT: transcribe with local Whisper model in thread executor."""
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        import tempfile, os as _os
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as f:
+            f.write(audio_bytes)
+            path = f.name
+        try:
+            result = _local_whisper_model.transcribe(path, fp16=True)
+            return result["text"].strip()
+        finally:
+            _os.remove(path)
+
+    return await loop.run_in_executor(None, _run)
+
 
 def estimate_token_count(text: str) -> int:
     """Estimates the number of tokens in a string using tiktoken if available, else fallback."""
@@ -998,7 +1118,7 @@ class DreamMemory:
         """Synchronously embed and store a document in Redis."""
         if not self.redis:
             return
-        embedding = generate_embedding_sync(text)
+        embedding = generate_embedding_sync(text, task_type="RETRIEVAL_DOCUMENT")
         if not embedding:
             return
         doc_id = f"{self.prefix}{self._doc_counter}"
@@ -1113,7 +1233,7 @@ class DreamMemory:
         NEMESIS is surfaced by proximity, not semantic similarity.
         NARRATIVE forces lore continuity regardless of topical similarity.
         """
-        query_emb = generate_embedding_sync(query)
+        query_emb = generate_embedding_sync(query, task_type="RETRIEVAL_QUERY")
         if not query_emb:
             return "No previous memories."
 
@@ -2339,9 +2459,18 @@ async def dream_stream(websocket: WebSocket):
                                 transcript = transcription.text.strip()
                             print(f'User said: {transcript}')
                             logger.info(f"Whisper Transcript: {transcript}")
-                        except Exception as e:
-                            logger.error(f"STT Error: {e}")
-                            transcript = ""
+                        except Exception as groq_err:
+                            logger.warning(f"[STT] Groq failed ({groq_err}), trying local Whisper...")
+                            if _local_whisper_model is not None:
+                                try:
+                                    transcript = await _transcribe_local_whisper(bytes(audio_buffer))
+                                    logger.info(f"[STT] Local Whisper fallback: {transcript}")
+                                except Exception as local_err:
+                                    logger.error(f"[STT] Local Whisper also failed: {local_err}")
+                                    transcript = ""
+                            else:
+                                logger.warning("[STT] No local model available, using mock.")
+                                transcript = "A towering cyberpunk city under a crimson sky."
                         finally:
                             os.remove(temp_audio_path)
                     else:
