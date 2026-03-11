@@ -45,14 +45,12 @@ graph TD
         ElevenLabs["🎙️ ElevenLabs\nRachel premium TTS voice\nauto-disabled on quota"]:::ext
     end
 
-    User -->|"WSS 60fps input"| CDN
-    User -->|"HTTPS voice/text/events"| CDN
+    User -->|"All traffic HTTPS/WSS\n(single domain)"| CDN
 
-    CDN -->|"/ws → :8081 WebSocket"| Rust
-    CDN -->|"REST /spawn /save /api/command..."| Rust
-    CDN -->|"/api/v1/* dream-stream WS"| Director
-    CDN -->|"/api/intelligence/* upload"| Director
-    CDN -->|"/assets/audio/* /assets/generated/*"| Director
+    CDN -->|"/ws WebSocket upgrade → :8081\n60fps player_input frames"| Rust
+    CDN -->|"REST → :8080\n/spawn /save /load /reset /api/command..."| Rust
+    CDN -->|"/api/v1/dream-stream WSS → :8000\nvoice · text · events"| Director
+    CDN -->|"HTTP → :8000\n/api/intelligence/upload · /assets/audio/*"| Director
     CDN -->|"/* default SPA"| S3_FE
 
     Director <-->|"Spawn / modify / state HTTP"| Rust

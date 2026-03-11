@@ -41,6 +41,8 @@ services:
       - DEMO_MODE=${DEMO_MODE:-false}
       - OPENSEARCH_ENDPOINT=${OPENSEARCH_ENDPOINT:-}
       - AWS_REGION=${AWS_REGION:-us-east-1}
+      - S3_BUCKET=${S3_BUCKET:-}
+      - S3_LORE_BUCKET=${S3_LORE_BUCKET:-}
     depends_on:
       - redis-memory
       - rust-engine

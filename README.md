@@ -50,9 +50,11 @@ graph TD
         EL["🎙️ ElevenLabs\nTTS premium"]:::ext
     end
 
-    Browser -->|"WS 60fps player_input"| Rust
-    Browser <-->|"WS voice/text/events"| Director
-    Director <-->|"spawn/modify/state HTTP"| Rust
+    Browser -->|"WS :8081 60fps player_input"| Rust
+    Browser -->|"HTTP :8080 save/load/reset/pause"| Rust
+    Browser <-->|"WS :8000 voice/text/events"| Director
+    Browser -->|"HTTP :8000 intel upload / TTS audio"| Director
+    Director <-->|"HTTP spawn/modify/state"| Rust
     Director <-->|"session vectors"| Redis
     Director <-->|"session vectors (AWS)"| ElastiCache
     Director <-->|"kNN RAG queries"| OpenSearch
@@ -82,10 +84,10 @@ graph TD
   ┌─────────────────────────────────────────────────────────────────────────┐
   │                        Player Browser                                   │
   │          React · Three.js · 27 GLB models · HUD · Radar                │
-  └──────────────────┬────────────────────────────┬───────────────────────┘
-         WS 60fps input (player_input)    WS voice/text/events
-                     │                            │
-                     ▼                            ▼
+  └────┬────────────────────────────────┬───────────────┬──────────────────┘
+       │ WS :8081 60fps player_input    │ HTTP :8080     │ WS/HTTP :8000
+       │ ← render_frame broadcast       │ save/load/reset│ voice·text·intel upload
+       ▼                                ▼               ▼
      ┌───────────────────────┐      ┌─────────────────────────────────┐
      │     Rust Engine       │◄─────│     Python AI Director          │
      │     (Bevy ECS)        │      │     (FastAPI)                   │
