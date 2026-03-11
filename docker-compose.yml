@@ -23,9 +23,12 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./apps/python-director:/app
+      - /app/venv
       - ./apps/python-director/data:/app/data
       - audio_assets:/app/audio
       - generated_assets:/app/generated
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     environment:
       - RUST_ENGINE_URL=http://rust-engine:8080
       - REDIS_URL=redis://redis-memory:6379

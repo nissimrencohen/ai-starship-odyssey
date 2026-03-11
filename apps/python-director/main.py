@@ -1876,7 +1876,7 @@ def analyze_and_embed_player_profile(dream_memory: DreamMemory) -> str:
 # ── Texture Registry Helper ──────────────────────────────────────────────────
 
 def get_texture_registry_path():
-    cache_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data", ".cache")
+    cache_dir = os.path.join(backend_data_dir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, "texture_registry.json")
 
@@ -1913,11 +1913,10 @@ async def api_generate_texture(req: TextureRequest):
         cached_url = registry[registry_key]
         return {"url": cached_url, "local_path": "n/a (cached)"}
 
-    # Save the generated image to a temporary file in the public/assets/generated directory
-    output_dir = os.path.join(os.path.dirname(__file__), "..", "web-client", "public", "assets", "generated")
+    os.makedirs(GENERATED_DIR, exist_ok=True)
     timestamp = int(time.time())
     file_name = f"tex_{timestamp}.png"
-    output_path = os.path.join(output_dir, file_name)
+    output_path = os.path.join(GENERATED_DIR, file_name)
     
     # NEW: Call refactored async HF generator
     from pipeline_setup import generate_texture
@@ -2436,15 +2435,6 @@ async def dream_stream(websocket: WebSocket):
                             temp_audio.write(audio_buffer)
                             temp_audio_path = temp_audio.name
                             
-                        # Debug: Save the last voice clip to root to verify bytes
-                        debug_path = os.path.join(os.path.dirname(__file__), "..", "..", "debug_last_voice.webm")
-                        try:
-                            with open(debug_path, "wb") as dbg_file:
-                                dbg_file.write(audio_buffer)
-                            logger.info(f"Saved debug audio blob to {debug_path}")
-                        except Exception as e:
-                            logger.error(f"Failed to save debug audio: {e}")
-                            
                         audio_len = len(audio_buffer)
                         if audio_len < 10000:
                             logger.warning(f"Audio payload is suspiciously small: {audio_len} bytes. Might be empty/silence.")
@@ -2500,6 +2490,9 @@ async def dream_stream(websocket: WebSocket):
                             should_process_pipeline = True
                             
                             # ---------- TEXTURE KEYWORD INTERCEPTOR ----------
+                            # Send the clean user transcript to the UI before any LLM hints
+                            await websocket.send_json({"type": "transcript", "content": transcript})
+
                             texture_keywords = [
                                 "generate texture", "create texture", "make a texture",
                                 "תייצרי טקסטורה", "טקסטורה של", "תעשי טקסטורה"
@@ -2507,10 +2500,9 @@ async def dream_stream(websocket: WebSocket):
                             for kw in texture_keywords:
                                 if kw in transcript.lower():
                                     logger.info(f"Texture Generation Triggered (Interceptor): {transcript}")
+                                    # Append hint only to the LLM input — never sent to the client
                                     transcript += "\n\nCRITICAL INSTRUCTION: The user explicitly requested a texture. You MUST output a descriptive prompt in the `generate_texture_prompt` JSON field. Do not just change colors."
                                     break
-                            
-                            await websocket.send_json({"type": "transcript", "content": transcript})
                     else:
                         logger.warning("Empty transcript or STT failure. Skipping LLM generation.")
                 
@@ -2871,11 +2863,10 @@ async def dream_stream(websocket: WebSocket):
                                     
                                     world_state_data["visual_config"]["custom_textures"][target_planet] = full_url
                                 else:
-                                    output_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "generated")
-                                    os.makedirs(output_dir, exist_ok=True)
+                                    os.makedirs(GENERATED_DIR, exist_ok=True)
                                     timestamp = int(time.time())
                                     file_name = f"tex_{timestamp}.png"
-                                    output_path = os.path.join(output_dir, file_name)
+                                    output_path = os.path.join(GENERATED_DIR, file_name)
                                     
                                     from pipeline_setup import generate_texture
                                     try:
@@ -3009,11 +3000,10 @@ async def dream_stream(websocket: WebSocket):
                                     custom_tex_url = None
                                     if tex_prompt:
                                         logger.info(f"Generating volumetric ring textures for {target_id}...")
-                                        output_dir = os.path.join(app_dir, "..", "web-client", "public", "assets", "generated")
-                                        os.makedirs(output_dir, exist_ok=True)
+                                        os.makedirs(GENERATED_DIR, exist_ok=True)
                                         timestamp = int(time.time())
                                         file_name = f"tex_ring_{timestamp}.png"
-                                        output_path = os.path.join(output_dir, file_name)
+                                        output_path = os.path.join(GENERATED_DIR, file_name)
                                         try:
                                             from pipeline_setup import generate_texture
                                             await generate_texture(tex_prompt, output_path)

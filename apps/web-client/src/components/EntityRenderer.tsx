@@ -181,6 +181,9 @@ const InstancedAsteroids = React.memo(
 
 const ASSET_BASE_URL = '/assets/';
 const MODEL_BASE = ASSET_BASE_URL + 'models/';
+// AI-generated textures are served by the Python director. Set VITE_DIRECTOR_URL in .env
+// for production (e.g. https://api.your-domain.com). Falls back to localhost for local dev.
+const DIRECTOR_BASE_URL = import.meta.env.VITE_DIRECTOR_URL || 'http://localhost:8000';
 
 // Client-side distance culling — cull dynamic entities beyond this radius from player
 const CULL_DISTANCE_SQ = 15000 * 15000;
@@ -731,9 +734,9 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                             let sunFallback;
 
                             if (specificCustomUrl) {
-                                const finalTextureUrl = specificCustomUrl.includes('/assets/')
-                                    ? specificCustomUrl.substring(specificCustomUrl.indexOf('/assets/'))
-                                    : specificCustomUrl;
+                                const finalTextureUrl = specificCustomUrl.startsWith('http')
+                                    ? specificCustomUrl
+                                    : `${DIRECTOR_BASE_URL}${specificCustomUrl}`;
 
                                 sunFallback = (
                                     <TextureErrorBoundary fallback={<PlanetMesh name="Sun" radius={sunScale} fallbackColor="#ffd700" isSun />}>
@@ -779,9 +782,9 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
                             let pFallback;
                             if (specificCustomUrl) {
                                 // Ensure the URL is absolute to the backend if it's a relative path
-                                const finalTextureUrl = specificCustomUrl.includes('/assets/')
-                                    ? specificCustomUrl.substring(specificCustomUrl.indexOf('/assets/'))
-                                    : specificCustomUrl;
+                                const finalTextureUrl = specificCustomUrl.startsWith('http')
+                                    ? specificCustomUrl
+                                    : `${DIRECTOR_BASE_URL}${specificCustomUrl}`;
 
                                 pFallback = (
                                     <TextureErrorBoundary fallback={hasTexture ? <PlanetMesh name={ent.name} radius={pScale} fallbackColor={getPlanetColor(ent.name)} isSun={isPlanetActuallySun} /> : <ProceduralPlanet radius={pScale} entityId={ent.id} />}>
@@ -831,9 +834,9 @@ export const EntityRenderer: React.FC<EntityRendererProps> = ({
 
                                         let moonFallback;
                                         if (moonCustomUrl) {
-                                            const finalMoonUrl = moonCustomUrl.includes('/assets/')
-                                                ? moonCustomUrl.substring(moonCustomUrl.indexOf('/assets/'))
-                                                : moonCustomUrl;
+                                            const finalMoonUrl = moonCustomUrl.startsWith('http')
+                                                ? moonCustomUrl
+                                                : `${DIRECTOR_BASE_URL}${moonCustomUrl}`;
 
                                             moonFallback = (
                                                 <TextureErrorBoundary fallback={hasMoonTexture ? <PlanetMesh name={moon.name} radius={moonR} fallbackColor={moon.custom_color || '#a8a8a8'} /> : <ProceduralPlanet radius={moonR} entityId={moon.id} />}>
