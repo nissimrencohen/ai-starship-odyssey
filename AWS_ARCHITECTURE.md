@@ -8,51 +8,66 @@ This document describes the full AWS production deployment. The local Docker Com
 
 ```mermaid
 graph TD
-    classDef client fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#fff
-    classDef react fill:#082f49,stroke:#0284c7,stroke-width:2px,color:#fff
-    classDef python fill:#14532d,stroke:#22c55e,stroke-width:2px,color:#fff
-    classDef rust fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fff
-    classDef aws fill:#451a03,stroke:#eab308,stroke-width:2px,color:#fff
-    classDef db fill:#831843,stroke:#f43f5e,stroke-width:2px,color:#fff
+    classDef client  fill:#0f172a,stroke:#38bdf8,stroke-width:3px,color:#e0f2fe
+    classDef cdn     fill:#082f49,stroke:#0284c7,stroke-width:2px,color:#bae6fd
+    classDef python  fill:#14532d,stroke:#22c55e,stroke-width:2px,color:#bbf7d0
+    classDef rust    fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fed7aa
+    classDef s3      fill:#451a03,stroke:#eab308,stroke-width:2px,color:#fef08a
+    classDef db      fill:#3b0764,stroke:#a855f7,stroke-width:2px,color:#e9d5ff
+    classDef bedrock fill:#1e3a5f,stroke:#60a5fa,stroke-width:2px,color:#bfdbfe
+    classDef ext     fill:#1c1917,stroke:#a8a29e,stroke-width:2px,color:#d6d3d1
 
-    User((Player)):::client
+    User((🧑 Player\nBrowser)):::client
 
-    subgraph Edge [AWS Global Edge]
-        CDN["CloudFront\nd3cuox6dfl2gvk.cloudfront.net\nHTTPS termination + path routing"]:::react
-        S3_FE[("S3: React Build\nstarship-frontend-*")]:::aws
+    subgraph Edge ["☁️  AWS Global Edge"]
+        CDN["🌐 CloudFront\nHTTPS termination\nPath-based routing\n3 origins"]:::cdn
+        S3_FE[("📦 S3 Frontend\nstarship-frontend-*\nReact + GLB assets")]:::s3
     end
 
-    subgraph Region [AWS us-east-1 — VPC]
-        Rust["EC2 c7a.xlarge\nRust Engine\n23.22.74.240\nDocker + Nginx"]:::rust
-        Director["EC2 t3.medium\nPython Director\n18.232.168.75\nDocker + Nginx"]:::python
-        Redis[("ElastiCache Redis\nSession Vector Memory")]:::db
-        OpenSearch[("OpenSearch\ngame-lore index\nkNN RAG queries")]:::db
-        S3_Lore[("S3: Lore Docs\nstarship-lore-docs-*")]:::aws
-        S3_Saves[("S3: Game Saves\nworld_snap.json")]:::aws
-        Bedrock["AWS Bedrock\nTitan Embed v2 (1024d)\nClaude 3 Sonnet"]:::aws
+    subgraph Region ["🏢  AWS us-east-1 — VPC"]
+        subgraph Compute ["EC2 Instances"]
+            Rust["⚙️ Rust Engine\nc7a.xlarge · 4vCPU · 8GB\nBevy ECS · Warp HTTP\n:8080 REST · :8081 WS\n60fps physics broadcast"]:::rust
+            Director["🧠 Python Director\nt3.medium · 2vCPU · 4GB\nFastAPI · LLM Cascade\nTTS · STT · SDXL · RAG\n:8000 WebSocket + REST"]:::python
+        end
+        subgraph Storage ["Managed Data Services"]
+            Redis[("🔴 ElastiCache Redis\nSession vector memory\nKill events · sector state\n(key-value, no RediSearch)")]:::db
+            OpenSearch[("🔍 OpenSearch\ngame-lore index\nkNN 1024d vectors\nRAG similarity search")]:::db
+            S3_Lore[("📄 S3 Lore Docs\nstarship-lore-docs-*\nRaw uploaded PDFs/TXT/MD")]:::s3
+            S3_Saves[("💾 S3 Game Saves\nworld_snap.json\nPlayer stats + entities")]:::s3
+        end
+        Bedrock["🤖 AWS Bedrock\nTitan Embed v2 · 1024d\nChunk → vector embedding"]:::bedrock
     end
 
-    subgraph External [External AI APIs]
-        Gemini["Google Gemini\nLLM + Embeddings (local)"]:::aws
-        Groq["Groq\nWhisper STT + Llama"]:::aws
-        HF["HuggingFace\nSDXL Textures"]:::aws
+    subgraph External ["🌍  External AI APIs"]
+        Gemini["✨ Google Gemini\ngemini-2.5-flash (primary LLM)\ngemini-embedding-001 (local)"]:::ext
+        Groq["⚡ Groq\nWhisper STT · Llama 3.3 70B\nLLM tier-2 fallback"]:::ext
+        HF["🎨 HuggingFace\nSDXL texture generation\nAI-generated planet surfaces"]:::ext
+        ElevenLabs["🎙️ ElevenLabs\nRachel premium TTS voice\nauto-disabled on quota"]:::ext
     end
 
-    User -->|"HTTPS / WSS"| CDN
-    CDN -->|"/* static"| S3_FE
-    CDN -->|"/ws → :8081"| Rust
-    CDN -->|"REST paths → :8080"| Rust
-    CDN -->|"/api/v1/* /api/intelligence/* /assets/*"| Director
+    User -->|"WSS 60fps input"| CDN
+    User -->|"HTTPS voice/text/events"| CDN
 
-    Director <-->|"World state HTTP"| Rust
-    Director <-->|"Session vectors"| Redis
-    Director <-->|"RAG kNN queries"| OpenSearch
-    Director -->|"Lore file upload"| S3_Lore
-    Director -->|"Game saves"| S3_Saves
-    Director <-->|"Titan embeddings"| Bedrock
-    Director <-->|"LLM primary"| Gemini
-    Director <-->|"STT + LLM fallback"| Groq
-    Director <-->|"Texture gen"| HF
+    CDN -->|"/ws → :8081 WebSocket"| Rust
+    CDN -->|"REST /spawn /save /api/command..."| Rust
+    CDN -->|"/api/v1/* dream-stream WS"| Director
+    CDN -->|"/api/intelligence/* upload"| Director
+    CDN -->|"/assets/audio/* /assets/generated/*"| Director
+    CDN -->|"/* default SPA"| S3_FE
+
+    Director <-->|"Spawn / modify / state HTTP"| Rust
+    Director <-->|"Session vectors\nkill events · sector memory"| Redis
+    Director <-->|"kNN RAG queries\nlore similarity search"| OpenSearch
+    Director -->|"Intel Upload\nraw file storage"| S3_Lore
+    S3_Lore -.->|"chunk source\n(indexed via Director)"| OpenSearch
+    Director -->|"Save / Load\nworld_snap.json"| S3_Saves
+    Director <-->|"Titan embeddings\nper lore chunk"| Bedrock
+    Bedrock -->|"1024d vectors"| OpenSearch
+
+    Director <-->|"Primary LLM\nworld_state JSON"| Gemini
+    Director <-->|"STT transcription\nLLM tier-2"| Groq
+    Director <-->|"Texture prompt → PNG"| HF
+    Director <-->|"TTS audio stream"| ElevenLabs
 ```
 
 ---

@@ -16,6 +16,56 @@ Three independent services communicate over WebSocket and HTTP, all orchestrated
 
 ## 🛠️ System Architecture
 
+### System Diagram
+
+```mermaid
+graph TD
+    classDef browser fill:#0f172a,stroke:#38bdf8,stroke-width:3px,color:#e0f2fe
+    classDef rust    fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fed7aa
+    classDef python  fill:#14532d,stroke:#22c55e,stroke-width:2px,color:#bbf7d0
+    classDef redis   fill:#3b0764,stroke:#a855f7,stroke-width:2px,color:#e9d5ff
+    classDef aws     fill:#1e3a5f,stroke:#60a5fa,stroke-width:2px,color:#bfdbfe
+    classDef ext     fill:#1c1917,stroke:#a8a29e,stroke-width:2px,color:#d6d3d1
+    classDef s3      fill:#451a03,stroke:#eab308,stroke-width:2px,color:#fef08a
+
+    Browser["🧑 Player Browser\nReact · Three.js\n27 GLB models · HUD · Radar\nPointer Lock 3D flight"]:::browser
+
+    subgraph Local ["Local / Docker Compose"]
+        Rust["⚙️ Rust Engine\n(Bevy ECS + Warp)\n:8080 REST · :8081 WS\n60fps physics · Collision · AI factions\nSave · Load · Reset · Spectator"]:::rust
+        Director["🧠 Python AI Director\n(FastAPI)\n:8000 WebSocket + REST\nLLM Cascade · TTS · STT · SDXL\n3-layer RAG · Intel Upload"]:::python
+        Redis[("🔴 Redis Stack\nSession memory\nKB index · lore store")]:::redis
+    end
+
+    subgraph AWS ["AWS Production (USE_AWS_RAG=true)"]
+        ElastiCache[("🔴 ElastiCache\nSession memory\nkey-value only")]:::redis
+        OpenSearch[("🔍 OpenSearch\ngame-lore kNN index\n1024d vectors")]:::aws
+        S3Lore[("📄 S3 Lore Docs\nRaw uploaded files\nPDF · TXT · MD")]:::s3
+        Bedrock["🤖 Bedrock\nTitan Embed v2\n1024d chunks"]:::aws
+    end
+
+    subgraph Ext ["External AI APIs"]
+        Gemini["✨ Gemini\nLLM primary\n+ embeddings (768d local)"]:::ext
+        Groq["⚡ Groq\nWhisper STT\n+ Llama fallback"]:::ext
+        HF["🎨 HuggingFace\nSDXL textures"]:::ext
+        EL["🎙️ ElevenLabs\nTTS premium"]:::ext
+    end
+
+    Browser -->|"WS 60fps player_input"| Rust
+    Browser <-->|"WS voice/text/events"| Director
+    Director <-->|"spawn/modify/state HTTP"| Rust
+    Director <-->|"session vectors"| Redis
+    Director <-->|"session vectors (AWS)"| ElastiCache
+    Director <-->|"kNN RAG queries"| OpenSearch
+    Director -->|"Intel Upload raw file"| S3Lore
+    S3Lore -.->|"chunk → embed → index"| OpenSearch
+    Director <-->|"Titan embeddings"| Bedrock
+    Bedrock --> OpenSearch
+    Director <-->|"LLM / embeddings"| Gemini
+    Director <-->|"STT / LLM fallback"| Groq
+    Director <-->|"texture gen"| HF
+    Director <-->|"TTS audio"| EL
+```
+
 ### Component Breakdown
 
 | Component | Port | Responsibility |
@@ -29,27 +79,44 @@ Three independent services communicate over WebSocket and HTTP, all orchestrated
 ### Architectural Flow
 
 ```
-                        ┌──────────────────────────────┐
-                        │      Player Browser           │
-                        │  React + Three.js             │
-                        │  27 GLB models · HUD · Radar  │
-                        └────┬─────────────────┬────────┘
-                             │ WS 60fps         │ WS text/voice/events
-                             ▼                  ▼
-              ┌──────────────────┐   ┌──────────────────────────┐
-              │  Rust Engine     │   │  Python AI Director      │
-              │  (Bevy ECS)      │◄──│  (FastAPI)               │
-              │  :8080 HTTP      │   │  :8000 WebSocket         │
-              │  :8081 WS        │   │  LLM·TTS·STT·RAG·SDXL   │
-              └──────────────────┘   └──────────┬───────────────┘
-                                                │
-                                     ┌──────────▼──────────┐
-                                     │ Redis / ElastiCache  │
-                                     │ Vector Memory        │
-                                     └─────────────────────┘
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                        Player Browser                                   │
+  │          React · Three.js · 27 GLB models · HUD · Radar                │
+  └──────────────────┬────────────────────────────┬───────────────────────┘
+         WS 60fps input (player_input)    WS voice/text/events
+                     │                            │
+                     ▼                            ▼
+     ┌───────────────────────┐      ┌─────────────────────────────────┐
+     │     Rust Engine       │◄─────│     Python AI Director          │
+     │     (Bevy ECS)        │      │     (FastAPI)                   │
+     │  :8080 REST           │      │  :8000 WebSocket + REST         │
+     │  :8081 WS broadcast   │      │                                 │
+     │                       │      │  LLM Cascade (10 models)        │
+     │  60fps physics tick   │      │  TTS: Edge / ElevenLabs / XTTS  │
+     │  Collision detection  │      │  STT: Groq Whisper              │
+     │  Enemy AI / factions  │      │  SDXL: AI texture generation    │
+     │  Save / Load / Reset  │      │  RAG: 3-layer memory system     │
+     └───────────────────────┘      │  Intel Upload: PDF/TXT → index  │
+                                    └──────┬──────────────────────────┘
+                                           │
+              ┌────────────────────────────┼──────────────────────────────┐
+              │                            │                              │
+              ▼                            ▼                              ▼
+  ┌────────────────────┐      ┌────────────────────────┐    ┌─────────────────────┐
+  │ Redis (local)      │      │ OpenSearch (AWS)        │    │ S3 Lore Docs (AWS)  │
+  │ ElastiCache (AWS)  │      │ game-lore index         │    │ raw PDF/TXT/MD      │
+  │ Session memory     │      │ kNN 1024d vector search │    │ uploaded intel      │
+  │ kill events        │      │ RAG similarity queries  │    └──────────┬──────────┘
+  └────────────────────┘      └────────────────────────┘               │ chunks
+                                           ▲                            │ embedded
+                                           │              ┌─────────────▼──────────┐
+                                           └──────────────│ AWS Bedrock             │
+                                       vectors            │ Titan Embed v2 · 1024d  │
+                                                          └─────────────────────────┘
 ```
 
-**Local = Docker Compose. Production = AWS (CloudFront → EC2 → ElastiCache + OpenSearch + Bedrock).**
+**Local:** Docker Compose (Redis Stack, Gemini embeddings 768d, mock_lore.json)
+**Production:** AWS — CloudFront → EC2 → ElastiCache + OpenSearch + Bedrock Titan (1024d)
 
 ---
 
@@ -220,13 +287,13 @@ Each script:
 
 ### LLM Cascade (10 models, auto-fallback)
 
-| Tier | Models |
-| :--- | :--- |
-| **1 — Gemini** | `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.5-pro` |
-| **2 — Groq** | `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `llama-4-scout-17b` |
-| **3 — Other** | `qwen3-32b`, `gpt-4o-mini` (slim), `Llama-3.1-8B` (slim), `Mistral-Nemo` (slim) |
+| Tier | Provider | Models | Notes |
+| :--- | :--- | :--- | :--- |
+| **1** | Google Gemini | `gemini-2.5-flash` · `gemini-2.5-flash-lite` · `gemini-2.5-pro` | Primary — fastest response |
+| **2** | Groq | `llama-3.3-70b-versatile` · `llama-3.1-8b-instant` · `llama-4-scout-17b` | Fallback on Gemini quota |
+| **3** | GitHub Models | `qwen3-32b` · `gpt-4o-mini` · `Llama-3.1-8B` · `Mistral-Nemo` | Last resort |
 
-If any tier fails (quota, timeout, API error), the next tier is tried automatically.
+If any model fails (rate limit, timeout, API error), the next is tried automatically within the same request.
 
 ### Memory — Three-Layer RAG
 
