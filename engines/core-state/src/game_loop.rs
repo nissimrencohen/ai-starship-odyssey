@@ -587,9 +587,14 @@ pub async fn run(engine_state: EngineState) {
             }
 
             let mut target_info: Vec<(Entity, f64, f64, f64, String)> = Vec::new();
+            // Also track player position for enemy-bullet → player damage
+            let mut player_pos: Option<(Entity, f64, f64, f64)> = None;
             {
                 let mut target_query = w.query_filtered::<(Entity, &Transform, &EntityType, Option<&DeathAge>), Without<Projectile>>();
                 for (entity, t, ent_type, da) in target_query.iter(&mut w) {
+                    if ent_type.0 == "player" {
+                        player_pos = Some((entity, t.x, t.y, t.z));
+                    }
                     if da.is_none()
                         && (ent_type.0 == "star"
                             || ent_type.0 == "companion"
@@ -607,7 +612,35 @@ pub async fn run(engine_state: EngineState) {
             let mut explosions_to_spawn: Vec<(f64, f64, f64)> = Vec::new(); // Queue for new 3D explosion entities
             let mut to_kill: Vec<Entity> = Vec::new(); // Queue for entity destruction
 
+            let mut enemy_bullet_player_damage: f64 = 0.0;
+            let mut enemy_bullets_to_kill: Vec<Entity> = Vec::new();
+            // Cache player entity ID once so we don't query per-projectile
+            let player_entity_id: Option<Entity> = player_pos.map(|(e, _, _, _)| e);
+
             for (p_entity, px, py, pz, shooter_opt) in projectiles_info {
+                // ── Enemy bullet → Player damage check ──────────────────────────
+                // If the shooter is a non-player entity and the bullet is near the
+                // player, deal damage and destroy the bullet.
+                if let (Some(shooter_ent), Some((_, plx, ply, plz))) = (shooter_opt, player_pos) {
+                    let shooter_is_player = player_entity_id == Some(shooter_ent);
+                    if !shooter_is_player {
+                        let dx = px - plx;
+                        let dy = py - ply;
+                        let dz = pz - plz;
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
+                        let player_hit_radius = 30.0_f64;
+                        if dist_sq < player_hit_radius * player_hit_radius {
+                            let dc = *damage_cooldown_for_loop.lock().unwrap();
+                            if dc <= 0.0 {
+                                enemy_bullet_player_damage += 10.0;
+                                *damage_cooldown_for_loop.lock().unwrap() = 0.5;
+                            }
+                            enemy_bullets_to_kill.push(p_entity);
+                            continue; // don't check this bullet against other targets
+                        }
+                    }
+                }
+
                 for (t_entity, tx, ty, tz, t_type) in &target_info {
                     // Skip self-collision
                     if let Some(sid) = shooter_opt {
@@ -658,6 +691,15 @@ pub async fn run(engine_state: EngineState) {
                         break;
                     }
                 }
+            }
+
+            // Apply enemy bullet damage to player
+            if enemy_bullet_player_damage > 0.0 {
+                let mut h = player_health_for_loop.lock().unwrap();
+                *h = (*h - enemy_bullet_player_damage).max(0.0);
+            }
+            for e in enemy_bullets_to_kill {
+                to_kill.push(e);
             }
 
             if combat_kills > 0 {

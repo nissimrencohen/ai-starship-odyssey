@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import useWebSocket, { ReadyState } from 'react-use-websocket';
-import { Activity, Server, Mic, MicOff, ChevronLeft, Send, Wifi, Bot, Volume2, VolumeX } from 'lucide-react';
+import { Activity, Server, Mic, MicOff, ChevronLeft, Send, Wifi, Bot, Volume2, VolumeX, UploadCloud, CheckCircle2, AlertCircle } from 'lucide-react';
 import { Canvas } from '@react-three/fiber';
 import { GameScene } from './components/GameScene';
 import { HUD } from './components/HUD';
@@ -31,6 +31,11 @@ export default function App() {
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isChatVisible, setIsChatVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(450);
+  const [uplinkStatus, setUplinkStatus] = useState<'idle' | 'ready' | 'uploading' | 'done' | 'error'>('idle');
+  const [uplinkProgress, setUplinkProgress] = useState(0);
+  const [uplinkFilename, setUplinkFilename] = useState('');
+  const [uplinkPendingFile, setUplinkPendingFile] = useState<File | null>(null);
+  const uplinkInputRef = useRef<HTMLInputElement>(null);
   const [isResizing, setIsResizing] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunks = useRef<Blob[]>([]);
@@ -293,6 +298,34 @@ export default function App() {
 
   // Full reset: clears BH overlay + calls engine reset
   const bhAutoResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const DIRECTOR_URL = (import.meta as any).env?.VITE_DIRECTOR_URL || 'http://localhost:8000';
+
+  const handleIntelUpload = useCallback(async (file: File) => {
+    setUplinkStatus('uploading');
+    setUplinkProgress(0);
+    setUplinkPendingFile(null);
+
+    // Animate progress bar (fake progress up to 85%, real completion at 100%)
+    const interval = setInterval(() => {
+      setUplinkProgress(prev => prev < 85 ? prev + Math.random() * 15 : prev);
+    }, 200);
+
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch(`${DIRECTOR_URL}/api/intelligence/upload`, { method: 'POST', body: form });
+      clearInterval(interval);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setUplinkProgress(100);
+      setUplinkStatus('done');
+      setTimeout(() => setUplinkStatus('idle'), 5000);
+    } catch (err) {
+      clearInterval(interval);
+      setUplinkStatus('error');
+      setTimeout(() => setUplinkStatus('idle'), 4000);
+    }
+  }, [DIRECTOR_URL]);
+
   const handleFullReset = useCallback(async () => {
     lastResetTimeRef.current = Date.now();
     if (bhAutoResetTimerRef.current) { clearTimeout(bhAutoResetTimerRef.current); bhAutoResetTimerRef.current = null; }
@@ -800,6 +833,21 @@ export default function App() {
           setWorldState(data.content);
         } else if (data.type === 'texture_ready') {
           setCustomTextureUrl(data.url);
+          // Also inject into worldState.visual_config so planet_mode switches to "texture"
+          if (data.planet) {
+            setWorldState((prev: any) => {
+              if (!prev) return prev;
+              const vc = prev.visual_config || {};
+              return {
+                ...prev,
+                visual_config: {
+                  ...vc,
+                  planet_mode: { ...(vc.planet_mode || {}), [data.planet]: 'texture' },
+                  custom_textures: { ...(vc.custom_textures || {}), [data.planet]: data.url },
+                },
+              };
+            });
+          }
           setDirectorMessage("New AI texture applied.");
           setAiState("idle");
         } else if (data.type === 'proactive_audio') {
@@ -1494,6 +1542,86 @@ export default function App() {
                 />
               </div>
             </div>
+          </div>
+
+          {/* ── Intelligence Uplink Panel ── */}
+          <div className="mt-4 pt-4 border-t border-white/5">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[10px] font-black text-white/50 uppercase tracking-[0.3em]">Intel Uplink</span>
+              {uplinkStatus === 'done' && <CheckCircle2 className="w-3.5 h-3.5 text-green-400" />}
+              {uplinkStatus === 'error' && <AlertCircle className="w-3.5 h-3.5 text-red-400" />}
+            </div>
+
+            <input
+              ref={uplinkInputRef}
+              type="file"
+              accept=".pdf,.txt,.md"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) { setUplinkPendingFile(f); setUplinkFilename(f.name); setUplinkStatus('ready'); }
+                e.target.value = '';
+              }}
+            />
+
+            {(uplinkStatus === 'idle' || uplinkStatus === 'done' || uplinkStatus === 'error') && (
+              <button
+                onClick={() => { setUplinkStatus('idle'); setUplinkPendingFile(null); uplinkInputRef.current?.click(); }}
+                className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-dashed border-white/20 text-white/40 hover:border-purple-500/50 hover:text-purple-400 transition-all text-[10px] font-mono uppercase tracking-wider"
+              >
+                <UploadCloud className="w-3.5 h-3.5" />
+                {uplinkStatus === 'done' ? 'Upload Another File' : 'Select Intelligence File'}
+              </button>
+            )}
+
+            {uplinkStatus === 'ready' && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-purple-500/10 border border-purple-500/20">
+                  <UploadCloud className="w-3 h-3 text-purple-400 shrink-0" />
+                  <span className="text-[9px] font-mono text-purple-300 truncate flex-1">{uplinkFilename}</span>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => { setUplinkStatus('idle'); setUplinkPendingFile(null); setUplinkFilename(''); }}
+                    className="flex-1 px-3 py-1.5 rounded-lg border border-white/10 text-white/30 hover:text-white/60 text-[9px] font-mono uppercase tracking-wider transition-all"
+                  >Cancel</button>
+                  <button
+                    onClick={() => { if (uplinkPendingFile) handleIntelUpload(uplinkPendingFile); }}
+                    className="flex-1 px-3 py-1.5 rounded-lg bg-purple-500/20 border border-purple-500/40 text-purple-300 hover:bg-purple-500/30 text-[9px] font-mono uppercase tracking-wider transition-all"
+                  >Transmit</button>
+                </div>
+              </div>
+            )}
+
+            {uplinkStatus === 'uploading' && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[9px] font-mono text-purple-400 truncate max-w-[70%]">{uplinkFilename}</span>
+                  <span className="text-[9px] font-mono text-white/40">{Math.round(uplinkProgress)}%</span>
+                </div>
+                <div className="w-full h-1 bg-white/10 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-purple-500 rounded-full transition-all duration-200"
+                    style={{ width: `${uplinkProgress}%` }}
+                  />
+                </div>
+                <p className="text-[9px] font-mono text-white/30">Processing intelligence...</p>
+              </div>
+            )}
+
+            {uplinkStatus === 'done' && (
+              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-green-500/10 border border-green-500/20">
+                <CheckCircle2 className="w-3 h-3 text-green-400 shrink-0" />
+                <span className="text-[9px] font-mono text-green-400 truncate">Indexed: {uplinkFilename}</span>
+              </div>
+            )}
+
+            {uplinkStatus === 'error' && (
+              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+                <AlertCircle className="w-3 h-3 text-red-400 shrink-0" />
+                <span className="text-[9px] font-mono text-red-400">Upload failed. Check connection.</span>
+              </div>
+            )}
           </div>
 
           {/* Control Interface inside sidebar */}

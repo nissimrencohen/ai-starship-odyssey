@@ -37,6 +37,10 @@ services:
       - COQUI_TOS_AGREED=1
       - AUDIO_DIR=/app/audio
       - GENERATED_DIR=/app/generated
+      - USE_AWS_RAG=${USE_AWS_RAG:-false}
+      - DEMO_MODE=${DEMO_MODE:-false}
+      - OPENSEARCH_ENDPOINT=${OPENSEARCH_ENDPOINT:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
     depends_on:
       - redis-memory
       - rust-engine

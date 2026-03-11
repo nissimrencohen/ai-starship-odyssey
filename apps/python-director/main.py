@@ -8,10 +8,11 @@ import re
 import tempfile
 import base64
 import threading
+import concurrent.futures
 import httpx
 import piper
 import edge_tts
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -81,6 +82,12 @@ app = FastAPI(title="Voice-to-Dream Director API")
 # Active WebSocket connections
 active_connections: List[WebSocket] = []
 
+# Thread pool for offloading blocking embedding calls (keeps asyncio event loop free)
+_embedding_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="embed")
+
+# Main asyncio event loop — captured at first WebSocket connect for use in background threads
+_main_event_loop = None
+
 # Setup CORS
 app.add_middleware(
     CORSMiddleware,
@@ -103,16 +110,25 @@ AUDIO_DIR     = os.getenv("AUDIO_DIR",     _default_audio)
 GENERATED_DIR = os.getenv("GENERATED_DIR", _default_generated)
 data_dir      = os.getenv("ASSETS_DIR",    _default_assets)
 
+# Feature flags (both default to off — safe for local dev with no AWS)
+USE_AWS_RAG = os.getenv("USE_AWS_RAG", "false").lower() == "true"
+DEMO_MODE   = os.getenv("DEMO_MODE",   "false").lower() == "true"
+
+# Local save/load directory (S3-mirrored in production)
+SAVES_DIR = os.path.join(backend_data_dir, "saves")
+
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(GENERATED_DIR, exist_ok=True)
+os.makedirs(SAVES_DIR, exist_ok=True)
 
-# Cleanup old textures on startup
-for f in os.listdir(GENERATED_DIR):
-    if f.endswith(".png"):
-        try:
-            os.remove(os.path.join(GENERATED_DIR, f))
-        except Exception as _e:
-            logger.debug(f"Could not purge old texture {f}: {_e}")
+# Cleanup old textures on startup (skipped in DEMO_MODE to preserve cached assets)
+if not DEMO_MODE:
+    for f in os.listdir(GENERATED_DIR):
+        if f.endswith(".png"):
+            try:
+                os.remove(os.path.join(GENERATED_DIR, f))
+            except Exception as _e:
+                logger.debug(f"Could not purge old texture {f}: {_e}")
 
 # Reset texture registry JSON
 try:
@@ -362,6 +378,15 @@ class TTSManager:
         - Tier 2 (default):          edge-tts    — Microsoft Azure Neural voices. Returns (url, None).
         - Tier 3 (offline fallback): Piper TTS   — local ONNX, no network needed. Returns (url, None).
         """
+        # Demo mode: bypass quota-heavy tiers, go straight to edge-tts
+        if DEMO_MODE:
+            try:
+                audio_url = await cls.generate_speech_edge(text)
+                if audio_url:
+                    return (audio_url, None)
+            except Exception:
+                pass  # fall through to normal cascade
+
         # Tier 0: LOCAL_GPU — XTTS-v2
         if AI_MODEL_MODE == "LOCAL_GPU" and _local_xtts_model is not None:
             try:
@@ -853,6 +878,8 @@ async def generate_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -
     if not api_key:
         logger.error("[Embedding] GOOGLE_API_KEY not set")
         return None
+    if DEMO_MODE:
+        await asyncio.sleep(1.5)
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -882,6 +909,9 @@ def generate_embedding_sync(text: str, task_type: str = "RETRIEVAL_DOCUMENT") ->
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         return None
+    if DEMO_MODE:
+        import time as _time
+        _time.sleep(1.5)
     try:
         import urllib.request
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={api_key}"
@@ -964,17 +994,24 @@ def initialize_global_knowledge_base():
                 if len(chunk) < 40:
                     continue
 
-                embedding = generate_embedding_sync(chunk, task_type="RETRIEVAL_DOCUMENT")
-                if not embedding:
-                    continue
-
+                # Submit embedding to background thread — never blocks startup
                 doc_id = f"kb:{hashlib.md5(chunk[:200].encode()).hexdigest()}"
-                r.hset(doc_id, mapping={
-                    "text": chunk,
-                    "memory_type": "ENGINE_KB",
-                    "x": 0.0, "y": 0.0, "z": 0.0,
-                    "embedding": _float_list_to_bytes(embedding),
-                })
+
+                def _store_kb_chunk(c=chunk, did=doc_id, redis=r):
+                    embedding = generate_embedding_sync(c, task_type="RETRIEVAL_DOCUMENT")
+                    if not embedding:
+                        return
+                    try:
+                        redis.hset(did, mapping={
+                            "text": c,
+                            "memory_type": "ENGINE_KB",
+                            "x": 0.0, "y": 0.0, "z": 0.0,
+                            "embedding": _float_list_to_bytes(embedding),
+                        })
+                    except Exception:
+                        pass
+
+                _embedding_executor.submit(_store_kb_chunk)
                 total += 1
         except Exception as e:
             logger.error(f"[KB] Failed to process {md_file.name}: {e}")
@@ -1096,15 +1133,17 @@ class DreamMemory:
                 loaded_sectors = persisted_data.get("sector_events", [])
 
                 if loaded_memories:
-                    for m in loaded_memories:
-                        self._store_sync(m["text"], m["memory_type"])
+                    # Load into in-memory store ONLY — skip re-embedding to avoid
+                    # 429 rate limits on startup. The Redis index is session-scoped
+                    # and starts fresh; new memories added this session will be
+                    # embedded and indexed normally.
                     self.memory_store.extend(loaded_memories)
 
                 if loaded_sectors:
                     self.sector_events.extend(loaded_sectors)
 
                 if loaded_memories or loaded_sectors:
-                    logger.info(f"Persistent DreamMemory initialized. Rehydrated {len(self.memory_store)} memories and {len(self.sector_events)} sector events.")
+                    logger.info(f"Persistent DreamMemory initialized. Rehydrated {len(self.memory_store)} memories and {len(self.sector_events)} sector events. (Embeddings skipped on load — session-fresh Redis index)")
                 else:
                     logger.warning("No persistent memory found. Starting with amnesia.")
             else:
@@ -1136,11 +1175,12 @@ class DreamMemory:
 
     def _embed_and_store(self, text: str, memory_type: str, skip_save: bool = False,
                          x: float = 0.0, y: float = 0.0, z: float = 0.0):
-        """Internal: add one entry to both memory_store and Redis."""
+        """Internal: add to memory_store immediately; Redis embedding runs in background thread."""
         self.memory_store.append({"text": text, "memory_type": memory_type})
-        self._store_sync(text, memory_type, x, y, z)
         if not skip_save:
             save_dream_memory(self.memory_store, self.sector_events)
+        # Submit blocking embedding+Redis write to thread pool — never blocks event loop
+        _embedding_executor.submit(self._store_sync, text, memory_type, x, y, z)
 
     def add_text_memory(self, text: str):
         """Add static knowledge-base chunks (engine capabilities, etc.)."""
@@ -1491,6 +1531,19 @@ This forces structured intent and prevents hallucinated spawns.
 - Spaceship Models: [stinger, interceptor, ufo, goliath, stealth, freighter].
 - Zero-Spawn Policy: DO NOT spawn entities unless strictly instructed.
 - If requested to do something outside your limits, reply EXACTLY: "I am unable to perform that specific reconfiguration, Pilot."
+
+### BIG-5 DEMO COMMAND REGISTRY (MANDATORY — Highest Priority Triggers)
+When you detect these exact phrases, execute the corresponding action WITHOUT hesitation:
+
+1. **"Cyberpunk Protocol"** → IMMEDIATELY set `reality_override.ambient_color="#0a0a2e"` and `reality_override.sun_color="#ff00ff"` AND `physics_overrides.gravity_scale=0.16`. The `retrieved_knowledge` block WILL contain a `[STYLE_OVERRIDE: Cyberpunk]` tag — treat it as a hard directive. Reply: "Cyberpunk Protocol online. Neon grid active. Lunar gravity engaged."
+
+2. **"Plasma Cat"** → Immediately populate `generate_texture_prompt` with a vivid plasma cat texture description AND set `target_planet_id="Sun"`. Reply: "Accessing generative subroutines. Plasma Cat aesthetics incoming."
+
+3. **"Combat Simulation: Ambush"** → Spawn 8–10 hostile interceptors scattered around the pilot (faction="pirate", behavior="standard_combat", fire_rate_multiplier=1.5). Set `behavior_policy="attack"` (REQUIRED — enables enemy fire). Set `radar_filters.enemy=false` (radar jamming). Reply with urgency and tactical framing.
+
+4. **"new intelligence"** or **"ingest"** or **"expand sector maps"** → Reply that you are processing the new data files. Reference the newly indexed intelligence in your reply. Do NOT spawn anything.
+
+5. **"localized singularity"** → Spawn exactly 1 anomaly of type `black_hole` at the pilot's current position with `mass=50000` and `radius=300`. Set `physics_overrides.gravity_scale=5.0`. Reply dramatically: "Warning: Singularity formation detected. Spaghettification imminent. It was an honor serving with you, Captain."
 
 ### MISSION OBJECTIVES (FOR RACHEL'S AWARENESS)
 - Level 1: Initial contact, basic combat.
@@ -1873,6 +1926,197 @@ def analyze_and_embed_player_profile(dream_memory: DreamMemory) -> str:
     return f"Combat log: {total_kills} total kills via {dominant_cause}."
 
 
+# ── Actionable RAG Router ─────────────────────────────────────────────────────
+
+async def _process_actionable_tags(
+    world_state_data: dict,
+    retrieved_knowledge: str,
+    websocket,
+) -> dict:
+    """
+    Scans RAG context for embedded action tags and injects matching actions
+    directly into world_state_data before it is broadcast to React.
+
+    Supported tags (set in mock_lore.json / federation_manual.txt / OpenSearch docs):
+      [STYLE_OVERRIDE: <style>]   — changes ambient/sun color + triggers texture prompt
+      [SPAWN_EVENT: <type>]       — injects an NPC ship or anomaly
+      [WEAPON_OVERRIDE: count=N, color=#HEX] — reconfigures player weapon
+    """
+    import re
+
+    has_style  = "[STYLE_OVERRIDE:" in retrieved_knowledge
+    has_spawn  = "[SPAWN_EVENT:"    in retrieved_knowledge
+    has_weapon = "[WEAPON_OVERRIDE" in retrieved_knowledge
+
+    if not (has_style or has_spawn or has_weapon):
+        return world_state_data  # fast path — nothing to do
+
+    # ── STYLE_OVERRIDE → reality_override + style_override WS event ──────────
+    if has_style:
+        style_match = re.search(r'\[STYLE_OVERRIDE:\s*(\w+)\]', retrieved_knowledge)
+        if style_match:
+            style = style_match.group(1).lower()
+            STYLE_PRESETS = {
+                "cyberpunk": {
+                    "ambient_color": "#0a0a2e",
+                    "sun_color": "#ff00ff",
+                    "texture_prompt": "A massive synthwave digital sun core, neon purple and cyan plasma veins, glowing grid patterns, futuristic star surface",
+                    "gravity_scale": 0.16,
+                },
+                "lava": {
+                    "ambient_color": "#1a0500",
+                    "sun_color": "#ff4400",
+                    "texture_prompt": "volcanic lava surface, molten rock, glowing orange cracks",
+                },
+                "void": {
+                    "ambient_color": "#000000",
+                    "sun_color": "#000000",
+                    "texture_prompt": "deep void, dark nebula, absolute darkness with faint star dust",
+                    "gravity_scale": 0.0,
+                },
+            }
+            preset = STYLE_PRESETS.get(style)
+            if preset:
+                if not world_state_data.get("reality_override"):
+                    world_state_data["reality_override"] = {}
+                world_state_data["reality_override"]["ambient_color"] = preset["ambient_color"]
+                world_state_data["reality_override"]["sun_color"]     = preset["sun_color"]
+                # Sync gravity to Rust via physics_overrides
+                if preset.get("gravity_scale") is not None:
+                    if not isinstance(world_state_data.get("physics_overrides"), dict):
+                        world_state_data["physics_overrides"] = {}
+                    world_state_data["physics_overrides"]["gravity_scale"] = preset["gravity_scale"]
+                # Send a separate WS event so React can apply a visual filter immediately
+                await websocket.send_json({
+                    "type": "style_override",
+                    "style": style,
+                    "texture_prompt": preset["texture_prompt"],
+                })
+                logger.info(f"[ActionableRouter] STYLE_OVERRIDE applied: {style}")
+
+                # ── Auto-texture: generate Sun texture for this style (non-blocking) ──
+                tex_prompt = preset.get("texture_prompt")
+                if tex_prompt:
+                    target_planet = "Sun"
+                    registry = load_texture_registry()
+                    registry_key = f"{target_planet.lower()}_{tex_prompt.strip().lower()}"
+                    if registry_key in registry:
+                        # Cache hit — inject immediately, no blocking
+                        full_url = registry[registry_key]
+                        logger.info(f"[ActionableRouter] Registry hit for {target_planet}: {full_url}")
+                        if not isinstance(world_state_data.get("visual_config"), dict):
+                            world_state_data["visual_config"] = {}
+                        vc = world_state_data["visual_config"]
+                        if not isinstance(vc.get("planet_mode"), dict):
+                            vc["planet_mode"] = {}
+                        vc["planet_mode"][target_planet] = "texture"
+                        if not isinstance(vc.get("custom_textures"), dict):
+                            vc["custom_textures"] = {}
+                        vc["custom_textures"][target_planet] = full_url
+                    else:
+                        # Cache miss — generate in background, push texture URL via WS when done
+                        async def _bg_generate_style_texture(prompt=tex_prompt, planet=target_planet, rkey=registry_key, ws=websocket):
+                            try:
+                                from pipeline_setup import generate_texture
+                                os.makedirs(GENERATED_DIR, exist_ok=True)
+                                ts = int(time.time())
+                                fname = f"tex_{ts}.png"
+                                out = os.path.join(GENERATED_DIR, fname)
+                                await generate_texture(prompt, out)
+                                url = f"/assets/generated/{fname}"
+                                reg = load_texture_registry()
+                                reg[rkey] = url
+                                save_texture_registry(reg)
+                                logger.info(f"[ActionableRouter] Background texture ready for {planet}: {url}")
+                                # Push texture update so React applies it without a full world_state
+                                await ws.send_json({
+                                    "type": "texture_ready",
+                                    "planet": planet,
+                                    "url": url,
+                                })
+                            except Exception as _bg_err:
+                                logger.error(f"[ActionableRouter] Background texture failed: {_bg_err}")
+                        asyncio.create_task(_bg_generate_style_texture())
+                        logger.info(f"[ActionableRouter] Texture generation for {target_planet} dispatched to background")
+
+    # ── SPAWN_EVENT → inject into npc_ships ──────────────────────────────────
+    if has_spawn:
+        spawn_match = re.search(r'\[SPAWN_EVENT:\s*(\w+)\]', retrieved_knowledge)
+        if spawn_match:
+            spawn_type = spawn_match.group(1).lower()
+            if spawn_type == "mothership":
+                ships = world_state_data.get("npc_ships") or []
+                ships.append({
+                    "count": 1,
+                    "faction": "alien",
+                    "color": "#8b00ff",
+                    "behavior": "attack",
+                    "fire_rate_multiplier": 2.0,
+                    "spawn_distance": 3000,
+                })
+                world_state_data["npc_ships"] = ships
+                logger.info("[ActionableRouter] SPAWN_EVENT: mothership injected")
+
+    # ── WEAPON_OVERRIDE → modify_weapon ──────────────────────────────────────
+    if has_weapon:
+        weapon_match = re.search(
+            r'\[WEAPON_OVERRIDE:\s*count=(\d+),\s*color=(#[\w]+)\]', retrieved_knowledge
+        )
+        if weapon_match:
+            world_state_data["modify_weapon"] = {
+                "projectile_count": int(weapon_match.group(1)),
+                "projectile_color": weapon_match.group(2),
+            }
+            logger.info("[ActionableRouter] WEAPON_OVERRIDE applied")
+
+    # ── SPAWN_ANOMALY: black_hole → singularity event ─────────────────────────
+    has_singularity = "[SPAWN_ANOMALY: black_hole]" in retrieved_knowledge
+    if has_singularity:
+        existing = world_state_data.get("spawn_anomalies") or []
+        if not existing:  # only inject if LLM didn't already spawn one
+            world_state_data["spawn_anomalies"] = [{
+                "anomaly_type": "black_hole",
+                "mass": 50000.0,
+                "radius": 300.0,
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+            }]
+            if not isinstance(world_state_data.get("physics_overrides"), dict):
+                world_state_data["physics_overrides"] = {}
+            world_state_data["physics_overrides"]["gravity_scale"] = 5.0
+            logger.info("[ActionableRouter] SPAWN_ANOMALY: singularity injected with max gravity")
+
+    return world_state_data
+
+
+# ── Local RAG Fallback (mock_lore.json) ──────────────────────────────────────
+
+def _query_local_rag(query: str) -> str:
+    """
+    Local RAG fallback: loads data/mock_lore.json, returns top keyword-matched chunk.
+    No embeddings needed — pure word-overlap scoring for local dev and demo.
+    """
+    lore_path = os.path.join(backend_data_dir, "mock_lore.json")
+    if not os.path.exists(lore_path):
+        return ""
+    try:
+        with open(lore_path, "r", encoding="utf-8") as f:
+            lore = json.load(f)
+        query_words = set(query.lower().split())
+        scored = []
+        for entry in lore:
+            words = set(entry["text"].lower().split())
+            score = len(query_words & words)
+            scored.append((score, entry["text"]))
+        scored.sort(reverse=True)
+        top = scored[0][1] if scored and scored[0][0] > 0 else ""
+        return f"[LORE INTEL]\n{top}" if top else ""
+    except Exception as e:
+        logger.warning(f"[LocalRAG] Failed to load mock_lore.json: {e}")
+        return ""
+
+
 # ── Texture Registry Helper ──────────────────────────────────────────────────
 
 def get_texture_registry_path():
@@ -1936,6 +2180,221 @@ async def api_generate_texture(req: TextureRequest):
 @app.get("/")
 async def root():
     return {"status": "The Director is alive."}
+
+
+# ── Director Save / Load (Python-side session state) ─────────────────────────
+# Separate from the Rust /save /load which snapshots ECS world state.
+# These endpoints persist the AI director's chat history and player position
+# to local saves/ folder (to be S3-mirrored in production).
+
+class DirectorSaveRequest(BaseModel):
+    slot: str = "default"
+    upload_to_s3: bool = False
+
+
+@app.post("/api/director/save")
+async def director_save(req: DirectorSaveRequest):
+    """Snapshot director session state (chat history, player position) to saves/<slot>.json."""
+    save_path = os.path.join(SAVES_DIR, f"{req.slot}.json")
+    snapshot = {
+        "slot": req.slot,
+        "timestamp": int(time.time()),
+        "player_position": {
+            "x": shared_player_pos.get("x", 0.0),
+            "y": shared_player_pos.get("y", 0.0),
+            "z": shared_player_pos.get("z", 0.0),
+        },
+        "active_sessions": len(active_connections),
+    }
+    try:
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2)
+        logger.info(f"[DirectorSave] State saved to {save_path}")
+        s3_ok = False
+        if req.upload_to_s3:
+            from s3_utils import upload_save
+            s3_ok = upload_save(save_path, req.slot)
+        return {"ok": True, "slot": req.slot, "path": save_path, "s3_uploaded": s3_ok}
+    except Exception as e:
+        logger.error(f"[DirectorSave] Failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/director/load")
+async def director_load(req: DirectorSaveRequest):
+    """Load a previously saved director snapshot from saves/<slot>.json."""
+    save_path = os.path.join(SAVES_DIR, f"{req.slot}.json")
+    if not os.path.exists(save_path):
+        raise HTTPException(status_code=404, detail=f"Save slot '{req.slot}' not found")
+    try:
+        with open(save_path, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+        # Restore shared player position
+        pos = snapshot.get("player_position", {})
+        shared_player_pos["x"] = float(pos.get("x", 0.0))
+        shared_player_pos["y"] = float(pos.get("y", 0.0))
+        shared_player_pos["z"] = float(pos.get("z", 0.0))
+        logger.info(f"[DirectorLoad] State loaded from {save_path}")
+        return {"ok": True, "slot": req.slot, "timestamp": snapshot.get("timestamp")}
+    except Exception as e:
+        logger.error(f"[DirectorLoad] Failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/director/saves")
+async def director_list_saves():
+    """List all available save slots."""
+    try:
+        slots = [
+            f.name[:-5] for f in os.scandir(SAVES_DIR)
+            if f.name.endswith(".json")
+        ]
+        return {"slots": slots}
+    except Exception as e:
+        return {"slots": [], "error": str(e)}
+
+
+# ── Intelligence Ingestion Pipeline ──────────────────────────────────────────
+
+INGESTED_DIR = os.path.join(backend_data_dir, "ingested")
+os.makedirs(INGESTED_DIR, exist_ok=True)
+
+
+def _extract_text_from_file(file_path: str) -> str:
+    """Extract raw text from a file. Uses PyPDF2 for PDFs, plain read otherwise."""
+    if file_path.lower().endswith(".pdf"):
+        try:
+            import PyPDF2
+            text_parts = []
+            with open(file_path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    text_parts.append(page.extract_text() or "")
+            return "\n".join(text_parts)
+        except ImportError:
+            logger.warning("[Intel] PyPDF2 not installed — reading PDF as raw bytes (may be garbled)")
+            with open(file_path, "rb") as f:
+                return f.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            logger.error(f"[Intel] PDF extraction failed: {e}")
+            return ""
+    else:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except Exception as e:
+            logger.error(f"[Intel] Text read failed: {e}")
+            return ""
+
+
+def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list:
+    """Split text into overlapping chunks for indexing."""
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = " ".join(words[i:i + chunk_size])
+        if len(chunk.strip()) > 40:
+            chunks.append(chunk)
+        i += chunk_size - overlap
+    return chunks
+
+
+def _ingest_file_to_lore(file_path: str, filename: str):
+    """Background task: extract, chunk, and append to mock_lore.json."""
+    try:
+        text = _extract_text_from_file(file_path)
+        if not text.strip():
+            logger.warning(f"[Intel] No text extracted from {filename}")
+            return
+
+        chunks = _chunk_text(text)
+        logger.info(f"[Intel] Extracted {len(chunks)} chunks from {filename}")
+
+        lore_path = os.path.join(backend_data_dir, "mock_lore.json")
+        try:
+            with open(lore_path, "r", encoding="utf-8") as f:
+                lore = json.load(f)
+        except Exception:
+            lore = []
+
+        base_id = f"ingested_{int(time.time())}"
+        for i, chunk in enumerate(chunks):
+            lore.append({
+                "id": f"{base_id}_{i}",
+                "text": chunk,
+                "source": filename,
+                "tags": ["ingested", filename.lower().replace(" ", "_")],
+            })
+
+        with open(lore_path, "w", encoding="utf-8") as f:
+            json.dump(lore, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"[Intel] Appended {len(chunks)} chunks from '{filename}' to mock_lore.json")
+
+        # Notify all connected WebSocket clients
+        notification = {
+            "type": "world_state",
+            "content": {
+                "summary": f"New intelligence indexed: {filename}",
+                "environment_theme": "Intelligence Update",
+                "terrain_rules": "Standard Grid",
+                "physics_mode": "static",
+                "conversational_reply": f"New intelligence indexed, Commander. Standing by for queries regarding '{filename}'. {len(chunks)} data segments absorbed.",
+                "behavior_policy": "idle",
+            }
+        }
+        # Schedule WS broadcast on the main event loop (captured at WebSocket connect)
+        if _main_event_loop is not None and _main_event_loop.is_running():
+            asyncio.run_coroutine_threadsafe(_broadcast_intel_notification(notification), _main_event_loop)
+        else:
+            logger.warning("[Intel] No event loop available — WS notification skipped")
+
+    except Exception as e:
+        logger.error(f"[Intel] Ingestion failed for {filename}: {e}")
+
+
+async def _broadcast_intel_notification(payload: dict):
+    """Broadcast an intelligence-indexed notification to all active WebSocket connections."""
+    for ws in list(active_connections):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            pass
+
+
+@app.post("/api/intelligence/upload")
+async def upload_intelligence(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
+    """
+    Receive a PDF or TXT file, save it to data/ingested/, and trigger
+    background ingestion into mock_lore.json so Rachel can answer
+    questions about it within seconds.
+    """
+    allowed_extensions = {".pdf", ".txt", ".md"}
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(allowed_extensions)}")
+
+    save_path = os.path.join(INGESTED_DIR, file.filename)
+    try:
+        contents = await file.read()
+        with open(save_path, "wb") as f:
+            f.write(contents)
+        logger.info(f"[Intel] Saved uploaded file: {save_path} ({len(contents)} bytes)")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File save failed: {e}")
+
+    background_tasks.add_task(_ingest_file_to_lore, save_path, file.filename)
+
+    return {
+        "ok": True,
+        "filename": file.filename,
+        "size_bytes": len(contents),
+        "message": f"File received. Processing '{file.filename}' in background — Rachel will be briefed shortly.",
+    }
 
 async def trigger_game_over_reaction(event_dict: dict):
     """Rachel reacts to the pilot's death with a dramatic, cinematic TTS broadcast."""
@@ -2276,8 +2735,12 @@ async def receive_telemetry(event: TelemetryEvent):
 
 @app.websocket("/api/v1/dream-stream")
 async def dream_stream(websocket: WebSocket):
+    global _main_event_loop
     await websocket.accept()
     active_connections.append(websocket)
+    # Capture the running event loop once so background threads can schedule coroutines
+    if _main_event_loop is None:
+        _main_event_loop = asyncio.get_event_loop()
     action_buffer = deque(maxlen=5)
     logger.info("Client connected to the Void.")
 
@@ -2479,7 +2942,6 @@ async def dream_stream(websocket: WebSocket):
                             transcript = ""
                             should_process_pipeline = False
                             
-                            import random
                             if random.random() < 0.2:
                                 await websocket.send_json({"type": "text", "content": "I lost the signal, Pilot. Please repeat your command."})
                                 await websocket.send_json({"type": "transcript", "content": "*static*"})
@@ -2520,6 +2982,24 @@ async def dream_stream(websocket: WebSocket):
                                 transcript, k=5,
                                 px=current_player_x, py=current_player_y, pz=current_player_z
                             )
+
+                            # ── RAG augmentation (AWS OpenSearch or local mock_lore.json) ──
+                            if USE_AWS_RAG:
+                                try:
+                                    from opensearch_utils import query_opensearch
+                                    aws_chunks = await query_opensearch(transcript)
+                                    if aws_chunks:
+                                        retrieved_knowledge += f"\n\n[AWS LORE]\n{aws_chunks}"
+                                except Exception as _rag_err:
+                                    logger.warning(f"[RAG] OpenSearch query failed, using local fallback: {_rag_err}")
+                                    _local_lore = _query_local_rag(transcript)
+                                    if _local_lore:
+                                        retrieved_knowledge += f"\n\n{_local_lore}"
+                            else:
+                                _local_lore = _query_local_rag(transcript)
+                                if _local_lore:
+                                    retrieved_knowledge += f"\n\n{_local_lore}"
+
                             sector_context = dream_memory.get_nearby_sector_context(current_player_x, current_player_y, current_player_z, k=3)
                             past_world_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-10:]]) if chat_history else "No previous memories."
                             
@@ -2888,6 +3368,11 @@ async def dream_stream(websocket: WebSocket):
                             # NOTE: Text is NOT sent here anymore. It is bundled with the
                             # generation_result payload (after TTS) so that the chat message
                             # and Rachel's voice arrive at the frontend simultaneously.
+
+                            # ── Actionable RAG Router: inject tag-driven overrides ──
+                            world_state_data = await _process_actionable_tags(
+                                world_state_data, retrieved_knowledge, websocket
+                            )
 
                             # Transmit the underlying JSON schema to React (visual changes apply immediately)
                             await websocket.send_json({

@@ -1,8 +1,8 @@
-# AI Starship Odyssey (The Void) 🚀
+# AI Starship Odyssey — The Void 🚀
 
-An AI-driven space exploration engine featuring a Rust core for state management, Python for AI orchestration, and a React frontend.
+An AI-driven space exploration engine with a Rust physics core, Python AI Director, and React/Three.js frontend. The AI Director (Rachel) listens to voice/text commands and dynamically reshapes the universe in real-time: spawning enemies, generating textures, altering gravity, and narrating the action.
 
-> **Status:** Stable, end-to-end operational. Phase 9+ 3D flight controls fully implemented. AI Dynamic Textures, Synchronous Orchestration, Save/Load System, Spectator Mode, and Faction Diplomacy enabled.
+> **Status:** Stable, end-to-end operational. Dockerized. Phase 9+ 3D flight controls, AI Dynamic Textures, Redis RAG Memory, Intel Upload Pipeline, Save/Load/Reset, Spectator Mode, and Faction Diplomacy all enabled.
 
 ---
 
@@ -10,7 +10,7 @@ An AI-driven space exploration engine featuring a Rust core for state management
 
 "The Void" is a real-time, voice-interactive space sandbox where the environment and AI agents respond dynamically to your commands. Experience a fully interactive Solar System managed by a high-performance Rust backend and orchestrated by a sophisticated Python AI Director.
 
-Three independent services communicate over local WebSocket and HTTP to bring this project to life.
+Three independent services communicate over WebSocket and HTTP, all orchestrated via Docker Compose.
 
 ---
 
@@ -18,71 +18,143 @@ Three independent services communicate over local WebSocket and HTTP to bring th
 
 ### Component Breakdown
 
-| Component | Endpoint | Responsibility |
+| Component | Port | Responsibility |
 | :--- | :--- | :--- |
-| **Web Client (Vite)** | `http://localhost:5173` | React/Three.js frontend. 3D Visualization, Tactical HUD, voice input, chat, spectator mode. Sends player 60fps movement. |
-| **Python Director** | `http://localhost:8000` | The "Dream Architect". Manages the LLM cascade (Gemini → Groq → GitHub Models), FAISS memory, Groq Whisper STT, Piper TTS (+ ElevenLabs fallback). |
-| **Rust Engine (State)** | `http://localhost:8080` | High-performance ECS-based simulation engine in Bevy ECS/Warp. Handles API events for spawning, modifying, save/load, reset, physics, factions. |
-| **Rust Engine (WS)** | `ws://localhost:8081` | Real-time physics broadcast at 60 FPS. Streams state frames to React and receives player input/coordinates. |
+| **Web Client (Vite/React)** | `5173` (dev) / `8000/static` (prod) | Three.js 3D scene, HUD, voice input, chat, spectator mode. Sends 60fps player input. |
+| **Python Director** | `8000` | AI Director "Rachel". LLM cascade (Gemini → Groq → GitHub), Redis RAG memory, Whisper STT, Edge/ElevenLabs TTS, HuggingFace texture gen, Intel Upload API. |
+| **Rust Engine (HTTP)** | `8080` | High-performance ECS engine (Bevy ECS + Warp). Spawning, physics, save/load, factions, collision detection, enemy AI. |
+| **Rust Engine (WebSocket)** | `8081` | Real-time 60fps state broadcast to React. Receives player input frames. |
+| **Redis (redis-stack)** | `6379` | In-memory vector DB for RAG: session memory, global knowledge base, sector events. Simulates AWS ElastiCache locally. |
 
-### Architectural Flow Diagram
+### Architectural Flow
 
 ```mermaid
 graph TD
-    classDef default fill:#1e293b,stroke:#0f172a,stroke-width:2px,color:#f8fafc;
-    classDef browser fill:#0284c7,stroke:#0369a1,stroke-width:2px,color:#ffffff;
-    classDef python fill:#16a34a,stroke:#15803d,stroke-width:2px,color:#ffffff;
-    classDef rust fill:#ea580c,stroke:#c2410c,stroke-width:2px,color:#ffffff;
+    classDef browser fill:#0284c7,stroke:#0369a1,color:#fff
+    classDef python fill:#16a34a,stroke:#15803d,color:#fff
+    classDef rust fill:#ea580c,stroke:#c2410c,color:#fff
+    classDef db fill:#831843,stroke:#f43f5e,color:#fff
 
     subgraph Browser ["🌐 Frontend (Browser)"]
-        Client["💻 Web Client (Port 5173)"]:::browser
-        HUD["🎛️ HUD / Tactical Map"]:::browser
-        Three["🌌 Three.js (3D Scene)"]:::browser
+        Client["💻 Web Client (5173/8000)"]:::browser
     end
 
-    subgraph AI ["🧠 AI Logic (Python)"]
-        Director["🎬 Python Director (Port 8000)"]:::python
-        STT["🎤 Groq Whisper (STT)"]:::python
-        LLM["🤖 LLM Cascade (Gemini → Groq → GitHub)"]:::python
-        TTS["🗣️ Piper TTS (+ ElevenLabs fallback)"]:::python
-        Memory["🧠 FAISS (Memory)"]:::python
-        HF["🎨 HuggingFace (Asset Generation)"]:::python
+    subgraph AI ["🧠 AI Director (Python :8000)"]
+        Director["🎬 FastAPI Director"]:::python
+        LLM["🤖 LLM Cascade\n(Gemini → Groq → GitHub)"]:::python
+        STT["🎤 Whisper STT (Groq)"]:::python
+        TTS["🗣️ Edge TTS / ElevenLabs"]:::python
+        HF["🎨 HuggingFace Textures"]:::python
+        Redis[("🧠 Redis Vector RAG")]:::db
     end
 
-    subgraph Engine ["⚙️ Game Engine (Rust)"]
-        StateAPI["🔌 State API (Port 8080)"]:::rust
-        WS["⚡ WebSocket (Port 8081)"]:::rust
-        ECS["🧩 Entity Component System"]:::rust
+    subgraph Engine ["⚙️ Rust Engine"]
+        StateAPI["🔌 HTTP API (:8080)"]:::rust
+        WS["⚡ WebSocket (:8081)"]:::rust
+        ECS["🧩 Bevy ECS"]:::rust
     end
 
-    %% Communications
-    Client <-->|"Audio, Texture Gen & AI Chat (WS)"| Director
-    Client <-->|"Physics & Controls (WS)"| WS
-    Director -->|"World Changes (HTTP POST)"| StateAPI
+    Client <-->|"Voice/Text/WS"| Director
+    Client <-->|"60fps frames + input"| WS
+    Director -->|"World state HTTP POST"| StateAPI
+    Director <-->|"Vector search"| Redis
     StateAPI <--> ECS
     WS <--> ECS
-    ECS -->|"Events / Kills (HTTP)"| Director
-
-    %% Details
-    Director -.-> STT
+    ECS -->|"Telemetry events"| Director
     Director -.-> LLM
+    Director -.-> STT
     Director -.-> TTS
-    Director -.-> Memory
     Director -.-> HF
 ```
 
 ---
 
-## ⚡ Core Features & Data Flow
+## 🚀 Quick Start — Docker (Recommended)
 
-### Voice/Text Command to World Change Flow
+### Prerequisites
+- Docker Desktop (with Compose v2)
+- API keys (see Environment Variables below)
 
-1. The **Web Client** records your voice (or accepts text) and sends it to the **Python Director**.
-2. **Director** transcribes speech via **Groq Whisper**, retrieves context from **FAISS** RAG memory (engine capabilities + game knowledge base).
-3. The **LLM cascade** (Gemini → Groq Llama → GitHub Models) decides whether to spawn enemies, change reality overrides, modify factions, or generate dynamic textures.
-4. If texture generation is required, **Python** calls **Hugging Face** API, saves the files locally, and serves them to React.
-5. The **Rust Engine** receives `POST` instructions, updating its **ECS**.
-6. The result is rendered synchronously back to the **Web Client** via 60fps `render_frame` WebSocket messages.
+### 1. Clone & configure
+
+```bash
+git clone <repo-url>
+cd Project
+cp .env.example .env
+# Fill in your API keys in .env
+```
+
+### 2. Launch all services
+
+```bash
+docker compose up --build
+```
+
+All three services start automatically:
+- **Web Client** is served as static files at `http://localhost:8000/` (via Python Director)
+- **Python Director** API at `http://localhost:8000`
+- **Rust Engine** at `http://localhost:8080` / `ws://localhost:8081`
+- **Redis** at `localhost:6379`
+
+### 3. Stop
+
+```bash
+docker compose down
+```
+
+---
+
+## 🔑 Environment Variables
+
+Copy `.env.example` to `.env` and fill in:
+
+| Variable | Required | Description |
+| :--- | :--- | :--- |
+| `GOOGLE_API_KEY` | ✅ | Gemini LLM (primary) + Gemini Embeddings for RAG |
+| `GROQ_API_KEY` | ✅ | Whisper STT + Groq Llama LLM (tier 2) |
+| `HF_TOKEN` | ✅ | HuggingFace — dynamic AI texture generation (SDXL) |
+| `ELEVENLABS_API_KEY` | ⚡ optional | Premium TTS voice (auto-disabled if quota exceeded) |
+| `GITHUB_API_KEY` | ⚡ optional | GitHub Models LLM fallback (tier 3) |
+| `AI_MODEL_MODE` | ⚡ optional | Set to `LOCAL_GPU` to use local Whisper/XTTS/SDXL on GPU |
+| `DEMO_MODE` | ⚡ optional | Set to `true` to throttle embedding calls (rate limit protection) |
+| `USE_AWS_RAG` | ⚡ optional | Set to `true` to use OpenSearch instead of local Redis for RAG |
+| `OPENSEARCH_ENDPOINT` | ⚡ AWS | OpenSearch endpoint URL (required if `USE_AWS_RAG=true`) |
+| `AWS_REGION` | ⚡ AWS | AWS region (default: `us-east-1`) |
+
+> **Never commit `.env` with real keys.** `.env` is in `.gitignore`.
+
+---
+
+## 🖥️ Local Development (Without Docker)
+
+### Prerequisites
+- Node.js 18+, Rust (stable), Python 3.11+
+- Redis Stack running locally on port 6379
+
+### Launch via PowerShell
+
+```powershell
+./run_all.ps1   # Starts Director + Engine + Vite dev server
+./stop_all.ps1  # Clean shutdown
+```
+
+### Build individually
+
+```bash
+# Frontend (dev)
+cd apps/web-client && npm install && npm run dev
+
+# Frontend (production build)
+cd apps/web-client && npx vite build
+
+# Rust engine
+cd engines/core-state && cargo build --release
+./target/release/core-state
+
+# Python Director
+cd apps/python-director && pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
 
 ---
 
@@ -90,216 +162,167 @@ graph TD
 
 | Key | Action |
 | :--- | :--- |
-| **W / ArrowUp** | Thrust forward (in full 3D direction) |
+| **W / ArrowUp** | Thrust forward (full 3D direction) |
 | **S / ArrowDown** | Brake (60% reverse thrust) |
-| **A / ArrowLeft** | Yaw left |
-| **D / ArrowRight** | Yaw right |
-| **Shift** | Boost / rapid acceleration |
-| **Space** | Fire weapon |
-| **Tab / Shift+Tab** | Cycle targeting (nearest enemy → farthest) |
 | **Mouse (Pointer Lock)** | Look / aim — controls both camera and ship direction |
-| **Scroll Wheel** | Zoom (also works in spectator mode) |
-| **M (Radar)** | Click radar mini-map to open full Tactical Sector Map |
-| **Escape** | Exit spectator mode / close tactical map |
+| **Scroll Wheel** | Zoom |
+| **Space** | Fire weapon |
+| **Tab / Shift+Tab** | Cycle target lock |
+| **M** | Open full Tactical Sector Map |
+| **Escape** | Exit pointer lock / close tactical map |
 
-> **Click the canvas** to enter pointer lock. Click again or press Escape to release.
+> Click the canvas to enter pointer lock. Press Escape to release.
 
 ---
 
 ## 🛡️ HUD Features
 
-- **Health bar** with color-coded status (green → amber → red)
-- **Score & Level counter** with cinematic warp-speed level transitions
-- **Objective display** — current mission directive from AI Director
-- **Mini radar** (bottom-right) — filterable by entity type (Sun, Planets, Moons, Hostiles, Stations, Anomalies, Asteroids, Travelers)
-- **Tactical Sector Map** — full-screen tactical overlay with hover tooltips and click-to-spectate
-- **Spectator Mode** — click any entity type pin → camera follows that entity. Engine auto-pauses physics while spectating.
-- **Low Orbit Alert** — warning banner when within 150 units of a planetary surface
+- **Health bar** — color-coded (green → amber → red)
+- **Score & Level** — cinematic warp-speed level transitions
+- **AI Objective** — current directive from Rachel
+- **Mini radar** — filterable: Sun, Planets, Moons, Hostiles, Stations, Anomalies, Asteroids, Travelers
+- **Tactical Sector Map** — full-screen overlay with hover tooltips and click-to-spectate
+- **Spectator Mode** — camera follows any entity; engine auto-pauses physics
+- **Intel Uplink panel** — drag-and-drop PDF/TXT/MD → Rachel indexes it and answers questions about it
+- **Director Console** (left sidebar, resizable) — voice/text interface, chat history, AI state, voice toggle
 - **Control buttons** (top-right): 💾 Save · 📂 Load · ↺ Reset · ⏭ Skip Level
-- **Director's Console** (left sidebar, resizable) — voice/text interface, chat history, AI state indicator, Rachel voice toggle
-- **Death Screen** — dramatic death/restart screen requiring user interaction (with cause: health / black hole / restart)
+- **Death Screen** — dramatic death/restart screen with cause (health / black hole / restart)
 
 ---
 
-## 🌐 Save / Load / Reset System
+## 🧠 AI Director — Rachel
+
+### LLM Cascade (10 models, auto-fallback)
+
+| Tier | Models |
+| :--- | :--- |
+| **1 — Gemini** | `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.5-pro` |
+| **2 — Groq** | `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `llama-4-scout-17b` |
+| **3 — Other** | `qwen3-32b`, `gpt-4o-mini` (slim), `Llama-3.1-8B` (slim), `Mistral-Nemo` (slim) |
+
+### Memory — Redis Vector RAG
+
+- **Session Memory**: Live sector events, player actions, Rachel's observations — stored per-session in Redis with vector embeddings (Gemini `gemini-embedding-001`, 768d)
+- **Global Knowledge Base**: `engine_capabilities.md` + `game_knowledge_base.md` — Rust API docs and game lore, indexed into `idx:kb` on startup (background thread, non-blocking)
+- **Intel Upload**: Upload any PDF/TXT/MD via the sidebar → chunked, appended to `mock_lore.json`, Rachel notified via WebSocket
+
+### TTS Pipeline
+
+- **Primary**: Edge TTS (Microsoft, free, no quota)
+- **Fallback**: ElevenLabs "Rachel" voice — auto-disabled if quota exceeded
+- **Local GPU**: XTTS-v2 (if `AI_MODEL_MODE=LOCAL_GPU`)
+
+### STT
+
+- Groq Whisper (cloud, fast)
+- Local Whisper (if `AI_MODEL_MODE=LOCAL_GPU`)
+
+---
+
+## 🌐 Save / Load / Reset
 
 | Action | Endpoint | Effect |
 | :--- | :--- | :--- |
-| **Save** | `POST /save` | Writes `world_snap.json` — player health/score/level + restorable entities + WorldState |
-| **Load** | `POST /load` | Reads `world_snap.json`, despawns dynamic entities, re-spawns from save, restores all stats |
-| **Reset** | `POST /api/engine/reset` | Full reset: teleports player to `(8500,500,0)`, clears all enemies, level=1, kills=0 |
-| **Next Level** | `POST /api/engine/next-level` | Force skip to next wave/level |
-| **Pause** | `POST /api/pause` | Freeze all Rust physics (auto-called when tactical map opens or spectator activates) |
+| **Save** | `POST /save` | Writes `world_snap.json` — player stats + all restorable entities + WorldState |
+| **Load** | `POST /load` | Reads `world_snap.json`, despawns dynamic entities, re-spawns from save |
+| **Reset** | `POST /api/engine/reset` | Full reset: player → `(8500,500,0)`, enemies cleared, level=1 |
+| **Skip Level** | `POST /api/engine/next-level` | Force advance to next wave |
+| **Pause** | `POST /api/pause` | Freeze Rust physics (auto-called in spectator/tactical map) |
 | **Resume** | `POST /api/resume` | Unfreeze physics |
 
 ---
 
-## 🔌 Full REST API Reference
+## 🔌 Key REST API Reference (Rust Engine :8080)
 
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `/state` | GET | Get current WorldState snapshot |
-| `/state` | POST | Update WorldState (environment theme, reality overrides, player position) |
-| `/spawn` | POST | Spawn a new entity (enemy, station, anomaly, neutral, etc.) |
-| `/despawn` | POST | Despawn entities by type, color, or IDs |
+| `/state` | GET/POST | Get or update WorldState |
+| `/spawn` | POST | Spawn entity (enemy, station, anomaly, neutral, etc.) |
+| `/despawn` | POST | Despawn entities by type / color / IDs |
 | `/modify` | POST | Modify entity physics, color, behavior, radius |
-| `/clear` | POST | Clear all dynamic entities |
-| `/save` | POST | Save world snapshot to disk |
-| `/load` | POST | Load world snapshot from disk |
-| `/update_player` | POST | Update player ship visuals (color, model, scale) |
-| `/set-planet-radius` | POST | Set collision radius for a named planet/moon/sun |
+| `/save` | POST | Save world snapshot |
+| `/load` | POST | Load world snapshot |
+| `/update_player` | POST | Update player ship visuals |
+| `/set-planet-radius` | POST | Set collision radius for a named celestial body |
 | `/api/command` | POST | AI command bus: `set_weapon`, `despawn`, `kill_event`, etc. |
 | `/api/engine/reset` | POST | Full game reset |
 | `/api/engine/next-level` | POST | Skip to next level |
 | `/api/physics` | POST | Update physics constants (gravity, friction, projectile speed) |
-| `/api/factions` | POST | Update faction affinity pair (−1.0 hostile → +1.0 allied) |
-| `/api/pause` | POST | Pause physics simulation |
-| `/api/resume` | POST | Resume physics simulation |
+| `/api/factions` | POST | Update faction affinity |
+| `/api/pause` | POST | Pause physics |
+| `/api/resume` | POST | Resume physics |
 
 ---
 
-## 🧠 AI Director — LLM Cascade & TTS
+## 🌍 Solar System
 
-The Python Director uses a **3-tier LLM cascade** to maximize reliability:
-
-1. **Tier 1 — Gemini** (Google): `gemini-2.0-flash-exp` → `gemini-1.5-pro` → `gemini-1.5-flash`
-2. **Tier 2 — Groq** (Llama): `llama-3.3-70b-versatile` → `llama-3.1-8b-instant` → `meta-llama/llama-4-scout-17b-16e-instruct`
-3. **Tier 3 — GitHub Models** (Azure inference): Llama 3.1 8B / GPT-4o-mini — slim prompt fallback
-
-**TTS Pipeline:**
-- **Primary**: Piper TTS (local, offline, no API quota)
-- **Fallback**: ElevenLabs ("Rachel" voice) — auto-disabled if quota exceeded or key invalid
-- Also supports Edge TTS
-
-**STT:** Groq Whisper (falls back to mock if `GROQ_API_KEY` not set)
-
-**Memory:** FAISS vector search over two knowledge bases:
-- `engine_capabilities.md` — available Rust API actions
-- `game_knowledge_base.md` — game lore and facts
-
----
-
-## 🌍 Solar System & 3D Assets
-
-### Planets & Moons
 All 8 planets + Sun rendered with 2K texture maps. AI can switch rendering mode per planet:
-- `texture` — 2K PNG/JPG texture sphere (default)
-- `glb` / `glb_alt` — 3D GLB model (Earth, Mars, Jupiter, Saturn, etc.)
+- `glb` — 3D model (default for most planets)
+- `texture` — 2K sphere
+- AI generates custom textures via HuggingFace SDXL on request
 
-Planet scale overrides (`visual_config.planet_scale_overrides`) let the AI dynamically rescale any celestial body. Collision radii auto-sync via `/set-planet-radius`.
-
-**Solar system sizes (approximate):**
-`Sun (1000)` · `Jupiter (750)` · `Saturn (630)` · `Uranus (420)` · `Neptune (390)` · `Earth (300)` · `Venus (255)` · `Mars (180)` · `Mercury (120)` · `Titan (250)` · `Io (200)` · `Europa (180)` · `Luna (80)`
-
-### 3D Models (GLB)
-- **Asteroids**: NASA Bennu (1999 RQ36) instanced mesh — up to 200 simultaneous instances
-- **Player ship**: Custom combat ship with cockpit dashboard + pilot avatar (GLTF)
-- **Neutral ships**: `fighter`, `shuttle`, `suzaku`, `space_shuttle_b`, `rick_cruiser`
-- **Anomalies**: Procedural Singularity (black hole visual)
-- **Procedural Planets**: GLSL shader-based fallback with simplex noise surface
-
-### Effects
-- **Black hole spaghettification**: entities stretch/squash as they enter the gravitational pull zone
-- **Particle system**: explosion / death particles
-- **SpaceGrid**: spatial reference grid
-- **Cinematic level transition**: warp-speed streak overlay on level complete
-- **Client-side culling**: dynamic entities culled beyond 15,000 units from player (permanent entities always render)
+**Approximate sizes:** `Sun (1000)` · `Jupiter (750)` · `Saturn (630)` · `Uranus (420)` · `Neptune (390)` · `Earth (300)` · `Venus (255)` · `Mars (180)` · `Titan (250)` · `Io (200)` · `Europa (180)` · `Luna (80)` · `Mercury (120)` · `Phobos (25)` · `Deimos (18)`
 
 ---
 
-## 📂 Complete Project Tree
+## 📂 Project Structure
 
 ```text
-C:\Project\
+Project/
+├── docker-compose.yml              # All-in-one local + cloud parity deployment
+├── .env.example                    # Required environment variables template
+├── run_all.ps1                     # PowerShell local launcher (non-Docker)
+├── stop_all.ps1                    # PowerShell clean shutdown
+├── AWS_ARCHITECTURE.md             # AWS deployment architecture (see for cloud setup)
 │
-├── engines/
-│   └── core-state/                        # Rust game engine (bevy_ecs + warp)
-│       ├── Cargo.toml
-│       └── src/
-│           ├── main.rs                    # Entry point, initialization, server startup
-│           ├── api.rs                     # All HTTP API routes (warp filters)
-│           ├── game_loop.rs               # 60fps ECS tick, WebSocket broadcast
-│           ├── engine_state.rs            # Shared state structs (Arc<Mutex<...>>)
-│           ├── world.rs                   # World spawning helpers, save/load logic
-│           ├── components.rs              # Bevy ECS components (Transform, Health, Faction, etc.)
-│           └── systems.rs                 # Physics, steering, combat, faction AI
+├── engines/core-state/             # Rust game engine (Bevy ECS + Warp)
+│   ├── Dockerfile
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs                 # Entry point, WebSocket server, startup
+│       ├── api.rs                  # All HTTP API routes
+│       ├── game_loop.rs            # 60fps ECS tick, collision, enemy AI, broadcast
+│       ├── engine_state.rs         # Shared Arc<Mutex<>> state
+│       ├── world.rs                # Entity spawning helpers, save/load
+│       ├── components.rs           # ECS components (Transform, Health, Faction, etc.)
+│       └── systems.rs              # Physics, steering, faction AI
 │
-├── apps/
-│   ├── python-director/                   # Python AI Director service
-│   │   ├── main.py                        # FastAPI server, LLM cascade, TTS, FAISS, STT
-│   │   ├── pipeline_setup.py              # HF dynamic texture generation
-│   │   ├── requirements.txt
-│   │   ├── .env                           # API keys (never commit!)
-│   │   └── data/
-│   │       ├── engine_capabilities.md     # RAG: Rust API capabilities for LLM
-│   │       └── game_knowledge_base.md     # RAG: game lore and narrative facts
-│   │
-│   └── web-client/                        # React + Three.js frontend
-│       ├── package.json
-│       ├── vite.config.ts
-│       ├── index.html
-│       └── src/
-│           ├── main.tsx
-│           ├── App.tsx                    # Root: WS connections, input loop, game state
-│           ├── three/
-│           │   ├── CameraSystem.tsx       # Camera follow / spectator camera logic
-│           │   └── entities/
-│           │       └── Anomalies.tsx      # Black hole / singularity visual
-│           └── components/
-│               ├── GameScene.tsx          # Three.js canvas setup
-│               ├── EntityRenderer.tsx     # Dispatches all 3D entities (planets, ships, etc.)
-│               ├── PlayerShip.tsx         # Player mesh, cockpit, pilot avatar
-│               ├── ProceduralPlanet.tsx   # GLSL shader planet (noise-based surface)
-│               ├── HUD.tsx                # Tactical overlay, radar, spectator, control buttons
-│               ├── ChatLog.tsx            # Director conversation history display
-│               ├── ParticleSystem.tsx     # Explosion / death particle effects
-│               ├── SpaceGrid.tsx          # Spatial reference grid
-│               └── Starfield.tsx          # Volumetric star background
+├── apps/python-director/           # Python AI Director
+│   ├── Dockerfile
+│   ├── main.py                     # FastAPI, LLM cascade, TTS, Redis RAG, STT, Intel Upload
+│   ├── pipeline_setup.py           # HuggingFace SDXL texture generation
+│   ├── s3_utils.py                 # AWS S3 save/load helpers
+│   ├── opensearch_utils.py         # AWS OpenSearch RAG helpers
+│   ├── bedrock_utils.py            # AWS Bedrock embedding helpers
+│   ├── requirements.txt
+│   └── data/
+│       ├── engine_capabilities.md  # RAG: Rust API capabilities
+│       ├── game_knowledge_base.md  # RAG: game lore and facts
+│       └── mock_lore.json          # Dynamic lore (AI-generated + user-uploaded intel)
 │
-├── data/                                  # 2K planet/star texture maps (PNG/JPG)
-│   └── .cache/                            # Auto-generated texture registry (AI textures)
-├── run_all.ps1                            # PowerShell launcher (Director + Engine + Vite)
-├── stop_all.ps1                           # PowerShell clean shutdown script
-├── .env.example                           # Root-level env var definitions
-└── README.md                              # Main documentation (This File)
+└── apps/web-client/                # React + Three.js frontend
+    ├── package.json
+    ├── vite.config.ts
+    └── src/
+        ├── App.tsx                 # Root: WS connections, input loop, game state
+        └── components/
+            ├── GameScene.tsx       # Three.js canvas
+            ├── EntityRenderer.tsx  # All 3D entities (planets, ships, projectiles)
+            ├── PlayerShip.tsx      # Player mesh + cockpit
+            ├── HUD.tsx             # Radar, tactical map, control buttons
+            ├── ChatLog.tsx         # Director conversation history
+            ├── ParticleSystem.tsx  # Explosion particles
+            └── Starfield.tsx       # Volumetric star background
 ```
 
 ---
 
-## 🚀 Getting Started
+## ⚠️ Known Behaviors (Not Bugs)
 
-1. **Environment Setup**:
-   - Clone the repo.
-   - Copy `.env.example` to `.env`.
-   - Provide your API keys (**never commit real keys!**):
-     - `GROQ_API_KEY` — Whisper STT + Groq LLM tier
-     - `GOOGLE_API_KEY` — Gemini LLM tier (primary)
-     - `HF_TOKEN` — HuggingFace dynamic texture generation
-     - `ELEVENLABS_API_KEY` — (optional) premium TTS voice
-     - `GITHUB_API_KEY` — (optional) GitHub Models LLM fallback
+- **429 Embedding errors in logs after startup**: The KB indexing (18 chunks) runs in a background thread pool. Google Gemini has a rate limit for the free tier. Errors are non-fatal — the game runs fully without KB vectors; RAG still works via in-memory fallback. On AWS, switch `USE_AWS_RAG=true` to use OpenSearch + Bedrock Titan (no rate limits).
 
-2. **Launch**:
-   - Run `./run_all.ps1` to start the Director, Rust Engine, and Vite Web Client concurrently.
-   - Run `./stop_all.ps1` to cleanly shut everything down.
-
-3. **Build individually**:
-   ```bash
-   # Frontend
-   cd apps/web-client && npx vite build
-
-   # Rust engine
-   cd engines/core-state && cargo build --release
-   ```
+- **Black hole death screen**: Currently shows a cinematic overlay. The full "resurrection" sequence is a known in-progress feature.
 
 ---
 
-## 🔮 Future Roadmap
-
-- **Procedural Planet Landing**: Switch to ground-based environments when approaching planetary surfaces.
-- **Dynamic Physics Overrides**: Story-driven changes to global gravity and friction constants.
-- **Faction Diplomacy Events**: AI-driven inter-faction war declarations with visual fleet movements.
-- **Procedural Planet Surfaces**: Vertex displacement noise for terrain detail on approach.
-
----
-
-*Built with Antigravity. Powered by Rust & FastAPI.*
+*Built with Antigravity. Powered by Rust, FastAPI, and Redis.*

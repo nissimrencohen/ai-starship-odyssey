@@ -1,0 +1,40 @@
+FEDERATION INTELLIGENCE MANUAL — CLASSIFIED ALPHA
+Sector Designations and Tactical Overrides
+Document ID: FED-INT-2157-ALPHA
+Distribution: Command Level Only
+
+════════════════════════════════════════════════════════════
+SECTOR CODENAME: NEON ABYSS
+Coordinates: (-3000, 0, 2000)
+Status: Active Cyberpunk Zone
+[STYLE_OVERRIDE: Cyberpunk]
+Gravity Reduction: 40% standard
+────────────────────────────────────────────────────────────
+Notes: Federation Outpost Theta-9 was lost to a rogue AI uprising in cycle 2154.
+All surviving vessels display chrome plating and neon signature markings.
+The sector ambient light has shifted to deep violet. Approach with caution.
+Friendly IFF codes are non-functional in this zone.
+
+════════════════════════════════════════════════════════════
+SECTOR CODENAME: BLACK GRAVEYARD
+Coordinates: (-5000, 0, 0)
+Status: Classified Memorial Zone — DO NOT ENGAGE
+[SPAWN_EVENT: mothership]
+────────────────────────────────────────────────────────────
+Notes: Site of the 3rd Fleet Massacre, cycle 2151. An alien Mothership
+designated LEVIATHAN-1 now patrols the wreckage as an autonomous guardian.
+Do not engage without carrier support. Previous solo engagements resulted
+in total loss. Recommend stealth approach or full avoidance.
+
+════════════════════════════════════════════════════════════
+WEAPONS INTELLIGENCE UPDATE — PRIORITY ALPHA
+[WEAPON_OVERRIDE: count=5, color=#ff0000]
+────────────────────────────────────────────────────────────
+Confirmed: All active Pirate Interceptor units have been retrofitted with
+plasma burst cannons sourced from the Black Market at Kepler Station.
+Burst count increased from 1 to 5 per trigger. Signature color: deep red.
+Fire rate increased approximately 200% above standard loadout.
+Evasion maneuvers are strongly recommended. Engage only from maximum range.
+
+════════════════════════════════════════════════════════════
+END OF DOCUMENT — FEDERATION COMMAND, CLASSIFIED ALPHA
