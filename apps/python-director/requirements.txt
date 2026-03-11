@@ -19,6 +19,8 @@ langchain-openai
 huggingface_hub
 Pillow
 psutil
+boto3>=1.34.0
+opensearch-py>=2.4.0
 piper-tts==1.4.1
 edge-tts
 # GPU / LOCAL_GPU mode (torch installed separately in Dockerfile with CUDA wheel)

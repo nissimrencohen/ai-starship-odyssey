@@ -815,7 +815,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 RUST_ENGINE_URL = os.getenv("RUST_ENGINE_URL", "http://127.0.0.1:8080")
 SELF_URL = os.getenv("SELF_URL", "http://127.0.0.1:8000")
 REDIS_CLIENT: Optional[redis.Redis] = None
-EMBEDDING_DIM = 768  # Google gemini-embedding-001 dimension (also used for fallback compatibility)
+EMBEDDING_DIM = 1024 if USE_AWS_RAG else 768  # Bedrock Titan v2=1024, Gemini embedding-001=768
 
 # ── Local GPU Mode ────────────────────────────────────────────────────────────
 AI_MODEL_MODE = os.getenv("AI_MODEL_MODE", "")  # Set to "LOCAL_GPU" on AWS g5.xlarge
@@ -873,7 +873,13 @@ def get_redis() -> Optional[redis.Redis]:
 
 
 async def generate_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> Optional[List[float]]:
-    """Generates a vector embedding for the given text using Google AI."""
+    """Generates a vector embedding. Uses Bedrock Titan when USE_AWS_RAG=true (no rate limits), else Gemini."""
+    if USE_AWS_RAG:
+        from bedrock_utils import generate_titan_embedding
+        loop = asyncio.get_event_loop()
+        vec = await loop.run_in_executor(None, generate_titan_embedding, text)
+        return vec if vec else None
+
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         logger.error("[Embedding] GOOGLE_API_KEY not set")
@@ -891,13 +897,10 @@ async def generate_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -
                 },
                 timeout=10.0,
             )
-            
             resp.raise_for_status()
             result = resp.json()
-            # Handle both possible response formats (flat list or object wrapping)
             values = result["embedding"]["values"] if "embedding" in result else result["values"]
             return values
-
     except Exception as e:
         logger.error(f"[Embedding] API call failed: {e}")
         return None
@@ -905,7 +908,12 @@ async def generate_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -
 
 
 def generate_embedding_sync(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> Optional[List[float]]:
-    """Synchronous embedding for startup use."""
+    """Synchronous embedding. Uses Bedrock Titan when USE_AWS_RAG=true (no rate limits), else Gemini."""
+    if USE_AWS_RAG:
+        from bedrock_utils import generate_titan_embedding
+        vec = generate_titan_embedding(text)
+        return vec if vec else None
+
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         return None
@@ -936,8 +944,13 @@ def _float_list_to_bytes(vec: List[float]) -> bytes:
     return struct.pack(f"<{len(vec)}f", *vec)
 
 
+REDIS_SEARCH_AVAILABLE = True  # set to False if FT.CREATE fails (standard ElastiCache)
+
 def _ensure_redis_index(r: redis.Redis, index_name: str, prefix: str):
-    """Create a RediSearch index if it doesn't exist."""
+    """Create a RediSearch index if it doesn't exist. Gracefully skips on standard Redis."""
+    global REDIS_SEARCH_AVAILABLE
+    if not REDIS_SEARCH_AVAILABLE:
+        return
     try:
         r.ft(index_name).info()
         logger.info(f"[Redis] Index '{index_name}' already exists.")
@@ -954,8 +967,15 @@ def _ensure_redis_index(r: redis.Redis, index_name: str, prefix: str):
             ),
         )
         definition = IndexDefinition(prefix=[prefix], index_type=IndexType.HASH)
-        r.ft(index_name).create_index(fields=schema, definition=definition)
-        logger.info(f"[Redis] Created index '{index_name}' with prefix '{prefix}'")
+        try:
+            r.ft(index_name).create_index(fields=schema, definition=definition)
+            logger.info(f"[Redis] Created index '{index_name}' with prefix '{prefix}'")
+        except Exception as e:
+            if "unknown command" in str(e).lower() or "ft.create" in str(e).lower():
+                logger.warning(f"[Redis] RediSearch not available (standard ElastiCache) — vector search disabled. Using simple key-value store.")
+                REDIS_SEARCH_AVAILABLE = False
+            else:
+                logger.warning(f"[Redis] Index creation failed: {e}")
 
 
 def initialize_global_knowledge_base():
@@ -1273,6 +1293,9 @@ class DreamMemory:
         NEMESIS is surfaced by proximity, not semantic similarity.
         NARRATIVE forces lore continuity regardless of topical similarity.
         """
+        if not REDIS_SEARCH_AVAILABLE:
+            return "No previous memories."
+
         query_emb = generate_embedding_sync(query, task_type="RETRIEVAL_QUERY")
         if not query_emb:
             return "No previous memories."

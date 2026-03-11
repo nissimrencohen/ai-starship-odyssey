@@ -86,7 +86,8 @@ graph TD
 
 | Local (Docker Compose) | AWS Equivalent | Env Switch |
 | :--- | :--- | :--- |
-| `redis/redis-stack-server` | ElastiCache Redis (OSS 7.x) | automatic |
+| `redis/redis-stack-server` (RediSearch) | ElastiCache Redis OSS 7.x (key-value only; RediSearch not available) | automatic — vector search gracefully disabled |
+| Gemini embeddings (768d) | Bedrock Titan Embed v2 (1024d) | `USE_AWS_RAG=true` |
 | `mock_lore.json` flat file | OpenSearch vector index | `USE_AWS_RAG=true` |
 | HuggingFace SDXL (cloud API) | EC2 g5 local SDXL | `AI_MODEL_MODE=LOCAL_GPU` |
 | Edge TTS (cloud) | XTTS-v2 on g5 GPU | `AI_MODEL_MODE=LOCAL_GPU` |
@@ -100,8 +101,10 @@ graph TD
 | Service | Instance | vCPU | RAM | GPU | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | Rust Engine | `c7a.xlarge` | 4 | 8 GB | — | CPU-bound ECS physics at 60fps |
-| Python Director | `g5.xlarge` | 4 | 16 GB | 1× A10G 24GB | SDXL texture gen + XTTS-v2 TTS |
+| Python Director | `t3.medium`* | 2 | 4 GB | — | Cloud APIs: Gemini LLM + Bedrock Titan embeddings + Groq Whisper + HuggingFace SDXL |
 | SQS Worker | `t3.medium` | 2 | 4 GB | — | Textract + chunking + Bedrock calls |
+
+> **\* GPU upgrade path**: Swap `t3.medium` → `g5.xlarge` and set `AI_MODEL_MODE=LOCAL_GPU` to run XTTS-v2 TTS + SDXL texture generation on-device (24GB A10G). Requires AWS Service Quota increase for G instances (`L-DB2E81BA`). Pending for production.
 
 ---
 
@@ -147,22 +150,22 @@ docker run -d --name rust-engine \
   -e PYTHON_DIRECTOR_URL=http://<director-private-ip>:8000 \
   <ecr-repo>/starship-rust:latest
 
-# Python Director (GPU instance)
+# Python Director (t3.medium — cloud APIs, no GPU)
 docker run -d --name python-director \
-  --gpus all \
   -p 8000:8000 \
-  -e RUST_ENGINE_URL=http://<rust-private-ip>:8080 \
+  -e RUST_ENGINE_URL=http://<rust-public-ip>:8080 \
   -e REDIS_URL=redis://<elasticache-endpoint>:6379 \
   -e SELF_URL=http://<director-public-ip>:8000 \
   -e USE_AWS_RAG=true \
   -e OPENSEARCH_ENDPOINT=https://<opensearch-endpoint> \
   -e AWS_REGION=us-east-1 \
-  -e AI_MODEL_MODE=LOCAL_GPU \
+  -e AI_MODEL_MODE= \
   -e GOOGLE_API_KEY=<key> \
   -e GROQ_API_KEY=<key> \
   -e HF_TOKEN=<key> \
   -e ELEVENLABS_API_KEY=<key> \
   <ecr-repo>/starship-director:latest
+# Note: add --gpus all and AI_MODEL_MODE=LOCAL_GPU when using g5.xlarge
 ```
 
 ### 4. Create S3 buckets

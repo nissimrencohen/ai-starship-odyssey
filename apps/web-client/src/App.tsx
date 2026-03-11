@@ -6,7 +6,10 @@ import { GameScene } from './components/GameScene';
 import { HUD } from './components/HUD';
 import { ChatLog, ChatMessage } from './components/ChatLog';
 
-const WS_URL = 'ws://localhost:8000/api/v1/dream-stream';
+const _DIRECTOR_BASE = (import.meta as any).env?.VITE_DIRECTOR_URL || 'http://localhost:8000';
+const _ENGINE_WS = (import.meta as any).env?.VITE_ENGINE_WS_URL || 'ws://localhost:8081/ws';
+const _ENGINE_HTTP = (import.meta as any).env?.VITE_ENGINE_HTTP_URL || 'http://localhost:8080';
+const WS_URL = _DIRECTOR_BASE.replace(/^http/, 'ws') + '/api/v1/dream-stream';
 const RESET_DEBOUNCE_MS = 1000;
 
 export default function App() {
@@ -57,7 +60,7 @@ export default function App() {
   }, [readyState, sendMessage]);
 
   // ECS WebSocket connection
-  const { lastMessage: ecsMessage, sendMessage: sendEcsMessage } = useWebSocket('ws://localhost:8081/ws', {
+  const { lastMessage: ecsMessage, sendMessage: sendEcsMessage } = useWebSocket(_ENGINE_WS, {
     shouldReconnect: () => true,
     reconnectInterval: 500,
     onError: (e) => { }, // Suppressed error spam
@@ -298,7 +301,7 @@ export default function App() {
 
   // Full reset: clears BH overlay + calls engine reset
   const bhAutoResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const DIRECTOR_URL = (import.meta as any).env?.VITE_DIRECTOR_URL || 'http://localhost:8000';
+  const DIRECTOR_URL = _DIRECTOR_BASE;
 
   const handleIntelUpload = useCallback(async (file: File) => {
     setUplinkStatus('uploading');
@@ -329,7 +332,7 @@ export default function App() {
   const handleFullReset = useCallback(async () => {
     lastResetTimeRef.current = Date.now();
     if (bhAutoResetTimerRef.current) { clearTimeout(bhAutoResetTimerRef.current); bhAutoResetTimerRef.current = null; }
-    try { await fetch('http://127.0.0.1:8080/api/engine/reset', { method: 'POST' }); } catch (_) { }
+    try { await fetch(`${_ENGINE_HTTP}/api/engine/reset`, { method: 'POST' }); } catch (_) { }
     setBlackHoleDeath(false);
     blackHoleDeathFiredRef.current = false;
     setSpectatorTargetId(null);
@@ -350,7 +353,7 @@ export default function App() {
   // Pause/resume Rust physics when tactical map opens/closes or spectator mode changes
   const syncEnginePauseState = useCallback(() => {
     const shouldPause = isFocusModePausedRef.current || spectatorTargetIdRef.current !== null;
-    fetch(`http://127.0.0.1:8080/api/${shouldPause ? 'pause' : 'resume'}`, { method: 'POST' }).catch(() => { });
+    fetch(`${_ENGINE_HTTP}/api/${shouldPause ? 'pause' : 'resume'}`, { method: 'POST' }).catch(() => { });
   }, []);
 
   const handleFocusModeChange = useCallback((isOpen: boolean) => {
@@ -553,7 +556,7 @@ export default function App() {
     if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
     zoomDebounceRef.current = setTimeout(() => {
       lastSentZoomRef.current = zoom;
-      fetch('http://localhost:8080/state', {
+      fetch(`${_ENGINE_HTTP}/state`, {
         method: 'POST',
         mode: 'cors',
         headers: { 'Content-Type': 'application/json' },
