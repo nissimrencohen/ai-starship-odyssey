@@ -275,7 +275,9 @@ RUST_INSTANCE=i-0e775d61351fad5bc
 RUST_IP=23.22.74.240
 CLOUDFRONT_DOMAIN=d3cuox6dfl2gvk.cloudfront.net
 CLOUDFRONT_ID=E1NRIS4HZUY13Y
-S3_BUCKET=starship-frontend-131677314808
+S3_FRONTEND_BUCKET=starship-frontend-131677314808
+S3_SAVES_BUCKET=starship-game-saves
+S3_LORE_BUCKET=starship-lore-docs-131677314808
 REDIS_URL=redis://starship-redis.vtgv11.0001.use1.cache.amazonaws.com:6379
 OPENSEARCH_ENDPOINT=https://vpc-starship-knowledge-xxx.us-east-1.es.amazonaws.com
 ```

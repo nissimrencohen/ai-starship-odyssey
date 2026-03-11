@@ -28,11 +28,11 @@ npx vite build
 echo "=== [2/2] Syncing to S3 + invalidating CloudFront ==="
 cd dist
 
-aws s3 sync . "s3://${S3_BUCKET}/" --delete \
+aws s3 sync . "s3://${S3_FRONTEND_BUCKET}/" --delete \
   --cache-control "public, max-age=31536000"
 
 # index.html: no-cache so users always get the latest version
-aws s3 cp index.html "s3://${S3_BUCKET}/index.html" \
+aws s3 cp index.html "s3://${S3_FRONTEND_BUCKET}/index.html" \
   --cache-control "no-cache" \
   --content-type "text/html"
 
