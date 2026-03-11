@@ -10,8 +10,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-S3_BUCKET = os.getenv("S3_BUCKET", "")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET      = os.getenv("S3_BUCKET", "")
+S3_LORE_BUCKET = os.getenv("S3_LORE_BUCKET", "starship-lore-docs-131677314808")
+AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")
 
 try:
     import boto3
@@ -58,6 +59,24 @@ def upload_save(local_path: str, slot: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"[S3] Upload failed: {e}")
+        return False
+
+
+def upload_lore_file(local_path: str, filename: str) -> bool:
+    """
+    Upload an ingested lore file (PDF/TXT/MD) to S3_LORE_BUCKET.
+    Returns True on success, False on any failure.
+    """
+    client = _get_client()
+    if not client:
+        return False
+    s3_key = f"lore/{filename}"
+    try:
+        client.upload_file(local_path, S3_LORE_BUCKET, s3_key)
+        logger.info(f"[S3] Uploaded lore → s3://{S3_LORE_BUCKET}/{s3_key}")
+        return True
+    except Exception as e:
+        logger.error(f"[S3] Lore upload failed: {e}")
         return False
 
 

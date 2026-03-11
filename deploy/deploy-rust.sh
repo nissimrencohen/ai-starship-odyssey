@@ -1,24 +1,29 @@
 #!/bin/bash
 # ── Deploy Rust Engine to EC2 ──────────────────────────────────────────────────
 # Usage: ./deploy/deploy-rust.sh
-# Requires: AWS CLI configured, Docker logged in to ECR, temp SSH key at /tmp/starship-temp-key
+# Requires: deploy/.env.deploy (copy from .env.deploy.example and fill in)
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-ACCOUNT_ID="131677314808"
-REGION="us-east-1"
-ECR_REPO="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/starship-rust"
-RUST_INSTANCE="i-0e775d61351fad5bc"
-RUST_IP="23.22.74.240"
-DIRECTOR_IP="18.232.168.75"
+# Load deploy config
+DEPLOY_ENV="${SCRIPT_DIR}/.env.deploy"
+if [ ! -f "$DEPLOY_ENV" ]; then
+  echo "ERROR: Missing ${DEPLOY_ENV}"
+  echo "Copy deploy/.env.deploy.example to deploy/.env.deploy and fill in values."
+  exit 1
+fi
+source "$DEPLOY_ENV"
+
+ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/starship-rust"
 
 echo "=== [1/4] Building Rust Engine Docker image ==="
-docker build -t starship-rust ./engines/core-state
+docker build -t starship-rust "${SCRIPT_DIR}/../engines/core-state"
 
 echo "=== [2/4] Pushing to ECR ==="
-aws ecr get-login-password --region "$REGION" | \
-  docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+aws ecr get-login-password --region "$AWS_REGION" | \
+  docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 docker tag starship-rust:latest "${ECR_REPO}:latest"
 docker push "${ECR_REPO}:latest"
 
@@ -31,19 +36,19 @@ aws ec2-instance-connect send-ssh-public-key \
   --instance-id "$RUST_INSTANCE" \
   --instance-os-user ec2-user \
   --ssh-public-key "$PUB_KEY" \
-  --region "$REGION" > /dev/null
+  --region "$AWS_REGION" > /dev/null
 
 echo "=== [4/4] Deploying on EC2 ==="
 ssh -i /tmp/starship-temp-key \
   -o StrictHostKeyChecking=no \
   -o ConnectTimeout=15 \
-  ec2-user@"$RUST_IP" bash << REMOTE
+  "ec2-user@${RUST_IP}" bash << REMOTE
 set -e
 
 sudo systemctl start docker 2>/dev/null || true
 
-sudo aws ecr get-login-password --region ${REGION} | \
-  sudo docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com
+sudo aws ecr get-login-password --region ${AWS_REGION} | \
+  sudo docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
 
 sudo docker pull ${ECR_REPO}:latest
 

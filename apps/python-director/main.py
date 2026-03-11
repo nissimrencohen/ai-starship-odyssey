@@ -2324,7 +2324,7 @@ def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list:
 
 
 def _ingest_file_to_lore(file_path: str, filename: str):
-    """Background task: extract, chunk, and append to mock_lore.json."""
+    """Background task: extract, chunk, index into mock_lore.json and OpenSearch (AWS path)."""
     try:
         text = _extract_text_from_file(file_path)
         if not text.strip():
@@ -2334,6 +2334,7 @@ def _ingest_file_to_lore(file_path: str, filename: str):
         chunks = _chunk_text(text)
         logger.info(f"[Intel] Extracted {len(chunks)} chunks from {filename}")
 
+        # ── 1. Always write to mock_lore.json (local fallback) ──────────────
         lore_path = os.path.join(backend_data_dir, "mock_lore.json")
         try:
             with open(lore_path, "r", encoding="utf-8") as f:
@@ -2355,19 +2356,39 @@ def _ingest_file_to_lore(file_path: str, filename: str):
 
         logger.info(f"[Intel] Appended {len(chunks)} chunks from '{filename}' to mock_lore.json")
 
-        # Notify all connected WebSocket clients
+        # ── 2. Upload raw file to S3 lore bucket (AWS path) ──────────────────
+        if USE_AWS_RAG:
+            try:
+                from s3_utils import upload_lore_file
+                upload_lore_file(file_path, filename)
+            except Exception as e:
+                logger.warning(f"[Intel] S3 lore upload failed: {e}")
+
+        # ── 3. AWS path: index into OpenSearch with Bedrock embeddings ───────
+        indexed_os = 0
+        if USE_AWS_RAG:
+            try:
+                from opensearch_utils import index_document
+                from bedrock_utils import generate_titan_embedding
+                for i, chunk in enumerate(chunks):
+                    doc_id = f"{base_id}_{i}"
+                    embedding = generate_titan_embedding(chunk)
+                    ok = index_document(doc_id, chunk, embedding, {"source": filename, "chunk": i})
+                    if ok:
+                        indexed_os += 1
+                logger.info(f"[Intel] Indexed {indexed_os}/{len(chunks)} chunks into OpenSearch for '{filename}'")
+            except Exception as e:
+                logger.warning(f"[Intel] OpenSearch indexing failed for '{filename}': {e}")
+
+        # ── 3. Notify connected WebSocket clients (Rachel speaks in chat) ────
+        summary = (
+            f"Intelligence upload complete. '{filename}' — {len(chunks)} segments absorbed"
+            + (f", {indexed_os} indexed into the knowledge grid." if USE_AWS_RAG else ".")
+        )
         notification = {
-            "type": "world_state",
-            "content": {
-                "summary": f"New intelligence indexed: {filename}",
-                "environment_theme": "Intelligence Update",
-                "terrain_rules": "Standard Grid",
-                "physics_mode": "static",
-                "conversational_reply": f"New intelligence indexed, Commander. Standing by for queries regarding '{filename}'. {len(chunks)} data segments absorbed.",
-                "behavior_policy": "idle",
-            }
+            "type": "text",
+            "content": f"[INTEL UPLINK] {summary} I can now answer questions about this document, Commander."
         }
-        # Schedule WS broadcast on the main event loop (captured at WebSocket connect)
         if _main_event_loop is not None and _main_event_loop.is_running():
             asyncio.run_coroutine_threadsafe(_broadcast_intel_notification(notification), _main_event_loop)
         else:

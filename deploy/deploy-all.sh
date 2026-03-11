@@ -2,11 +2,21 @@
 # ── Full Deploy: Director + Rust Engine + Frontend ────────────────────────────
 # Usage: ./deploy/deploy-all.sh [director|rust|frontend|all]
 # Default: all
+# Requires: deploy/.env.deploy (copy from .env.deploy.example and fill in)
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
-SCRIPT_DIR="$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET="${1:-all}"
+
+# Load deploy config (for summary output)
+DEPLOY_ENV="${SCRIPT_DIR}/.env.deploy"
+if [ ! -f "$DEPLOY_ENV" ]; then
+  echo "ERROR: Missing ${DEPLOY_ENV}"
+  echo "Copy deploy/.env.deploy.example to deploy/.env.deploy and fill in values."
+  exit 1
+fi
+source "$DEPLOY_ENV"
 
 # Generate SSH key once if missing
 if [ ! -f /tmp/starship-temp-key ]; then
@@ -36,9 +46,9 @@ case "$TARGET" in
     echo ""
     echo "========================================="
     echo "All services deployed!"
-    echo "  Frontend: https://d3cuox6dfl2gvk.cloudfront.net"
-    echo "  Director: 18.232.168.75 (via CF)"
-    echo "  Rust Eng: 23.22.74.240 (via CF)"
+    echo "  Frontend: https://${CLOUDFRONT_DOMAIN}"
+    echo "  Director: ${DIRECTOR_IP} (via CF)"
+    echo "  Rust Eng: ${RUST_IP} (via CF)"
     echo "========================================="
     ;;
   *)

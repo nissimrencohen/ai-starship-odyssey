@@ -1,6 +1,6 @@
 # AWS Deployment Architecture — AI Starship Odyssey
 
-This document describes the full AWS deployment for production. The local Docker Compose environment mirrors this architecture exactly (Redis ↔ ElastiCache, local files ↔ S3, mock_lore.json ↔ OpenSearch).
+This document describes the full AWS production deployment. The local Docker Compose environment mirrors this architecture exactly — swap env vars to switch between local and cloud backends.
 
 ---
 
@@ -14,85 +14,81 @@ graph TD
     classDef rust fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fff
     classDef aws fill:#451a03,stroke:#eab308,stroke-width:2px,color:#fff
     classDef db fill:#831843,stroke:#f43f5e,stroke-width:2px,color:#fff
-    classDef worker fill:#4f46e5,stroke:#818cf8,stroke-width:2px,color:#fff
 
     User((Player)):::client
-    Admin((DevOps)):::client
 
     subgraph Edge [AWS Global Edge]
-        CDN["CloudFront + S3\nReact UI Static Assets"]:::react
-        GA["AWS Global Accelerator\nZero-jitter routing"]:::aws
+        CDN["CloudFront\nd3cuox6dfl2gvk.cloudfront.net\nHTTPS termination + path routing"]:::react
+        S3_FE[("S3: React Build\nstarship-frontend-*")]:::aws
     end
 
-    subgraph Ingest [Intelligence Ingestion Pipeline]
-        S3_Docs[("S3: Lore PDFs / Docs")]:::aws
-        SQS["SQS: ObjectCreated Queue"]:::aws
-        Worker["EC2 Worker\nTextract + Chunking"]:::worker
-        Bedrock_Titan["Bedrock: Titan Embeddings"]:::aws
-
-        Admin -->|Uploads Intel| S3_Docs
-        S3_Docs -->|ObjectCreated trigger| SQS
-        SQS -->|Polls| Worker
-        Worker <-->|Vectorizes chunks| Bedrock_Titan
+    subgraph Region [AWS us-east-1 — VPC]
+        Rust["EC2 c7a.xlarge\nRust Engine\n23.22.74.240\nDocker + Nginx"]:::rust
+        Director["EC2 t3.medium\nPython Director\n18.232.168.75\nDocker + Nginx"]:::python
+        Redis[("ElastiCache Redis\nSession Vector Memory")]:::db
+        OpenSearch[("OpenSearch\ngame-lore index\nkNN RAG queries")]:::db
+        S3_Lore[("S3: Lore Docs\nstarship-lore-docs-*")]:::aws
+        S3_Saves[("S3: Game Saves\nworld_snap.json")]:::aws
+        Bedrock["AWS Bedrock\nTitan Embed v2 (1024d)\nClaude 3 Sonnet"]:::aws
     end
 
-    subgraph Region [AWS Region — us-east-1]
-        NLB["Network Load Balancer"]:::aws
-
-        subgraph Compute [Compute Layer]
-            Rust["EC2 c7a.xlarge\nRust Game Engine\n(Docker)"]:::rust
-            FastAPI["EC2 g5.xlarge\nPython AI Director\n(Docker)"]:::python
-            LocalAI["Local: SDXL Textures\n+ XTTS-v2 TTS\n(on g5 GPU)"]:::python
-        end
-
-        subgraph Storage [Memory & Storage]
-            Redis[("ElastiCache Redis\nSession Vector Memory\n60fps hot state")]:::db
-            OpenSearch[("OpenSearch\nKnowledge Vector DB\nRAG queries")]:::db
-            S3_Saves[("S3: Game Saves\nworld_snap.json")]:::aws
-        end
-
-        Worker -->|Indexes chunks| OpenSearch
+    subgraph External [External AI APIs]
+        Gemini["Google Gemini\nLLM + Embeddings (local)"]:::aws
+        Groq["Groq\nWhisper STT + Llama"]:::aws
+        HF["HuggingFace\nSDXL Textures"]:::aws
     end
 
-    subgraph AICore [External AI Services]
-        Groq["Groq API\nWhisper STT + Llama LLM"]:::aws
-        Gemini["Google AI\nGemini LLM + Embeddings"]:::aws
-    end
+    User -->|"HTTPS / WSS"| CDN
+    CDN -->|"/* static"| S3_FE
+    CDN -->|"/ws → :8081"| Rust
+    CDN -->|"REST paths → :8080"| Rust
+    CDN -->|"/api/v1/* /api/intelligence/* /assets/*"| Director
 
-    %% Player flow
-    User -->|Loads 3D world assets| CDN
-    User <-->|WebSocket + REST| GA
-    GA <--> NLB
-    NLB <-->|60fps WebSocket frames| Rust
-    NLB <-->|Voice / Chat / Intel API| FastAPI
-
-    %% Real-time game loop
-    FastAPI <-->|World state HTTP| Rust
-    FastAPI <-->|Session memory KNN| Redis
-    FastAPI <-->|Deep RAG queries| OpenSearch
-    FastAPI -->|Persist saves| S3_Saves
-    FastAPI <-->|STT + LLM fallback| Groq
-    FastAPI <-->|LLM primary + Embeddings| Gemini
-    FastAPI -.->|GPU texture gen| LocalAI
-
-    %% RAG actionable tags → world mutations
-    OpenSearch -.->|Actionable lore tags| FastAPI
-    FastAPI -.->|Physics / spawn commands| Rust
+    Director <-->|"World state HTTP"| Rust
+    Director <-->|"Session vectors"| Redis
+    Director <-->|"RAG kNN queries"| OpenSearch
+    Director -->|"Lore file upload"| S3_Lore
+    Director -->|"Game saves"| S3_Saves
+    Director <-->|"Titan embeddings"| Bedrock
+    Director <-->|"LLM primary"| Gemini
+    Director <-->|"STT + LLM fallback"| Groq
+    Director <-->|"Texture gen"| HF
 ```
 
 ---
 
 ## Local ↔ AWS Parity
 
-| Local (Docker Compose) | AWS Equivalent | Env Switch |
+| Local (Docker Compose) | AWS Equivalent | How to switch |
 | :--- | :--- | :--- |
-| `redis/redis-stack-server` (RediSearch) | ElastiCache Redis OSS 7.x (key-value only; RediSearch not available) | automatic — vector search gracefully disabled |
+| `redis/redis-stack-server` | ElastiCache Redis 7.x (key-value only; no RediSearch) | Automatic — vector search gracefully disabled on ElastiCache |
 | Gemini embeddings (768d) | Bedrock Titan Embed v2 (1024d) | `USE_AWS_RAG=true` |
-| `mock_lore.json` flat file | OpenSearch vector index | `USE_AWS_RAG=true` |
-| HuggingFace SDXL (cloud API) | EC2 g5 local SDXL | `AI_MODEL_MODE=LOCAL_GPU` |
-| Edge TTS (cloud) | XTTS-v2 on g5 GPU | `AI_MODEL_MODE=LOCAL_GPU` |
-| Local `world_snap.json` | S3 bucket (`/saves/`) | code: `s3_utils.py` |
-| `data/ingested/` folder | S3 + SQS + Worker pipeline | `USE_AWS_RAG=true` |
+| `mock_lore.json` flat file | OpenSearch `game-lore` index (kNN) | `USE_AWS_RAG=true` |
+| `data/ingested/` folder watch | S3 `starship-lore-docs-*` bucket | `USE_AWS_RAG=true` (upload via `/api/intelligence/upload`) |
+| HuggingFace SDXL cloud API | EC2 g5 local SDXL-Turbo | `AI_MODEL_MODE=LOCAL_GPU` |
+| Edge TTS / Piper | XTTS-v2 on g5 GPU | `AI_MODEL_MODE=LOCAL_GPU` |
+| Local `world_snap.json` | S3 `starship-game-saves` | `s3_utils.py` (auto when `USE_AWS_RAG=true`) |
+| `SELF_URL=http://localhost:8000` | `SELF_URL=https://d3cuox6dfl2gvk.cloudfront.net` | Set in deploy script |
+
+---
+
+## CloudFront Path Routing
+
+All traffic enters via a single CloudFront domain — no mixed content issues.
+
+| Path Pattern | Target Origin | Protocol |
+| :--- | :--- | :--- |
+| `/ws` | Rust Engine `:8081` | WebSocket upgrade |
+| `/state`, `/spawn`, `/despawn`, `/modify`, `/save`, `/load`, `/update_player` | Rust Engine `:8080` | HTTP |
+| `/api/command`, `/api/engine/*`, `/api/physics`, `/api/factions`, `/api/pause`, `/api/resume` | Rust Engine `:8080` | HTTP |
+| `/api/v1/dream-stream` | Director `:8000` | WebSocket upgrade |
+| `/api/director/*` | Director `:8000` | HTTP |
+| `/api/intelligence/*` | Director `:8000` | HTTP (file upload) |
+| `/assets/audio/*`, `/assets/generated/*` | Director `:8000` | HTTP (audio/image streaming) |
+| `/*` (default) | S3 Frontend | HTTP (React SPA) |
+
+Origins use `{ip}.nip.io` DNS — CloudFront rejects raw IPs as DomainName.
+EC2 Nginx listens on port 80 (http-only; CloudFront handles TLS).
 
 ---
 
@@ -101,126 +97,224 @@ graph TD
 | Service | Instance | vCPU | RAM | GPU | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | Rust Engine | `c7a.xlarge` | 4 | 8 GB | — | CPU-bound ECS physics at 60fps |
-| Python Director | `t3.medium`* | 2 | 4 GB | — | Cloud APIs: Gemini LLM + Bedrock Titan embeddings + Groq Whisper + HuggingFace SDXL |
-| SQS Worker | `t3.medium` | 2 | 4 GB | — | Textract + chunking + Bedrock calls |
+| Python Director | `t3.medium` | 2 | 4 GB | — | Cloud APIs: Bedrock + Gemini + Groq + HuggingFace |
+| *(GPU upgrade)* | `g5.xlarge` | 8 | 24 GB | A10G | Local SDXL-Turbo + XTTS-v2; set `AI_MODEL_MODE=LOCAL_GPU` |
 
-> **\* GPU upgrade path**: Swap `t3.medium` → `g5.xlarge` and set `AI_MODEL_MODE=LOCAL_GPU` to run XTTS-v2 TTS + SDXL texture generation on-device (24GB A10G). Requires AWS Service Quota increase for G instances (`L-DB2E81BA`). Pending for production.
+> GPU upgrade requires AWS Service Quota increase for G instances (`L-DB2E81BA`).
 
 ---
 
-## Deployment Steps
+## One-Command Deployment
 
-### 1. Build & push Docker images to ECR
+### Prerequisites
+
+1. AWS CLI configured (`aws configure`)
+2. Docker Desktop running
+3. ECR repositories created: `starship-rust`, `starship-director`
+4. EC2 instances running with `starship-ec2-role` IAM role attached
+5. `deploy/.env.deploy` filled in (copy from `deploy/.env.deploy.example`)
+
+### Run
 
 ```bash
-# Authenticate
-aws ecr get-login-password --region us-east-1 | \
-  docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
+cp deploy/.env.deploy.example deploy/.env.deploy
+# Edit deploy/.env.deploy with your AWS values
 
-# Build and push Rust engine
-docker build -t starship-rust ./engines/core-state
-docker tag starship-rust:latest <ecr-repo>/starship-rust:latest
-docker push <ecr-repo>/starship-rust:latest
-
-# Build and push Python Director
-docker build -t starship-director ./apps/python-director
-docker tag starship-director:latest <ecr-repo>/starship-director:latest
-docker push <ecr-repo>/starship-director:latest
+bash deploy/deploy-all.sh all
+# Deploys Rust + Director in parallel, then Frontend
 ```
 
-### 2. Deploy React frontend to S3 + CloudFront
+Or individually:
 
 ```bash
-cd apps/web-client
-VITE_DIRECTOR_URL=https://<your-nlb-or-api-domain> npx vite build
-aws s3 sync dist/ s3://<your-frontend-bucket>/ --delete
-aws cloudfront create-invalidation --distribution-id <dist-id> --paths "/*"
+bash deploy/deploy-all.sh rust      # Rust engine only
+bash deploy/deploy-all.sh director  # Python Director only
+bash deploy/deploy-all.sh frontend  # React → S3 + CloudFront
 ```
 
-### 3. Launch EC2 instances
+Each script:
+1. Builds Docker image locally
+2. Pushes to ECR (`{account}.dkr.ecr.{region}.amazonaws.com/starship-{service}`)
+3. SSHes to EC2 via Instance Connect API (no keypair needed, 60s temp key)
+4. Pulls new image, stops old container, starts with `--restart unless-stopped`
+5. Installs/configures Nginx if not present
+
+---
+
+## AWS Resources Required
+
+### One-time setup (create once, reuse across deploys)
+
+#### ECR repositories
 
 ```bash
-# On each EC2 instance, pull and run:
-docker pull <ecr-repo>/starship-rust:latest
-docker pull <ecr-repo>/starship-director:latest
-
-# Rust Engine
-docker run -d --name rust-engine \
-  -p 8080:8080 -p 8081:8081 \
-  -e PYTHON_DIRECTOR_URL=http://<director-private-ip>:8000 \
-  <ecr-repo>/starship-rust:latest
-
-# Python Director (t3.medium — cloud APIs, no GPU)
-docker run -d --name python-director \
-  -p 8000:8000 \
-  -e RUST_ENGINE_URL=http://<rust-public-ip>:8080 \
-  -e REDIS_URL=redis://<elasticache-endpoint>:6379 \
-  -e SELF_URL=http://<director-public-ip>:8000 \
-  -e USE_AWS_RAG=true \
-  -e OPENSEARCH_ENDPOINT=https://<opensearch-endpoint> \
-  -e AWS_REGION=us-east-1 \
-  -e AI_MODEL_MODE= \
-  -e GOOGLE_API_KEY=<key> \
-  -e GROQ_API_KEY=<key> \
-  -e HF_TOKEN=<key> \
-  -e ELEVENLABS_API_KEY=<key> \
-  <ecr-repo>/starship-director:latest
-# Note: add --gpus all and AI_MODEL_MODE=LOCAL_GPU when using g5.xlarge
+aws ecr create-repository --repository-name starship-rust --region us-east-1
+aws ecr create-repository --repository-name starship-director --region us-east-1
 ```
 
-### 4. Create S3 buckets
+#### S3 buckets
 
 ```bash
-aws s3 mb s3://starship-lore-docs --region us-east-1
+aws s3 mb s3://starship-frontend-$(aws sts get-caller-identity --query Account --output text) --region us-east-1
+aws s3 mb s3://starship-lore-docs-$(aws sts get-caller-identity --query Account --output text) --region us-east-1
 aws s3 mb s3://starship-game-saves --region us-east-1
 ```
 
-### 5. Create SQS queue + S3 trigger
+#### ElastiCache Redis
 
 ```bash
-aws sqs create-queue --queue-name starship-lore-ingest
-# Add S3 event notification on starship-lore-docs → SQS for ObjectCreated
+aws elasticache create-cache-cluster \
+  --cache-cluster-id starship-redis \
+  --engine redis \
+  --cache-node-type cache.t3.micro \
+  --num-cache-nodes 1 \
+  --region us-east-1
 ```
 
-### 6. Create OpenSearch domain
+#### OpenSearch domain
 
 ```bash
 aws opensearch create-domain \
   --domain-name starship-knowledge \
   --engine-version OpenSearch_2.11 \
   --cluster-config InstanceType=t3.medium.search,InstanceCount=1 \
-  --ebs-options EBSEnabled=true,VolumeType=gp3,VolumeSize=20
+  --ebs-options EBSEnabled=true,VolumeType=gp3,VolumeSize=20 \
+  --vpc-options SubnetIds=<subnet-id>,SecurityGroupIds=<sg-id> \
+  --region us-east-1
 ```
+
+After creation, create the `game-lore` index with kNN mapping:
+
+```bash
+# Run from Director EC2 or via the opensearch_utils.py helper
+# Index mapping: text (text), embedding (knn_vector, dim=1024, hnsw/cosinesimil)
+```
+
+#### IAM Role for EC2 (`starship-ec2-role`)
+
+Attach these policies:
+
+```text
+AmazonBedrockFullAccess
+AmazonS3FullAccess
+AmazonEC2ContainerRegistryReadOnly
+AmazonOpenSearchServiceFullAccess  ← or inline policy with es:ESHttpGet/Post/Put
+```
+
+Inline policy for OpenSearch (if not using managed policy):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["es:ESHttpGet", "es:ESHttpPost", "es:ESHttpPut", "es:ESHttpDelete", "es:ESHttpHead"],
+    "Resource": "arn:aws:es:us-east-1:ACCOUNT_ID:domain/starship-knowledge/*"
+  }]
+}
+```
+
+Also update the OpenSearch **domain access policy** to include the role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "AWS": ["arn:aws:iam::ACCOUNT_ID:root", "arn:aws:iam::ACCOUNT_ID:role/starship-ec2-role"] },
+    "Action": "es:*",
+    "Resource": "arn:aws:es:us-east-1:ACCOUNT_ID:domain/starship-knowledge/*"
+  }]
+}
+```
+
+#### CloudFront distribution
+
+Create a distribution with:
+- Origins: `{rust-ip}.nip.io` (port 80, HTTP) + `{director-ip}.nip.io` (port 80, HTTP) + S3 frontend bucket
+- Cache behaviors per the path table above
+- Default root object: `index.html`
+- Error pages: 403/404 → `/index.html` (for React SPA routing)
+
+#### EC2 instances
+
+Launch with:
+- AMI: Amazon Linux 2023
+- IAM instance profile: `starship-ec2-profile`
+- Security groups: open port 80 inbound from `0.0.0.0/0` (CloudFront needs HTTP)
+- Install Docker: `sudo dnf install -y docker && sudo systemctl enable --now docker`
 
 ---
 
-## Environment Variables (AWS production)
+## Environment Variables (Production)
 
-```env
-# Required
+Set in `deploy/.env.deploy` (never committed):
+
+```bash
+# AWS Infrastructure
+AWS_ACCOUNT_ID=131677314808
+AWS_REGION=us-east-1
+DIRECTOR_INSTANCE=i-09efcfe243030e561
+DIRECTOR_IP=18.232.168.75
+RUST_INSTANCE=i-0e775d61351fad5bc
+RUST_IP=23.22.74.240
+CLOUDFRONT_DOMAIN=d3cuox6dfl2gvk.cloudfront.net
+CLOUDFRONT_ID=E1NRIS4HZUY13Y
+S3_BUCKET=starship-frontend-131677314808
+REDIS_URL=redis://starship-redis.vtgv11.0001.use1.cache.amazonaws.com:6379
+OPENSEARCH_ENDPOINT=https://vpc-starship-knowledge-xxx.us-east-1.es.amazonaws.com
+```
+
+API keys set in root `.env` (also never committed):
+
+```bash
 GOOGLE_API_KEY=...
 GROQ_API_KEY=...
 HF_TOKEN=...
-
-# AWS
-USE_AWS_RAG=true
-OPENSEARCH_ENDPOINT=https://search-starship-knowledge-xxx.us-east-1.es.amazonaws.com
-AWS_REGION=us-east-1
-
-# Local GPU (on g5 instance)
-AI_MODEL_MODE=LOCAL_GPU
-
-# Optional
 ELEVENLABS_API_KEY=...
 GITHUB_API_KEY=...
 ```
+
+The Director container is launched with these runtime flags:
+
+```bash
+USE_AWS_RAG=true
+OPENSEARCH_ENDPOINT=https://vpc-starship-knowledge-xxx.us-east-1.es.amazonaws.com
+REDIS_URL=redis://...
+SELF_URL=https://d3cuox6dfl2gvk.cloudfront.net   # CRITICAL: audio URLs must be HTTPS
+AI_MODEL_MODE=                                      # empty = cloud APIs only
+DEMO_MODE=false
+```
+
+> **`SELF_URL` must be the CloudFront HTTPS domain** — not the EC2 IP.
+> If set to `http://EC2-IP`, audio file URLs sent to the browser will be HTTP and blocked as Mixed Content.
+
+---
+
+## Known AWS Gotchas
+
+| Issue | Cause | Fix |
+| :--- | :--- | :--- |
+| ElastiCache `FT.CREATE` = unknown command | Standard Redis doesn't support RediSearch | Graceful fallback: `REDIS_SEARCH_AVAILABLE=False`, app uses key-value store |
+| OpenSearch 403 AuthorizationException | IAM role not in domain access policy | Add role ARN to domain access policy AND attach inline IAM policy |
+| OpenSearch URL double-`https://` | `OPENSEARCH_ENDPOINT` includes scheme; client added another | Fixed in `opensearch_utils.py`: scheme stripped before passing to client |
+| CloudFront rejects raw IP as origin | DomainName must be DNS resolvable | Use `{ip}.nip.io` (wildcard DNS resolving to IP) |
+| CloudFront → EC2 504 timeout | Security group blocked port 80 | Open SG inbound port 80 from `0.0.0.0/0` |
+| Mixed Content (ws:// from HTTPS page) | Browser blocks non-TLS connections | Route all traffic through CloudFront; use `wss://` and `https://` everywhere |
+| Bedrock Titan v2 = 1024d (not 768d) | Gemini embeddings = 768d | `EMBEDDING_DIM` is dynamic in code: `1024 if USE_AWS_RAG else 768` |
+| `boto3` ImportError at startup | Not in `requirements.txt` | Added `boto3>=1.34.0` to requirements |
+| OpenSearch `aoss` vs `es` service name | `aoss` = Serverless; `es` = managed domain | Fixed in `opensearch_utils.py`: `AWSV4SignerAuth(creds, region, "es")` |
+| `/api/intelligence/upload` → S3 (wrong) | CloudFront default behavior → S3 frontend | Added explicit CF behavior `/api/intelligence/*` → director-origin |
+| Bedrock cold start timeout (first call) | Bedrock Titan takes ~10s on first call | Timeout set to 10s; first chunk may fail, retry by re-uploading file |
+| EC2 Instance Connect key valid 60s only | By design (security) | Scripts regenerate key each deploy run |
 
 ---
 
 ## Security Notes
 
-- All inter-service traffic flows over **VPC private subnets** — Rust ↔ Director ↔ Redis never exposed to internet
-- NLB handles public-facing WebSocket and REST traffic
-- API keys stored in **AWS Secrets Manager** and injected at container start (not in ECR image)
-- S3 buckets are **private** — CloudFront uses OAC for static asset delivery
-- OpenSearch domain placed in VPC, accessible only from Director's security group
+- All inter-service traffic via **VPC private subnets** — Redis and OpenSearch not publicly accessible
+- CloudFront handles TLS; EC2 Nginx serves HTTP-only on port 80 (internal to CF)
+- API keys loaded at container start from environment (not baked into Docker images)
+- IAM Instance Role provides AWS credentials automatically — no keys stored on EC2
+- `deploy/.env.deploy` and `.env` are in `.gitignore` — never committed
+- OpenSearch placed in VPC, accessible only from Director's security group

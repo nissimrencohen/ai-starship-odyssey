@@ -1,17 +1,24 @@
 #!/bin/bash
 # ── Deploy React Frontend to S3 + CloudFront ──────────────────────────────────
 # Usage: ./deploy/deploy-frontend.sh
+# Requires: deploy/.env.deploy (copy from .env.deploy.example and fill in)
 # All WS/HTTP connections route through CloudFront (single HTTPS domain).
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-CLOUDFRONT_DOMAIN="d3cuox6dfl2gvk.cloudfront.net"
-CLOUDFRONT_ID="E1NRIS4HZUY13Y"
-S3_BUCKET="starship-frontend-131677314808"
+# Load deploy config
+DEPLOY_ENV="${SCRIPT_DIR}/.env.deploy"
+if [ ! -f "$DEPLOY_ENV" ]; then
+  echo "ERROR: Missing ${DEPLOY_ENV}"
+  echo "Copy deploy/.env.deploy.example to deploy/.env.deploy and fill in values."
+  exit 1
+fi
+source "$DEPLOY_ENV"
 
 echo "=== [1/2] Building React with CloudFront URLs ==="
-cd "$(dirname "$0")/../apps/web-client"
+cd "${SCRIPT_DIR}/../apps/web-client"
 
 VITE_DIRECTOR_URL="https://${CLOUDFRONT_DOMAIN}" \
 VITE_ENGINE_WS_URL="wss://${CLOUDFRONT_DOMAIN}/ws" \

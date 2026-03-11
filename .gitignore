@@ -1,5 +1,6 @@
 # General
 .env
+deploy/.env.deploy
 .env.local
 *.tmp
 *.log

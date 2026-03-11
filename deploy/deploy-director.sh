@@ -1,38 +1,33 @@
 #!/bin/bash
 # ── Deploy Python Director to EC2 ─────────────────────────────────────────────
 # Usage: ./deploy/deploy-director.sh
-# Requires: AWS CLI configured, Docker logged in to ECR, temp SSH key at /tmp/starship-temp-key
-#
-# What this script does:
-#   1. Builds + pushes the Director Docker image to ECR
-#   2. SSHs into the Director EC2 (via EC2 Instance Connect)
-#   3. Pulls the new image, restarts the container with correct env vars
-#   4. Ensures Nginx (port 80 reverse proxy) is running
+# Requires: deploy/.env.deploy (copy from .env.deploy.example and fill in)
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-ACCOUNT_ID="131677314808"
-REGION="us-east-1"
-ECR_REPO="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/starship-director"
-DIRECTOR_INSTANCE="i-09efcfe243030e561"
-DIRECTOR_IP="18.232.168.75"
-RUST_IP="23.22.74.240"
-CLOUDFRONT_DOMAIN="d3cuox6dfl2gvk.cloudfront.net"
-REDIS_URL="redis://starship-redis.vtgv11.0001.use1.cache.amazonaws.com:6379"
-OPENSEARCH_URL="https://vpc-starship-knowledge-qsszian6yzsuobhwkaksol544y.us-east-1.es.amazonaws.com"
-
-# Load API keys from .env
-if [ -f "$(dirname "$0")/../.env" ]; then
-  source "$(dirname "$0")/../.env"
+# Load deploy config
+DEPLOY_ENV="${SCRIPT_DIR}/.env.deploy"
+if [ ! -f "$DEPLOY_ENV" ]; then
+  echo "ERROR: Missing ${DEPLOY_ENV}"
+  echo "Copy deploy/.env.deploy.example to deploy/.env.deploy and fill in values."
+  exit 1
 fi
+source "$DEPLOY_ENV"
+
+# Load API keys from root .env
+ROOT_ENV="${SCRIPT_DIR}/../.env"
+if [ -f "$ROOT_ENV" ]; then source "$ROOT_ENV"; fi
+
+ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/starship-director"
 
 echo "=== [1/4] Building Director Docker image ==="
-docker build -t starship-director ./apps/python-director
+docker build -t starship-director "${SCRIPT_DIR}/../apps/python-director"
 
 echo "=== [2/4] Pushing to ECR ==="
-aws ecr get-login-password --region "$REGION" | \
-  docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+aws ecr get-login-password --region "$AWS_REGION" | \
+  docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 docker tag starship-director:latest "${ECR_REPO}:latest"
 docker push "${ECR_REPO}:latest"
 
@@ -45,30 +40,20 @@ aws ec2-instance-connect send-ssh-public-key \
   --instance-id "$DIRECTOR_INSTANCE" \
   --instance-os-user ec2-user \
   --ssh-public-key "$PUB_KEY" \
-  --region "$REGION" > /dev/null
+  --region "$AWS_REGION" > /dev/null
 
 echo "=== [4/4] Deploying on EC2 ==="
 ssh -i /tmp/starship-temp-key \
   -o StrictHostKeyChecking=no \
   -o ConnectTimeout=15 \
-  ec2-user@"$DIRECTOR_IP" bash << REMOTE
+  "ec2-user@${DIRECTOR_IP}" bash << REMOTE
 set -e
-
-# Ensure Docker is running
 sudo systemctl start docker 2>/dev/null || true
+sudo aws ecr get-login-password --region ${AWS_REGION} | \
+  sudo docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com 2>/dev/null
+sudo docker pull ${ECR_REPO}:latest 2>&1 | tail -2
+sudo docker stop python-director 2>/dev/null; sudo docker rm python-director 2>/dev/null
 
-# Authenticate ECR
-sudo aws ecr get-login-password --region ${REGION} | \
-  sudo docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com
-
-# Pull latest image
-sudo docker pull ${ECR_REPO}:latest
-
-# Stop old container
-sudo docker stop python-director 2>/dev/null || true
-sudo docker rm   python-director 2>/dev/null || true
-
-# Run with all env vars — SELF_URL must point to CloudFront (HTTPS)
 sudo docker run -d \
   --name python-director \
   --restart unless-stopped \
@@ -79,7 +64,7 @@ sudo docker run -d \
   -e USE_AWS_RAG=true \
   -e DEMO_MODE=false \
   -e OPENSEARCH_ENDPOINT=${OPENSEARCH_URL} \
-  -e AWS_REGION=${REGION} \
+  -e AWS_REGION=${AWS_REGION} \
   -e AI_MODEL_MODE= \
   -e GOOGLE_API_KEY=${GOOGLE_API_KEY} \
   -e GROQ_API_KEY=${GROQ_API_KEY} \
@@ -91,11 +76,8 @@ sudo docker run -d \
   -e GENERATED_DIR=/app/generated \
   ${ECR_REPO}:latest
 
-# Ensure Nginx is installed and running (port 80 → 8000 proxy for CloudFront)
-if ! command -v nginx &>/dev/null; then
-  sudo dnf install -y nginx
-fi
-
+# Nginx: port 80 → 8000 (CloudFront http-only origin)
+if ! command -v nginx &>/dev/null; then sudo dnf install -y nginx; fi
 sudo tee /etc/nginx/conf.d/director.conf > /dev/null << 'NGINX'
 server {
     listen 80;
@@ -110,15 +92,11 @@ server {
     }
 }
 NGINX
-
-sudo systemctl enable nginx
-sudo systemctl restart nginx
-
-echo "Director deployed. Waiting for startup..."
+sudo systemctl enable nginx && sudo systemctl restart nginx
 sleep 8
 sudo docker logs python-director --tail 5
 REMOTE
 
-echo ""
-echo "=== Deploy complete ==="
-echo "Director: http://${DIRECTOR_IP}:8000  (via CF: https://${CLOUDFRONT_DOMAIN})"
+echo "=== Director deployed ==="
+echo "  Direct:  http://${DIRECTOR_IP}:8000"
+echo "  Via CF:  https://${CLOUDFRONT_DOMAIN}"

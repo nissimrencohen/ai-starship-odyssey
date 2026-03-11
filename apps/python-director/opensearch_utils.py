@@ -15,7 +15,9 @@ except ImportError:
     _OPENSEARCH_AVAILABLE = False
     logger.info("[OpenSearch] boto3/opensearch-py not installed — AWS RAG disabled.")
 
-OPENSEARCH_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT", "")
+_raw_endpoint       = os.getenv("OPENSEARCH_ENDPOINT", "")
+# Strip scheme if present (e.g. "https://vpc-...") — OpenSearch client needs hostname only
+OPENSEARCH_ENDPOINT = _raw_endpoint.replace("https://", "").replace("http://", "").rstrip("/")
 AWS_REGION          = os.getenv("AWS_REGION", "us-east-1")
 INDEX_NAME          = os.getenv("OPENSEARCH_INDEX", "game-lore")
 
@@ -30,7 +32,8 @@ def _get_client():
         return None
     try:
         credentials = boto3.Session().get_credentials()
-        auth = AWSV4SignerAuth(credentials, AWS_REGION, "aoss")
+        # "es" = managed OpenSearch domain; "aoss" = OpenSearch Serverless
+        auth = AWSV4SignerAuth(credentials, AWS_REGION, "es")
         _client = OpenSearch(
             hosts=[{"host": OPENSEARCH_ENDPOINT, "port": 443}],
             http_auth=auth,
