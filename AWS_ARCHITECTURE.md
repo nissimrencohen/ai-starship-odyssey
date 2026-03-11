@@ -83,7 +83,7 @@ graph TD
 | HuggingFace SDXL cloud API | EC2 g5 local SDXL-Turbo | `AI_MODEL_MODE=LOCAL_GPU` |
 | Edge TTS / Piper | XTTS-v2 on g5 GPU | `AI_MODEL_MODE=LOCAL_GPU` |
 | Local `world_snap.json` | S3 `starship-game-saves` | `s3_utils.py` (auto when `USE_AWS_RAG=true`) |
-| `SELF_URL=http://localhost:8000` | `SELF_URL=https://d3cuox6dfl2gvk.cloudfront.net` | Set in deploy script |
+| `SELF_URL=http://localhost:8000` | `SELF_URL=https://<your-cf-domain>.cloudfront.net` | Set in deploy script |
 
 ---
 
@@ -267,19 +267,19 @@ Set in `deploy/.env.deploy` (never committed):
 
 ```bash
 # AWS Infrastructure
-AWS_ACCOUNT_ID=131677314808
+AWS_ACCOUNT_ID=YOUR_ACCOUNT_ID
 AWS_REGION=us-east-1
-DIRECTOR_INSTANCE=i-09efcfe243030e561
-DIRECTOR_IP=18.232.168.75
-RUST_INSTANCE=i-0e775d61351fad5bc
-RUST_IP=23.22.74.240
-CLOUDFRONT_DOMAIN=d3cuox6dfl2gvk.cloudfront.net
-CLOUDFRONT_ID=E1NRIS4HZUY13Y
-S3_FRONTEND_BUCKET=starship-frontend-131677314808
-S3_SAVES_BUCKET=starship-game-saves
-S3_LORE_BUCKET=starship-lore-docs-131677314808
-REDIS_URL=redis://starship-redis.vtgv11.0001.use1.cache.amazonaws.com:6379
-OPENSEARCH_ENDPOINT=https://vpc-starship-knowledge-xxx.us-east-1.es.amazonaws.com
+DIRECTOR_INSTANCE=i-XXXXXXXXXXXXXXXXX
+DIRECTOR_IP=0.0.0.0
+RUST_INSTANCE=i-XXXXXXXXXXXXXXXXX
+RUST_IP=0.0.0.0
+CLOUDFRONT_DOMAIN=XXXXXXXXXXXX.cloudfront.net
+CLOUDFRONT_ID=XXXXXXXXXXXXX
+S3_FRONTEND_BUCKET=starship-frontend-YOUR_ACCOUNT_ID
+S3_SAVES_BUCKET=starship-game-saves-YOUR_ACCOUNT_ID
+S3_LORE_BUCKET=starship-lore-docs-YOUR_ACCOUNT_ID
+REDIS_URL=redis://YOUR_CLUSTER.XXXXX.0001.use1.cache.amazonaws.com:6379
+OPENSEARCH_URL=https://vpc-YOUR_DOMAIN.us-east-1.es.amazonaws.com
 ```
 
 API keys set in root `.env` (also never committed):
@@ -298,7 +298,7 @@ The Director container is launched with these runtime flags:
 USE_AWS_RAG=true
 OPENSEARCH_ENDPOINT=https://vpc-starship-knowledge-xxx.us-east-1.es.amazonaws.com
 REDIS_URL=redis://...
-SELF_URL=https://d3cuox6dfl2gvk.cloudfront.net   # CRITICAL: audio URLs must be HTTPS
+SELF_URL=https://XXXXXXXXXXXX.cloudfront.net     # CRITICAL: audio URLs must be HTTPS
 AI_MODEL_MODE=                                      # empty = cloud APIs only
 DEMO_MODE=false
 ```
